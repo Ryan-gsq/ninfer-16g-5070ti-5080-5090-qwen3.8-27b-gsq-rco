@@ -29,7 +29,9 @@ void launch_gemm(const Weight& weight, Tensor& qkv, Tensor& z, Nvfp4W4a4Workspac
                     (tokens + Schedule::kBlockM - 1) / Schedule::kBlockM);
     const Nvfp4W4a4MaterializedActivation activation{workspace.codes, workspace.scales};
     const float alpha = 1.0F / (weight.input_scale_divisor * weight.weight_scale_divisor);
-    nvfp4_w4a4_mma_kernel<Geometry, Schedule><<<grid, Schedule::kThreads, 0, stream>>>(
+    const std::size_t shared_bytes = configure_nvfp4_w4a4_mma_shared<
+        Geometry, Schedule, Nvfp4IdentityEpilogue, Nvfp4GdnInputOutput>();
+    nvfp4_w4a4_mma_kernel<Geometry, Schedule><<<grid, Schedule::kThreads, shared_bytes, stream>>>(
         activation, static_cast<const std::uint8_t*>(weight.qdata),
         static_cast<const std::uint8_t*>(weight.scales), tokens, alpha, Nvfp4IdentityEpilogue{},
         Nvfp4GdnInputOutput{static_cast<__nv_bfloat16*>(qkv.data),

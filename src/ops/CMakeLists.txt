@@ -16,7 +16,7 @@ if(CMAKE_CUDA_ARCHITECTURES STREQUAL "120a")
   add_library(ninfer_nvfp4_non_rdc STATIC)
   ninfer_internal_includes(ninfer_nvfp4_non_rdc)
   ninfer_cuda_non_rdc_archive(ninfer_nvfp4_non_rdc)
-  target_link_libraries(ninfer_nvfp4_non_rdc PRIVATE ninfer_core CUDA::cudart CUDA::cuda_driver)
+  target_link_libraries(ninfer_nvfp4_non_rdc PRIVATE ninfer_core ${NINFER_CUDART_TARGET} CUDA::cuda_driver)
   target_link_libraries(ninfer_ops PRIVATE ninfer_nvfp4_non_rdc)
 endif()
 

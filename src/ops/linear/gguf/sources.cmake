@@ -40,6 +40,6 @@ ninfer_cuda_non_rdc_archive(ninfer_ggml_quants)
 target_compile_options(ninfer_ggml_quants PRIVATE
   $<$<COMPILE_LANGUAGE:CUDA>:--extended-lambda>
   $<$<COMPILE_LANGUAGE:CUDA>:-Xcudafe=--diag_suppress=177>)
-target_link_libraries(ninfer_ggml_quants PRIVATE CUDA::cudart CUDA::cublas)
+target_link_libraries(ninfer_ggml_quants PRIVATE ${NINFER_CUDART_TARGET} CUDA::cublas)
 target_link_libraries(ninfer_ops PRIVATE ninfer_ggml_quants)
 target_sources(ninfer_ops PRIVATE "${CMAKE_CURRENT_LIST_DIR}/gguf_linear.cpp")

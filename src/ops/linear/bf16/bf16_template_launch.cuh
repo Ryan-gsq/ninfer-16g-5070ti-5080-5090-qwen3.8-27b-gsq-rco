@@ -109,7 +109,8 @@ void launch_bf16_a16_sliced_k_mma(const Bf16A16Operands& p, Output output, Epilo
     const int bytes       = bf16_prepare_shared<Schedule::kSharedBytes, kernel>();
     for_each_token_slice(p.tokens, Schedule::kBlockTokens, [&](int offset, int count) {
         const dim3 grid(p.rows / Schedule::kBlockRows, div_up(count, Schedule::kBlockTokens));
-        kernel<<<grid, Schedule::kThreads, bytes, stream>>>(p.x, p.weight, output, epilogue, p.rows,
+        bf16_a16_sliced_k_mma_kernel<Schedule, Output, Epilogue>
+            <<<grid, Schedule::kThreads, bytes, stream>>>(p.x, p.weight, output, epilogue, p.rows,
                                                             p.k, p.tokens, offset);
         CUDA_CHECK(cudaGetLastError());
     });

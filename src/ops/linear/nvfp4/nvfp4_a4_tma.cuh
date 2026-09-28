@@ -1,5 +1,7 @@
 #pragma once
 
+#include "core/tma_descriptor_staging.cuh"
+
 #include "ops/common/mbarrier.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/common/mma.cuh"
@@ -142,9 +144,17 @@ __device__ __forceinline__ void nvfp4_tma_load_2d(void* destination, const CUten
 template <class Schedule, class Epilogue, class OutputPolicy, class Rows>
 __global__
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a4_tma_kernel(
+#ifdef NINFER_TMA_STAGED_DESCRIPTORS
+    const Nvfp4A4TmaDescriptors* descriptors_pointer, float alpha,
+    const Epilogue epilogue, const OutputPolicy output,
+#else
     const __grid_constant__ Nvfp4A4TmaDescriptors descriptors, float alpha,
     const __grid_constant__ Epilogue epilogue, const __grid_constant__ OutputPolicy output,
+#endif
     int token_count, int output_rows, int input_rows, int token_offset) {
+#ifdef NINFER_TMA_STAGED_DESCRIPTORS
+    const Nvfp4A4TmaDescriptors& descriptors = *descriptors_pointer;
+#endif
     const int K               = Schedule::kStaticK ? Schedule::kStaticK : input_rows;
     constexpr int branches    = Rows::kPaired ? 2 : 1;
     constexpr int loaded_rows = Schedule::kBlockRows / branches;
@@ -176,6 +186,13 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a4_t
             asm volatile("setmaxnreg.dec.sync.aligned.u32 40;" : : : "memory");
         }
         if (threadIdx.x == 0) {
+#ifdef NINFER_TMA_STAGED_DESCRIPTORS
+            acquire_staged_tensor_map(&descriptors.a_codes);
+            acquire_staged_tensor_map(&descriptors.b_codes);
+            acquire_staged_tensor_map(&descriptors.a_scales);
+            acquire_staged_tensor_map(&descriptors.b_scales);
+            asm volatile("fence.proxy.async.global;" : : : "memory");
+#endif
 #pragma unroll 1
             for (int k_tile = 0; k_tile < kKTiles; ++k_tile) {
                 const int stage                 = k_tile % Schedule::kStages;
@@ -394,9 +411,16 @@ void launch_nvfp4_a4_tma_mma(const Nvfp4A4Operands& p, Output output, Epilogue e
     constexpr int bytes    = sizeof(Nvfp4A4TmaSharedStorage<Schedule, Rows, Epilogue>);
     constexpr auto kernel  = nvfp4_a4_tma_kernel<Schedule, Epilogue, Output, Rows>;
     (void)nvfp4_prepare_shared<bytes, kernel, true>();
+#ifdef NINFER_TMA_STAGED_DESCRIPTORS
+    static TmaDescriptorStaging<Nvfp4A4TmaDescriptors> staging;
+    const auto descriptor_argument = staging.stage(descriptors, stream);
+#else
+    const auto& descriptor_argument = descriptors;
+#endif
     for_each_token_slice(p.tokens, Schedule::kBlockTokens, [&](int offset, int count) {
         const dim3 grid(p.rows / Schedule::kBlockRows, div_up(count, Schedule::kBlockTokens));
-        kernel<<<grid, Schedule::kThreads, bytes, stream>>>(descriptors, p.alpha, epilogue, output,
+        nvfp4_a4_tma_kernel<Schedule, Epilogue, Output, Rows>
+            <<<grid, Schedule::kThreads, bytes, stream>>>(descriptor_argument, p.alpha, epilogue, output,
                                                             offset + count, p.rows, p.k, offset);
         CUDA_CHECK(cudaGetLastError());
     });

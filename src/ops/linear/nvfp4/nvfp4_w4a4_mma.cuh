@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/device.h"
 #include "ops/common/mma.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/linear/nvfp4/nvfp4_codec.cuh"
@@ -248,7 +249,8 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4
     static_assert(!PairRows || (Schedule::kBlockN % 2) == 0);
     static_assert(!PairRows || ((Geometry::kOutputRows / 2) % (Schedule::kBlockN / 2)) == 0);
 
-    __shared__ Nvfp4W4a4SharedStorage<Schedule> shared;
+    extern __shared__ __align__(16) unsigned char shared_bytes[];
+    auto& shared = *reinterpret_cast<Nvfp4W4a4SharedStorage<Schedule>*>(shared_bytes);
     // A routed launch reads its work list, token map and expert rows from buffers a producer
     // writes, so as a programmatic dependent it waits before anything else. A dense launch reads
     // only its block index and immutable weights ahead of the wait.
@@ -463,6 +465,25 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_w4a4
             }
         }
     }
+}
+
+// Larger schedules exceed CUDA's 48 KiB static shared-memory limit. Keep the exact
+// storage layout, but opt the selected kernel into its dynamic allocation on each device.
+template <class Geometry, class Schedule, class Epilogue, class OutputPolicy,
+          class RowPolicy = Nvfp4W4a4IdentityRows, bool PairRows = false,
+          class TokenPolicy  = Nvfp4W4a4IdentityTokens,
+          class RasterPolicy = Nvfp4W4a4MmaRasterRowFast>
+std::size_t configure_nvfp4_w4a4_mma_shared() {
+    constexpr std::size_t kSharedBytes = sizeof(Nvfp4W4a4SharedStorage<Schedule>);
+    if constexpr (kSharedBytes > 48U * 1024U) {
+        configure_cuda_device_once([] {
+            return cudaFuncSetAttribute(
+                nvfp4_w4a4_mma_kernel<Geometry, Schedule, Epilogue, OutputPolicy, RowPolicy,
+                                      PairRows, TokenPolicy, RasterPolicy>,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(kSharedBytes));
+        });
+    }
+    return kSharedBytes;
 }
 
 // The TMA route reads a whole [kNvfp4TmaBlockM tokens, kNvfp4ScaleTileGroups groups] tile of

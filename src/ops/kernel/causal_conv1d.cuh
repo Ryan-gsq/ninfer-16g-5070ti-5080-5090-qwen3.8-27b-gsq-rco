@@ -75,8 +75,12 @@ __global__ void causal_conv1d_prefill_kernel(const __nv_bfloat16* x, const __nv_
                                              const __nv_bfloat16* conv_state, Output out,
                                              std::int32_t C, std::int32_t T) {
     const std::int64_t C64      = static_cast<std::int64_t>(C);
-    const std::int64_t c_blocks = div_up(C64, static_cast<std::int64_t>(blockDim.x));
-    const std::int64_t block    = static_cast<std::int64_t>(blockIdx.x);
+    // The launcher bounds grid.x by INT_MAX. Keep the grid division in int32:
+    // CUDA 12.8 sm_120a miscompiles its int64 form for non-power-of-two channel tiles.
+    // Tensor offsets below remain int64.
+    const std::int32_t c_blocks =
+        static_cast<std::int32_t>(div_up(C64, static_cast<std::int64_t>(blockDim.x)));
+    const std::int32_t block    = static_cast<std::int32_t>(blockIdx.x);
     const std::int32_t t        = static_cast<std::int32_t>(block / c_blocks);
     const std::int64_t c_base   = (block - static_cast<std::int64_t>(t) * c_blocks) * blockDim.x;
     const std::int64_t c64      = c_base + threadIdx.x;
@@ -106,8 +110,10 @@ __global__ void causal_conv1d_prefill_pairs_kernel(const __nv_bfloat16* x,
                                                    const __nv_bfloat16* conv_state, Output out,
                                                    std::int32_t C, std::int32_t T) {
     const std::int64_t C2        = static_cast<std::int64_t>(C / 2);
-    const std::int64_t c_blocks  = div_up(C2, static_cast<std::int64_t>(blockDim.x));
-    const std::int64_t block     = static_cast<std::int64_t>(blockIdx.x);
+    // Match the bounded int32 grid division in the scalar prefill kernel.
+    const std::int32_t c_blocks  =
+        static_cast<std::int32_t>(div_up(C2, static_cast<std::int64_t>(blockDim.x)));
+    const std::int32_t block     = static_cast<std::int32_t>(blockIdx.x);
     const std::int32_t t         = static_cast<std::int32_t>(block / c_blocks);
     const std::int64_t pair_base = (block - static_cast<std::int64_t>(t) * c_blocks) * blockDim.x;
     const std::int64_t p         = pair_base + threadIdx.x;
