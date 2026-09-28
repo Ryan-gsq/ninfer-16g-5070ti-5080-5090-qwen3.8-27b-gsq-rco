@@ -1,5 +1,9 @@
 # NInfer-all
 
+This branch adds Windows / RTX 5070 Ti support for the CUDA 13 native SM120 build.
+See the [5070 Ti build and serving guide](docs/rtx-5070ti-windows.md) for the measured
+configuration, device profile, and validation limits.
+
 One line of [NInfer](https://github.com/Neroued/ninfer) for the RTX 3090, RTX 4090, RTX 5090 and RTX
 PRO 6000 Blackwell, consolidated from the forks that carry it and extended with this repository's
 own work. The base is the `master` of
