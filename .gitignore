@@ -88,3 +88,16 @@ repro/
 
 # WebUI releases unpacked by scripts/fetch-webui.sh for -DNINFER_WEBUI_DIR.
 third_party/webui/
+
+# Windows tray manager: source and config seeds are versioned, build products are not.
+apps/windows-manager/bin/
+apps/windows-manager/obj/
+apps/windows-manager/wwwroot/
+apps/windows-manager/web/node_modules/
+apps/windows-manager/web/*.log
+tests/windows-manager-platform/bin/
+tests/windows-manager-platform/obj/
+tests/windows-manager-backend/bin/
+tests/windows-manager-backend/obj/
+!apps/windows-manager/config/profiles/
+!apps/windows-manager/config/profiles/*.json
