@@ -1,6 +1,7 @@
 #include "runtime/engine/kv_capacity.h"
 
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -114,6 +115,88 @@ int main() {
                           },
                           "every device"),
                       "missing free memory for a device was accepted");
+
+    // Mixed allocation is demand-bounded, not free-memory-bounded. Two 129-token windows
+    // each need three 64-token pages: six pages and 1512 runtime bytes, even with zero free.
+    const auto mixed_auto = ninfer::runtime::resolve_mixed_kv_capacity(
+        ninfer::KvCapacityPolicy::automatic(0), curve, 129, 2, 0);
+    failures += check(mixed_auto.main_page_groups == 6 && mixed_auto.resolved_tokens == 384 &&
+                          mixed_auto.runtime_reservation_bytes == 1512 &&
+                          mixed_auto.mode == ninfer::KvCapacityMode::Automatic &&
+                          mixed_auto.available_after_weights_bytes == 0 &&
+                          mixed_auto.planned_slack_bytes == 0,
+                      "mixed auto did not allocate one page-aligned context window per lane");
+    // A large Hybrid curve must not turn a driver-paging policy into an unbounded RAM probe.
+    auto hybrid = curve;
+    hybrid.maximum_main_page_groups = 1000000;
+    const auto mixed_room = ninfer::runtime::resolve_mixed_kv_capacity(
+        ninfer::KvCapacityPolicy::automatic(0), hybrid, 129, 2, 1ULL << 40);
+    failures += check(mixed_room.main_page_groups == 6 && mixed_room.runtime_reservation_bytes == 1512 &&
+                          mixed_room.available_after_weights_bytes == (1ULL << 40) &&
+                          mixed_room.planned_slack_bytes == (1ULL << 40) - 1512,
+                      "mixed auto expanded idle cache beyond its finite workload bound");
+    const auto mixed_capped = ninfer::runtime::resolve_mixed_kv_capacity(
+        ninfer::KvCapacityPolicy::automatic(0), curve, 129, 8, 0);
+    failures += check(mixed_capped.main_page_groups == 6,
+                      "mixed auto ignored the target's maximum usable page count");
+    const auto mixed_fixed = ninfer::runtime::resolve_mixed_kv_capacity(
+        ninfer::KvCapacityPolicy::explicit_capacity(257), curve, 129, 1, 10);
+    failures += check(mixed_fixed.main_page_groups == 5 && mixed_fixed.resolved_tokens == 320 &&
+                          mixed_fixed.runtime_reservation_bytes == 1384 &&
+                          mixed_fixed.available_after_weights_bytes == 10 &&
+                          mixed_fixed.planned_slack_bytes == 0,
+                      "mixed explicit capacity was reduced or rejected by reported free bytes");
+    const auto invalid = [](auto&& call) {
+        try { call(); } catch (const std::invalid_argument&) { return true; }
+        return false;
+    };
+    failures += check(invalid([&] {
+        (void)ninfer::runtime::resolve_kv_capacity(
+            ninfer::KvCapacityPolicy::explicit_capacity(257), curve, 10);
+    }), "default fixed capacity stopped checking reported free memory");
+    failures += check(invalid([&] {
+        (void)ninfer::runtime::resolve_mixed_kv_capacity(
+            ninfer::KvCapacityPolicy::automatic(1), curve, 129, 2, 0);
+    }), "unnormalized mixed automatic headroom was silently ignored");
+    failures += check(invalid([&] {
+        (void)ninfer::runtime::resolve_mixed_kv_capacity(
+            ninfer::KvCapacityPolicy::explicit_capacity(64), curve, 129, 1, 999999);
+    }), "mixed fixed capacity below max_context was accepted");
+    failures += check(invalid([&] {
+        (void)ninfer::runtime::resolve_mixed_kv_capacity(
+            ninfer::KvCapacityPolicy::automatic(0), curve, 1024, 1, 999999);
+    }), "mixed accepted a capacity curve unable to hold one full context");
+    failures += check(invalid([&] {
+        (void)ninfer::runtime::resolve_mixed_kv_capacity(
+            ninfer::KvCapacityPolicy::automatic(0), split, 129, 2, 999999);
+    }), "mixed accepted a multi-device capacity plan");
+    for (const auto concurrency : {0U, 9U}) {
+        failures += check(invalid([&] {
+            (void)ninfer::runtime::resolve_mixed_kv_capacity(
+                ninfer::KvCapacityPolicy::automatic(0), curve, 129, concurrency, 999999);
+        }), "mixed accepted an invalid concurrency");
+    }
+    const auto overflows = [](auto&& call) {
+        try { call(); } catch (const std::overflow_error&) { return true; }
+        return false;
+    };
+    auto byte_overflow = curve;
+    byte_overflow.minimum_device_reservation_bytes = std::numeric_limits<std::size_t>::max() - 1;
+    failures += check(overflows([&] {
+        (void)ninfer::runtime::resolve_mixed_kv_capacity(
+            ninfer::KvCapacityPolicy::automatic(0), byte_overflow, 129, 2, 0);
+    }), "mixed runtime byte reservation overflow was not detected");
+    const ninfer::runtime::SequenceCapacityCurve token_overflow{
+        .main_page_tokens = std::numeric_limits<std::uint32_t>::max(),
+        .minimum_main_page_groups = 1,
+        .maximum_main_page_groups = 3,
+        .minimum_device_reservation_bytes = 1000,
+        .bytes_per_additional_main_page_group = 128,
+    };
+    failures += check(overflows([&] {
+        (void)ninfer::runtime::resolve_mixed_kv_capacity(ninfer::KvCapacityPolicy::automatic(0),
+            token_overflow, std::numeric_limits<std::uint32_t>::max(), 2, 0);
+    }), "mixed per-lane token capacity overflow was not detected");
 
     if (failures == 0) { std::cout << "ok\n"; }
     return failures == 0 ? 0 : 1;

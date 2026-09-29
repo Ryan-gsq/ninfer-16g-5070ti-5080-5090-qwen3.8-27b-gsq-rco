@@ -344,6 +344,12 @@ enum class VisionResidency : std::uint8_t {
     Cpu,      // tower decoded to FP32 host memory and run on CPU threads; no device Vision memory
 };
 
+enum class CudaMemoryPolicy : std::uint8_t {
+    DriverDefault,
+    StrictVram,
+    Mixed,
+};
+
 struct EngineOptions {
     std::filesystem::path artifact_path;
     std::filesystem::path chat_template_path;
@@ -394,6 +400,17 @@ struct EngineOptions {
     // on the grounds that WDDM will evict other allocations. Not for a GPU that drives the
     // desktop, whose allocations are often not evictable.
     bool wddm_evictable_budget         = false;
+    // StrictVram is a Windows single-device residency guard and selects the Hybrid prefix cache.
+    // Mixed is Windows single-device text generation using ordinary cudaMalloc: it attempts the
+    // requested capacity even above reported CUDA free and accepts driver paging to Shared memory.
+    // Mixed automatic capacity covers at most max_concurrency full max_context windows, without
+    // expanding an idle prefix cache or probing system RAM. Normalization sets its automatic
+    // headroom to zero; StrictVram sets it to cuda_vram_reserve_bytes. Only DriverDefault uses
+    // the independently configured automatic KV headroom.
+    // StrictVram probes may exceed reported free, but only a verified resident layout is admitted.
+    CudaMemoryPolicy cuda_memory_policy = CudaMemoryPolicy::DriverDefault;
+    std::size_t cuda_vram_reserve_bytes = 64ULL << 20;
+    std::size_t cuda_memory_probe_step_bytes = 128ULL << 20;
     KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(2048);
     std::uint32_t max_concurrency      = 1;
     std::uint32_t max_pending_requests = 16;
@@ -1257,6 +1274,23 @@ struct VisionWorkspaceMemorySummary {
     std::size_t mirror_bytes              = 0; // overlay: pinned mirror of the borrowable tail
 };
 
+// Latest observed process residency, not a permanent physical-pinning guarantee. Intentional
+// pinned Host allocations are established before shared_baseline_bytes; device-driven growth
+// above that baseline invalidates a strict candidate. Zero counters while disabled are unknown.
+struct CudaResidencySummary {
+    bool enabled = false;
+    bool verified = false;
+    std::size_t cuda_free_bytes = 0;
+    std::size_t cuda_total_bytes = 0;
+    std::size_t dedicated_bytes = 0;
+    std::size_t shared_bytes = 0;
+    std::size_t shared_baseline_bytes = 0;
+    std::size_t device_allocated_bytes = 0;
+    std::size_t host_pool_bytes = 0;
+    std::size_t host_used_bytes = 0;
+    std::size_t verified_reserve_bytes = 0;
+};
+
 struct MemorySummary {
     int device                                = 0;
     std::uint32_t max_context                 = 0;
@@ -1293,6 +1327,7 @@ struct MemorySummary {
     std::size_t host_kv_page_group_bytes = 0;
     // Engaged only when the single host RAM budget mode is active.
     std::size_t host_cache_budget_bytes = 0;
+    CudaResidencySummary cuda_residency;
 };
 
 // Worker-owned monotonic nanosecond counters. Top-level Host phases are mutually exclusive;
@@ -1327,6 +1362,8 @@ struct RuntimeHostWorkStats {
 // decision observations. Consumers derive interval counters by subtracting two snapshots.
 struct RuntimeStats {
     RuntimeHostWorkStats host_work;
+    // Published by the worker so monitoring never takes the execution lock or queries CUDA/PDH.
+    CudaResidencySummary cuda_residency;
     // Actual prompt tokens evaluated by prefill; reused checkpoint-prefix tokens are excluded.
     std::uint64_t computed_prefill_tokens = 0;
     // Tokens committed by decode rounds; the first token emitted by prefill is excluded.

@@ -144,6 +144,20 @@ int main() {
     memory.host_cache_budget_bytes           = 24ULL << 20;
     memory.host_kv_capacity_bytes            = 12ULL << 20;
     memory.host_kv_occupied_bytes            = 8ULL << 20;
+    memory.cuda_residency = {.enabled = true,
+                             .verified = true,
+                             .cuda_free_bytes = 0,
+                             .cuda_total_bytes = 16ULL << 30,
+                             .dedicated_bytes = 15ULL << 30,
+                             .shared_bytes = 74ULL << 20,
+                             .shared_baseline_bytes = 74ULL << 20,
+                             .device_allocated_bytes = 14ULL << 30,
+                             .host_pool_bytes = 4ULL << 30,
+                             .host_used_bytes = 2ULL << 30,
+                             .verified_reserve_bytes = 64ULL << 20};
+    engine_options.cuda_memory_policy = ninfer::CudaMemoryPolicy::StrictVram;
+    engine_options.cuda_vram_reserve_bytes = 64ULL << 20;
+    engine_options.cuda_memory_probe_step_bytes = 128ULL << 20;
 
     ServerLogEnvironment environment;
     environment.device                    = 0;
@@ -164,6 +178,42 @@ int main() {
     failures += check(server.at("schema_version") == kRequestLogSchemaVersion,
                       "server record schema mismatch");
     failures += check(server.at("event") == "server_start", "server event mismatch");
+    failures += check(server.at("engine").at("cuda_memory_policy") == "strict" &&
+                          server.at("engine").at("cuda_vram_reserve_bytes") == (64ULL << 20) &&
+                          server.at("engine").at("cuda_memory_probe_step_bytes") == (128ULL << 20),
+                      "startup record lost CUDA residency policy configuration");
+    for (const auto policy : {ninfer::CudaMemoryPolicy::DriverDefault,
+                              ninfer::CudaMemoryPolicy::Mixed}) {
+        auto non_strict = engine_options;
+        non_strict.cuda_memory_policy = policy;
+        const auto record = Json::parse(format_server_start_json(
+            "serve-policy", 1000, options, non_strict, sampling_defaults, "deployment-alias", load,
+            memory, environment, std::uint64_t{123456}));
+        const auto& logged = record.at("engine");
+        failures += check(logged.at("cuda_memory_policy") ==
+                              (policy == ninfer::CudaMemoryPolicy::Mixed ? "mixed" : "default") &&
+                              logged.at("cuda_vram_reserve_bytes") == 0 &&
+                              logged.at("cuda_memory_probe_step_bytes") == 0,
+                          "non-strict startup policy must not claim a strict reserve or probe");
+    }
+    auto custom_strict = engine_options;
+    custom_strict.cuda_vram_reserve_bytes = 0;
+    custom_strict.cuda_memory_probe_step_bytes = 1ULL << 20;
+    const auto custom_record = Json::parse(format_server_start_json(
+        "serve-custom-policy", 1000, options, custom_strict, sampling_defaults, "deployment-alias", load,
+        memory, environment, std::uint64_t{123456}));
+    failures += check(custom_record.at("engine").at("cuda_memory_policy") == "strict-0-1" &&
+                          custom_record.at("engine").at("cuda_vram_reserve_bytes") == 0 &&
+                          custom_record.at("engine").at("cuda_memory_probe_step_bytes") == (1ULL << 20),
+                      "custom strict startup policy was not serialized canonically");
+    const Json& residency = server.at("memory").at("cuda_residency");
+    failures += check(residency.at("enabled") == true && residency.at("verified") == true &&
+                          residency.at("cuda_free_bytes") == 0 &&
+                          residency.at("shared_bytes") == residency.at("shared_baseline_bytes") &&
+                          residency.at("device_allocated_bytes") == (14ULL << 30) &&
+                          residency.at("host_used_bytes") == (2ULL << 30) &&
+                          residency.at("verified_reserve_bytes") == (64ULL << 20),
+                      "startup record lost CUDA residency admission result");
     failures += check(server.at("server").at("public_model_id") == "deployment-alias",
                       "resolved public model id missing");
     failures += check(server.at("artifact").at("architecture") == "Qwen3_5ForCausalLM",

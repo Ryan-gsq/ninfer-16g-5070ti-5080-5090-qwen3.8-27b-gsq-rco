@@ -3,6 +3,7 @@
 // Small fixed-capacity request execution for every backend.
 
 #include "core/device.h"
+#include "core/resident_memory.h"
 #include "core/nvtx.h"
 #include "ninfer/types.h"
 #include "runtime/contract/execution.h"
@@ -2277,7 +2278,18 @@ private:
         } catch (...) {}
     }
 
+    [[nodiscard]] std::shared_ptr<core::ResidentMemorySession> residency_session() const {
+        if constexpr (requires { instance_.residency; }) {
+            return instance_.residency;
+        } else {
+            return {};
+        }
+    }
+
     void worker_loop() noexcept {
+        const auto residency = residency_session();
+        core::ResidentMemoryBinding resident_binding(residency);
+        Clock::time_point last_residency_check{};
         bool previous_unit_was_decode = false;
         for (;;) {
             {
@@ -2288,7 +2300,12 @@ private:
                         active = active || slots_[lane] != nullptr;
                     }
                     if (!active) {
-                        queue_cv_.wait(lock, [&] { return stopping_ || !pending_.empty(); });
+                        if (residency) {
+                            queue_cv_.wait_for(lock, std::chrono::milliseconds(250),
+                                               [&] { return stopping_ || !pending_.empty(); });
+                        } else {
+                            queue_cv_.wait(lock, [&] { return stopping_ || !pending_.empty(); });
+                        }
                     }
                 }
                 if (stopping_) {
@@ -2303,6 +2320,11 @@ private:
 
             std::unique_lock execution_lock(execution_mutex_);
             try {
+                if (residency && Clock::now() - last_residency_check >=
+                                     std::chrono::milliseconds(250)) {
+                    residency->check("runtime boundary");
+                    last_residency_check = Clock::now();
+                }
                 set_host_work_class(HostWorkClass::Control);
                 HostPhaseMeasurement boundary = begin_host_phase();
                 const bool have_pending       = expire_pending_requests();
@@ -2329,6 +2351,7 @@ private:
                         previous_unit_was_decode,
                         instance_.program->has_context_transaction()) &&
                     consume_admission_check()) {
+                    if (residency) { residency->check("request admission"); }
                     (void)try_admit_one();
                     membership = scheduler_.build_round_membership(slots_, max_concurrency_);
                 }

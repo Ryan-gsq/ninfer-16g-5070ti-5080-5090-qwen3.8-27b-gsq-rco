@@ -4,6 +4,7 @@
 
 #include <filesystem>
 #include <iostream>
+#include <limits>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -30,6 +31,109 @@ ServeOptions parse(std::vector<std::string> arguments) {
 
 int main() {
     int failures = 0;
+    const auto memory_defaults = parse({"ninfer-serve", "model.ninfer"});
+    failures += check(memory_defaults.cuda_memory_policy == ninfer::CudaMemoryPolicy::DriverDefault &&
+                          memory_defaults.cuda_vram_reserve_bytes == 0 &&
+                          memory_defaults.cuda_memory_probe_step_bytes == 0 &&
+                          memory_defaults.context_cache.mode == ninfer::ContextCacheMode::Legacy &&
+                          memory_defaults.kv_capacity.mode == ninfer::KvCapacityMode::Explicit,
+                      "CUDA memory policy defaults changed");
+    const auto resident = parse({"ninfer-serve", "model.ninfer",
+                                 "--cuda-memory-policy", "strict", "--kv-capacity", "auto"});
+    failures += check(resident.cuda_memory_policy == ninfer::CudaMemoryPolicy::StrictVram &&
+                          resident.cuda_vram_reserve_bytes == (64ULL << 20) &&
+                          resident.cuda_memory_probe_step_bytes == (128ULL << 20) &&
+                          resident.context_cache.mode == ninfer::ContextCacheMode::Hybrid &&
+                          resident.kv_capacity.automatic_headroom_bytes == (64ULL << 20),
+                      "strict must enable hybrid caching and use its own automatic reserve");
+    const auto mixed = parse({"ninfer-serve", "model.ninfer",
+                              "--cuda-memory-policy", "mixed", "--kv-capacity", "auto"});
+    failures += check(mixed.cuda_memory_policy == ninfer::CudaMemoryPolicy::Mixed &&
+                          mixed.cuda_vram_reserve_bytes == 0 &&
+                          mixed.cuda_memory_probe_step_bytes == 0 &&
+                          mixed.kv_capacity.automatic_headroom_bytes == 0,
+                      "mixed must not inherit strict probing or default-policy headroom");
+    const auto ordinary = parse({"ninfer-serve", "model.ninfer",
+                                 "--cuda-memory-policy", "default", "--kv-capacity", "auto",
+                                 "--kv-headroom-mib", "100"});
+    failures += check(ordinary.cuda_memory_policy == ninfer::CudaMemoryPolicy::DriverDefault &&
+                          ordinary.kv_capacity.automatic_headroom_bytes == (100ULL << 20),
+                      "default policy must retain explicit automatic-KV headroom");
+    const auto custom = parse({"ninfer-serve", "model.ninfer",
+                               "--cuda-memory-policy", "strict-0-1", "--kv-capacity", "auto"});
+    failures += check(custom.cuda_vram_reserve_bytes == 0 &&
+                          custom.cuda_memory_probe_step_bytes == (1ULL << 20) &&
+                          custom.kv_capacity.automatic_headroom_bytes == 0,
+                      "strict custom reserve and step minimum were not preserved");
+    const auto custom_auto = parse({"ninfer-serve", "model.ninfer",
+                                    "--cuda-memory-policy", "strict-00072-00256", "--kv-capacity", "auto"});
+    failures += check(custom_auto.cuda_vram_reserve_bytes == (72ULL << 20) &&
+                          custom_auto.cuda_memory_probe_step_bytes == (256ULL << 20) &&
+                          custom_auto.kv_capacity.automatic_headroom_bytes == (72ULL << 20),
+                      "custom strict decimal values must control auto-KV headroom");
+    const auto maximum_mib = std::numeric_limits<std::size_t>::max() >> 20;
+    const auto memory_boundaries = parse({"ninfer-serve", "model.ninfer",
+                                          "--cuda-memory-policy", "strict-" + std::to_string(maximum_mib) + "-16384"});
+    failures += check(memory_boundaries.cuda_memory_policy == ninfer::CudaMemoryPolicy::StrictVram &&
+                          memory_boundaries.cuda_vram_reserve_bytes == (maximum_mib << 20) &&
+                          memory_boundaries.cuda_memory_probe_step_bytes == (16384ULL << 20),
+                      "valid CUDA memory parameter boundaries were rejected or truncated");
+    const auto reset_policy = parse({"ninfer-serve", "model.ninfer",
+                                     "--cuda-memory-policy", "strict-7-8", "--cuda-memory-policy", "default"});
+    failures += check(reset_policy.cuda_memory_policy == ninfer::CudaMemoryPolicy::DriverDefault &&
+                          reset_policy.cuda_vram_reserve_bytes == 0 &&
+                          reset_policy.cuda_memory_probe_step_bytes == 0 &&
+                          reset_policy.context_cache.mode == ninfer::ContextCacheMode::Legacy,
+                      "last policy selection must not retain strict side effects");
+    for (const auto& extra : std::vector<std::vector<std::string>>{
+             {"--cuda-memory-policy", "unknown"},
+             {"--cuda-memory-policy", "strict-64"}, {"--cuda-memory-policy", "strict--128"},
+             {"--cuda-memory-policy", "strict-64-"}, {"--cuda-memory-policy", "strict-64-0"},
+             {"--cuda-memory-policy", "strict-64-16385"}, {"--cuda-memory-policy", "strict-64-128-1"},
+             {"--cuda-memory-policy", "strict-+64-128"}, {"--cuda-memory-policy", "strict- 64-128"},
+             {"--cuda-memory-policy", "strict-1.5-128"}, {"--cuda-memory-policy", "strict-64--1"},
+             {"--cuda-memory-policy", "strict-18446744073709551615-128"},
+             {"--cuda-memory-policy", "strict-" + std::to_string(maximum_mib + 1) + "-128"},
+             {"--cuda-memory-policy", "strict-64-18446744073709551615"},
+             {"--cuda-memory-policy", "strict", "--vision"},
+             {"--cuda-memory-policy", "mixed", "--vision"},
+             {"--cuda-memory-policy", "strict", "--wddm-evictable-budget"},
+             {"--cuda-memory-policy", "mixed", "--wddm-evictable-budget"},
+             {"--cuda-memory-policy", "strict", "--devices", "0,1"},
+             {"--cuda-memory-policy", "mixed", "--devices", "0,1"},
+             {"--cuda-memory-policy", "strict", "--use-original-prefix-caching"},
+             {"--no-prefix-reuse", "--cuda-memory-policy", "strict"},
+             {"--cuda-memory-policy", "strict", "--kv-capacity", "auto", "--kv-headroom-mib", "64"},
+             {"--cuda-memory-policy", "mixed", "--kv-capacity", "auto", "--vram-headroom-mib", "0"}}) {
+        std::vector<std::string> arguments{"ninfer-serve", "model.ninfer"};
+        arguments.insert(arguments.end(), extra.begin(), extra.end());
+        bool rejected = false;
+        try {
+            (void)parse(arguments);
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "invalid or conflicting CUDA residency options admitted");
+    }
+    const auto memory_help = serve_usage_text("ninfer-serve");
+    failures += check(memory_help.find("strict-RESERVE-STEP") != std::string::npos,
+                      "Serve help omits custom strict policy syntax");
+    const auto resident_engine = make_engine_options(resident);
+    failures += check(resident_engine.cuda_memory_policy == ninfer::CudaMemoryPolicy::StrictVram &&
+                          resident_engine.cuda_vram_reserve_bytes == (64ULL << 20) &&
+                          resident_engine.cuda_memory_probe_step_bytes == (128ULL << 20) &&
+                          resident_engine.context_cache.mode == ninfer::ContextCacheMode::Hybrid &&
+                          resident_engine.kv_capacity.automatic_headroom_bytes == (64ULL << 20),
+                      "serve-to-engine conversion lost strict policy semantics");
+    const auto mixed_engine = make_engine_options(mixed);
+    failures += check(mixed_engine.cuda_memory_policy == ninfer::CudaMemoryPolicy::Mixed &&
+                          mixed_engine.kv_capacity.mode == ninfer::KvCapacityMode::Automatic &&
+                          mixed_engine.kv_capacity.automatic_headroom_bytes == 0,
+                      "serve-to-engine conversion lost mixed policy semantics");
+    const auto implicit_strict = parse({"ninfer-serve", "model.ninfer", "--cuda-memory-policy", "strict",
+                                        "--device-snapshot-slots", "2"});
+    failures += check(implicit_strict.context_cache.mode == ninfer::ContextCacheMode::Hybrid &&
+                          implicit_strict.kv_capacity.mode == ninfer::KvCapacityMode::Automatic &&
+                          implicit_strict.kv_capacity.automatic_headroom_bytes == (64ULL << 20),
+                      "strict hybrid activation must precede KV default and hybrid-option validation");
     const auto archive = parse({"ninfer-serve", "model.ninfer", "--spec", "mtp", "--draft-tokens",
                                 "5", "--ngram-draft-tokens", "63", "--ngram-archive-mib", "512",
                                 "--ngram-session-mib", "128", "--ngram-native-sessions"});

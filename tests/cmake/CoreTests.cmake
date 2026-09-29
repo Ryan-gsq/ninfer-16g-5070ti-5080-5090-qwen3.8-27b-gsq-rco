@@ -4,6 +4,11 @@ add_executable(ninfer_public_api_test "${CMAKE_CURRENT_LIST_DIR}/../test_public_
 target_include_directories(ninfer_public_api_test PRIVATE ${PROJECT_SOURCE_DIR}/include)
 add_test(NAME ninfer_public_api_test COMMAND ninfer_public_api_test)
 
+ninfer_add_test(ninfer_resident_memory_test STANDALONE
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_resident_memory.cpp"
+  LIBRARIES ninfer_core)
+set_tests_properties(ninfer_resident_memory_test PROPERTIES SKIP_RETURN_CODE 77)
+
 ninfer_add_test(ninfer_wide_math_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_wide_math.cpp"
   LIBRARIES ninfer_core)

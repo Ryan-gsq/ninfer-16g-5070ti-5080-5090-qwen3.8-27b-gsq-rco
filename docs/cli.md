@@ -224,6 +224,12 @@ block length eight, while fifteen uses the maximum supported block length sixtee
 
 ## Common options
 
+Windows text generation can opt in to observed-residency admission with
+`--cuda-memory-policy strict`, which selects Hybrid automatically. The CLI's Hybrid cache has no
+persistent Host retention tier because an invocation serves one request. The default CLI route
+and driver allocation policy are unchanged. See [strict CUDA residency](serving.md#strict-cuda-residency)
+for probe semantics and limits.
+
 The table lists executable defaults. The examples above select FP8 KV and MTP3.
 
 | Option | Meaning | Default |
@@ -235,6 +241,8 @@ The table lists executable defaults. The examples above select FP8 KV and MTP3.
 | `--rope-scaling-original-context N` | the interpolation threshold | the native window |
 | `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory; omitted means `--max-context` | `2048` |
 | `--kv-headroom-mib N` | device memory in MiB that `--kv-capacity auto` leaves free after sizing the KV pool; requires `auto`. `--vram-headroom-mib` is accepted as an alias | `1024` |
+| `--cuda-memory-policy default\|mixed\|strict\|strict-N-N` | choose reported-free sizing, allowed Windows system-RAM fallback, or verified VRAM residency; `strict` means reserve 64 MiB / probe step 128 MiB. [Policy details](rtx-5070ti-windows.en.md#4-choose-a-memory-policy) | `default` |
+| `--use-alt-prefix-caching` | select Hybrid device context storage; automatic with `strict`, with no persistent Host retention tier in the CLI | off |
 | `--prefill-chunk N` | positive text-prefill chunk, in multiples of 128 | `1024` |
 | `--max-new N` | requested output-token limit | `128` |
 | `--device N` | CUDA device index | `0` |

@@ -1,4 +1,6 @@
 #include "serve/request_log.h"
+#include "serve/cuda_residency_json.h"
+#include "product/cuda_memory_options.h"
 #include "product/logging/pretty_format.h"
 #include "product/speculative_options.h"
 
@@ -767,6 +769,13 @@ std::string format_server_start_json(
         {"concurrent_prefill", engine_options.concurrent_prefill},
         {"recover_invariant_failures", engine_options.recover_invariant_failures},
         {"wddm_evictable_budget", engine_options.wddm_evictable_budget},
+        {"cuda_memory_policy", product::format_cuda_memory_policy(
+             engine_options.cuda_memory_policy, engine_options.cuda_vram_reserve_bytes,
+             engine_options.cuda_memory_probe_step_bytes)},
+        {"cuda_vram_reserve_bytes", engine_options.cuda_memory_policy == CudaMemoryPolicy::StrictVram
+                                       ? engine_options.cuda_vram_reserve_bytes : 0},
+        {"cuda_memory_probe_step_bytes", engine_options.cuda_memory_policy == CudaMemoryPolicy::StrictVram
+                                            ? engine_options.cuda_memory_probe_step_bytes : 0},
         {"mlp_a8_decode", engine_options.mlp_a8_decode},
         {"prefill_a8", engine_options.prefill_a8},
         {"prefix_reuse", options.allow_prefix_reuse},
@@ -832,6 +841,7 @@ std::string format_server_start_json(
              {"greedy", options.greedy}};
     record["memory"] =
         Json{{"weights", arena_json(memory.weights)},
+             {"cuda_residency", cuda_residency_json(memory.cuda_residency)},
              {"sequence", arena_json(memory.sequence)},
              {"workspace", arena_json(memory.workspace)},
              {"vision_workspace", vision_workspace_json(memory.vision_workspace)},

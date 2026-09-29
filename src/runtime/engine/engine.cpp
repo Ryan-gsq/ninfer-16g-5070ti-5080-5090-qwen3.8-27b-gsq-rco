@@ -84,6 +84,23 @@ std::string context_capacity_error(std::size_t prompt_tokens, std::uint32_t max_
            " tokens, exceeding Engine max_context " + std::to_string(max_context);
 }
 
+CudaResidencySummary residency_summary(const runtime::ModelInstance& instance) {
+    if (!instance.residency) { return {}; }
+    // stats() reads the session's cached snapshot. HTTP threads never enter CUDA or PDH.
+    const auto stats = instance.residency->stats();
+    return {.enabled = true,
+            .verified = stats.verified,
+            .cuda_free_bytes = stats.cuda_free_bytes,
+            .cuda_total_bytes = stats.cuda_total_bytes,
+            .dedicated_bytes = stats.dedicated_bytes,
+            .shared_bytes = stats.shared_bytes,
+            .shared_baseline_bytes = stats.shared_baseline_bytes,
+            .device_allocated_bytes = stats.device_allocated_bytes,
+            .host_pool_bytes = stats.host_pool_bytes,
+            .host_used_bytes = stats.host_used_bytes,
+            .verified_reserve_bytes = stats.verified_reserve_bytes};
+}
+
 } // namespace
 
 class PreparedPrompt::Impl {
@@ -221,6 +238,7 @@ public:
 
     ~Impl() noexcept {
         device.bind_to_current_thread_noexcept();
+        core::ResidentMemoryBinding resident_binding(active ? active->residency : nullptr);
         const bool persists = persists_prefix_cache();
         if (persists) {
             runtime::publish_diagnostic(
@@ -233,6 +251,7 @@ public:
             device.synchronize();
         } catch (...) {}
         if (persists) { report_prefix_cache_save(); }
+        active.reset();
     }
 
     [[nodiscard]] bool persists_prefix_cache() const noexcept {
@@ -469,7 +488,7 @@ ModelMetadata Engine::model_metadata() const {
 
 MemorySummary Engine::memory_summary() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    return std::visit(
+    MemorySummary summary = std::visit(
         [](const auto& core) -> MemorySummary {
             using CoreState = std::remove_cvref_t<decltype(core)>;
             if constexpr (std::is_same_v<CoreState, std::monostate>) {
@@ -479,6 +498,8 @@ MemorySummary Engine::memory_summary() const {
             }
         },
         impl_->core);
+    summary.cuda_residency = residency_summary(*impl_->active);
+    return summary;
 }
 
 MediaCacheSummary Engine::media_cache_summary() const {
@@ -488,7 +509,7 @@ MediaCacheSummary Engine::media_cache_summary() const {
 
 RuntimeStats Engine::runtime_stats() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    return std::visit(
+    RuntimeStats summary = std::visit(
         [](const auto& core) -> RuntimeStats {
             using CoreState = std::remove_cvref_t<decltype(core)>;
             if constexpr (std::is_same_v<CoreState, std::monostate>) {
@@ -498,6 +519,8 @@ RuntimeStats Engine::runtime_stats() const {
             }
         },
         impl_->core);
+    summary.cuda_residency = residency_summary(*impl_->active);
+    return summary;
 }
 
 bool Engine::is_available() const {

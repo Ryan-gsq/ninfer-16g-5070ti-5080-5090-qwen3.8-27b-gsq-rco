@@ -222,4 +222,63 @@ KvCapacityResolution resolve_kv_capacity(const KvCapacityPolicy& policy,
     };
 }
 
+KvCapacityResolution resolve_mixed_kv_capacity(const KvCapacityPolicy& policy,
+                                               const SequenceCapacityCurve& curve,
+                                               std::uint32_t max_context,
+                                               std::uint32_t max_concurrency,
+                                               std::size_t available_runtime_bytes) {
+    validate_curve(curve);
+    if (!curve.extra_ranks.empty()) {
+        throw std::invalid_argument("mixed CUDA memory supports only one device");
+    }
+    if (max_context == 0 || max_concurrency == 0 || max_concurrency > kMaximumConcurrency) {
+        throw std::invalid_argument("mixed KV capacity needs positive max_context and concurrency in [1,8]");
+    }
+    if (policy.automatic_headroom_bytes != 0) {
+        throw std::invalid_argument("mixed CUDA memory does not support automatic KV headroom; use auto with zero headroom");
+    }
+    std::uint32_t pages = 0;
+    switch (policy.mode) {
+    case KvCapacityMode::Explicit:
+        if (policy.explicit_tokens < max_context) {
+            throw std::invalid_argument("mixed explicit KV capacity must be at least max_context");
+        }
+        pages = explicit_page_groups(policy, curve);
+        break;
+    case KvCapacityMode::Automatic: {
+        if (policy.explicit_tokens != 0) {
+            throw std::invalid_argument("mixed automatic KV capacity must not carry explicit tokens");
+        }
+        const std::uint64_t window_pages =
+            1ULL + (static_cast<std::uint64_t>(max_context) - 1ULL) / curve.main_page_tokens;
+        // The operands are bounded uint32 and concurrency <= 8, so the multiplication fits uint64.
+        // Bound in page space before converting back to the public uint32 token capacity.
+        const std::uint64_t requested_pages = window_pages * max_concurrency;
+        pages = static_cast<std::uint32_t>(
+            std::min<std::uint64_t>(requested_pages, curve.maximum_main_page_groups));
+        break;
+    }
+    default:
+        throw std::invalid_argument("unknown KV capacity policy");
+    }
+    const std::size_t reservation = curve.reservation_bytes(pages);
+    const std::uint32_t tokens = curve.resolved_tokens(pages);
+    if (tokens < max_context) {
+        throw std::invalid_argument("mixed KV capacity curve cannot hold one max_context window");
+    }
+    return KvCapacityResolution{
+        .mode                                 = policy.mode,
+        .main_page_groups                     = pages,
+        .maximum_main_page_groups             = curve.maximum_main_page_groups,
+        .resolved_tokens                      = tokens,
+        .minimum_runtime_reservation_bytes    = curve.minimum_device_reservation_bytes,
+        .bytes_per_additional_main_page_group = curve.bytes_per_additional_main_page_group,
+        .runtime_reservation_bytes            = reservation,
+        .available_after_weights_bytes        = available_runtime_bytes,
+        .automatic_headroom_bytes             = 0,
+        .planned_slack_bytes                  = available_runtime_bytes > reservation
+                                                   ? available_runtime_bytes - reservation : 0,
+    };
+}
+
 } // namespace ninfer::runtime

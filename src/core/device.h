@@ -16,6 +16,17 @@
 
 namespace ninfer {
 
+// Strict residency startup may retry an allocation failure, but must never classify an illegal
+// access or another execution error as capacity pressure. Keep the CUDA status as typed data.
+class CudaError : public std::runtime_error {
+public:
+    CudaError(cudaError_t status, std::string message)
+        : std::runtime_error(std::move(message)), status_(status) {}
+    [[nodiscard]] cudaError_t status() const noexcept { return status_; }
+private:
+    cudaError_t status_;
+};
+
 void cuda_check(cudaError_t err, const char* expr, const char* file, int line);
 
 #define CUDA_CHECK(expr) ::ninfer::cuda_check((expr), #expr, __FILE__, __LINE__)

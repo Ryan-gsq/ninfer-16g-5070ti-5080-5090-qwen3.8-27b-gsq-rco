@@ -7,6 +7,7 @@
 #include "core/host_kv_clamp.h"
 #include "core/startup.h"
 #include "core/device.h"
+#include "core/resident_memory.h"
 #include <cuda_runtime.h>
 #include "ninfer/ops/target_logprobs.h"
 
@@ -188,6 +189,14 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
       context_transfer_timers_{CudaEventTimer(device_in, device_in.transfer_stream),
                                CudaEventTimer(device_in, device_in.transfer_stream),
                                CudaEventTimer(device_in, device_in.transfer_stream)} {
+    // The Program destructor does not run if its constructor throws. Synchronize before members
+    // unwind, so queued initialization/Graph work cannot retain pointers to freed arena backing.
+    struct StartupSyncGuard {
+        DeviceContext& device;
+        ~StartupSyncGuard() noexcept {
+            try { device.synchronize(); } catch (...) {}
+        }
+    } startup_sync{device};
     if (&parameters != plan.parameters || parameters.model.options() != plan.features) {
         throw std::invalid_argument("Program parameters do not match the frozen sequence plan");
     }
@@ -532,11 +541,26 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     }
     if (use_cuda_graph) {
         StartupPhaseScope graph_phase(startup_observer, StartupPhase::CudaGraphPrepare);
+        const auto residency = core::current_resident_memory();
+        std::size_t dedicated_before = 0;
+        if (residency) {
+            residency->check("before Graph preparation");
+            dedicated_before = residency->stats().dedicated_bytes;
+        }
         const std::size_t free_before = device.free_bytes();
         prepare_graphs();
         device.synchronize();
         const std::size_t free_after = device.free_bytes();
         graph_measured_bytes         = free_before > free_after ? free_before - free_after : 0;
+        if (residency) {
+            // WDDM clamps CUDA free at zero once the process is over budget. Use
+            // the process's observed dedicated delta so Graph usage does not
+            // falsely become zero precisely when capacity is being stretched.
+            residency->check("after Graph preparation");
+            const auto dedicated_after = residency->stats().dedicated_bytes;
+            graph_measured_bytes = dedicated_after > dedicated_before
+                ? dedicated_after - dedicated_before : 0;
+        }
         graph_phase.complete();
     }
     work.reset();

@@ -1,4 +1,5 @@
 #include "core/device.h"
+#include "core/resident_memory.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -64,6 +65,11 @@ void destroy_event(cudaEvent_t& event) noexcept {
 
 void cuda_check(cudaError_t err, const char* expr, const char* file, int line) {
     if (err == cudaSuccess) { return; }
+    if (core::current_resident_memory()) {
+        throw CudaError(err, std::string(file) + ":" + std::to_string(line) +
+                                ": CUDA_CHECK(" + expr + ") failed: " +
+                                cudaGetErrorName(err) + ": " + cudaGetErrorString(err));
+    }
     std::fprintf(stderr, "%s:%d: CUDA_CHECK(%s) failed: %s: %s\n", file, line, expr,
                  cudaGetErrorName(err), cudaGetErrorString(err));
     std::abort();

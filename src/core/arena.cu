@@ -1,4 +1,5 @@
 #include "core/arena.h"
+#include "core/resident_memory.h"
 
 #include <cuda_runtime.h>
 
@@ -294,6 +295,11 @@ bool wddm_residency_lock_enabled() noexcept { return false; }
 
 DeviceBuffer::DeviceBuffer(std::size_t size_bytes) : bytes(size_bytes) {
     if (bytes == 0) { return; }
+    resident_session_ = core::current_resident_memory();
+    if (resident_session_) {
+        p = resident_session_->allocate_device(bytes);
+        return;
+    }
 
     void* ptr             = nullptr;
     const cudaError_t err = cudaMalloc(&ptr, bytes);
@@ -303,9 +309,13 @@ DeviceBuffer::DeviceBuffer(std::size_t size_bytes) : bytes(size_bytes) {
     p = ptr;
 }
 
-DeviceBuffer::~DeviceBuffer() { free_device(p); }
+DeviceBuffer::~DeviceBuffer() {
+    if (resident_session_) { resident_session_->free_device(p); }
+    else { free_device(p); }
+}
 
-DeviceBuffer::DeviceBuffer(DeviceBuffer&& other) noexcept : p(other.p), bytes(other.bytes) {
+DeviceBuffer::DeviceBuffer(DeviceBuffer&& other) noexcept
+    : p(other.p), bytes(other.bytes), resident_session_(std::move(other.resident_session_)) {
     other.p     = nullptr;
     other.bytes = 0;
 }
@@ -313,7 +323,9 @@ DeviceBuffer::DeviceBuffer(DeviceBuffer&& other) noexcept : p(other.p), bytes(ot
 DeviceBuffer& DeviceBuffer::operator=(DeviceBuffer&& other) noexcept {
     if (this == &other) { return *this; }
 
-    free_device(p);
+    if (resident_session_) { resident_session_->free_device(p); }
+    else { free_device(p); }
+    resident_session_ = std::move(other.resident_session_);
     p     = other.p;
     bytes = other.bytes;
 
@@ -421,6 +433,13 @@ DeviceArena::DeviceArena(std::size_t capacity_bytes) {
         throw std::invalid_argument("DeviceArena capacity must be nonzero");
     }
 
+    resident_session_ = core::current_resident_memory();
+    if (resident_session_) {
+        base_ = resident_session_->allocate_device(capacity_bytes);
+        owned_base_ = base_;
+        cap_ = capacity_bytes;
+        return;
+    }
     void* ptr = nullptr;
 #if NINFER_WDDM_RESIDENCY
     if (core::wddm_residency_lock_enabled()) { ptr = allocate_resident_heap(capacity_bytes); }
@@ -458,12 +477,16 @@ DeviceArena::DeviceArena(DeviceSpan storage)
 }
 
 DeviceArena::~DeviceArena() {
-    if (owns_) { free_arena(owned_base_); }
+    if (owns_) {
+        if (resident_session_) { resident_session_->free_device(owned_base_); }
+        else { free_arena(owned_base_); }
+    }
 }
 
 DeviceArena::DeviceArena(DeviceArena&& other) noexcept
     : base_(other.base_), cap_(other.cap_), off_(other.off_), peak_(other.peak_),
-      owns_(other.owns_), owned_base_(other.owned_base_), ranks_(std::move(other.ranks_)),
+      owns_(other.owns_), owned_base_(other.owned_base_),
+      resident_session_(std::move(other.resident_session_)), ranks_(std::move(other.ranks_)),
       active_rank_(other.active_rank_) {
     other.base_        = nullptr;
     other.cap_         = 0;
@@ -478,7 +501,11 @@ DeviceArena::DeviceArena(DeviceArena&& other) noexcept
 DeviceArena& DeviceArena::operator=(DeviceArena&& other) noexcept {
     if (this == &other) { return *this; }
 
-    if (owns_) { free_arena(owned_base_); }
+    if (owns_) {
+        if (resident_session_) { resident_session_->free_device(owned_base_); }
+        else { free_arena(owned_base_); }
+    }
+    resident_session_ = std::move(other.resident_session_);
     base_       = other.base_;
     cap_        = other.cap_;
     off_        = other.off_;
@@ -624,6 +651,12 @@ ScopedArenaRank::~ScopedArenaRank() noexcept {
 
 PinnedHostBuffer::PinnedHostBuffer(std::size_t size_bytes) {
     if (size_bytes == 0) { throw std::invalid_argument("PinnedHostBuffer size must be nonzero"); }
+    resident_session_ = core::current_resident_memory();
+    if (resident_session_) {
+        data_ = resident_session_->allocate_host(size_bytes);
+        size_ = size_bytes;
+        return;
+    }
 
     // A pending error from an earlier call is returned by whatever runs next, so read and clear it
     // first. Without this, a failure here can be somebody else's error wearing this message.
@@ -681,10 +714,13 @@ PinnedHostBuffer::PinnedHostBuffer(std::size_t size_bytes) {
     size_ = size_bytes;
 }
 
-PinnedHostBuffer::~PinnedHostBuffer() { free_pinned(data_); }
+PinnedHostBuffer::~PinnedHostBuffer() {
+    if (resident_session_) { resident_session_->free_host(data_); }
+    else { free_pinned(data_); }
+}
 
 PinnedHostBuffer::PinnedHostBuffer(PinnedHostBuffer&& other) noexcept
-    : data_(other.data_), size_(other.size_) {
+    : data_(other.data_), size_(other.size_), resident_session_(std::move(other.resident_session_)) {
     other.data_ = nullptr;
     other.size_ = 0;
 }
@@ -692,7 +728,9 @@ PinnedHostBuffer::PinnedHostBuffer(PinnedHostBuffer&& other) noexcept
 PinnedHostBuffer& PinnedHostBuffer::operator=(PinnedHostBuffer&& other) noexcept {
     if (this == &other) { return *this; }
 
-    free_pinned(data_);
+    if (resident_session_) { resident_session_->free_host(data_); }
+    else { free_pinned(data_); }
+    resident_session_ = std::move(other.resident_session_);
     data_ = other.data_;
     size_ = other.size_;
 

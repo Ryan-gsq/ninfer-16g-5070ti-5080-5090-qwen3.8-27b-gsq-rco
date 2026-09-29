@@ -69,6 +69,78 @@ int main() {
 
     int failures = 0;
 
+#ifdef _WIN32
+    // Strict selects Hybrid before deriving snapshot/tap capacities. Host cache remains a
+    // separate choice, including zero, and strict's own reserve defines automatic headroom.
+    for (const std::size_t host_bytes : {0ULL, 6ULL << 30}) {
+        EngineOptions options;
+        options.cuda_memory_policy = ninfer::CudaMemoryPolicy::StrictVram;
+        options.kv_capacity = ninfer::KvCapacityPolicy::automatic();
+        options.context_cache.host_cache_budget_bytes = host_bytes;
+        const auto out = normalize_engine_options(options);
+        failures += check(out.context_cache.enabled &&
+                              out.context_cache.mode == ninfer::ContextCacheMode::Hybrid &&
+                              out.context_cache.host_cache_budget_bytes == host_bytes &&
+                              out.context_cache.hybrid.device_snapshot_slots == (host_bytes == 0 ? 3U : 2U) &&
+                              out.kv_capacity.automatic_headroom_bytes == (64ULL << 20),
+                          "strict did not select Hybrid while preserving Host cache and 64 MiB reserve");
+    }
+    {
+        EngineOptions options;
+        options.cuda_memory_policy = ninfer::CudaMemoryPolicy::StrictVram;
+        options.cuda_vram_reserve_bytes = 96ULL << 20;
+        options.kv_capacity = ninfer::KvCapacityPolicy::automatic();
+        const auto out = normalize_engine_options(options);
+        failures += check(out.kv_capacity.automatic_headroom_bytes == (96ULL << 20),
+                          "strict custom reserve did not replace default KV headroom");
+    }
+    {
+        EngineOptions options;
+        options.cuda_memory_policy = ninfer::CudaMemoryPolicy::Mixed;
+        options.kv_capacity = ninfer::KvCapacityPolicy::automatic();
+        options.cuda_memory_probe_step_bytes = 0; // Mixed must not use strict-only knobs.
+        options.cuda_vram_reserve_bytes = 123ULL << 20;
+        options.context_cache.host_cache_budget_bytes = 3ULL << 30;
+        const auto out = normalize_engine_options(options);
+        failures += check(out.kv_capacity.automatic_headroom_bytes == 0 &&
+                              out.context_cache.host_cache_budget_bytes == (3ULL << 30) &&
+                              out.context_cache.mode == ninfer::ContextCacheMode::Legacy,
+                          "mixed changed Host cache, forced Hybrid, or retained automatic headroom");
+    }
+    for (int variant = 0; variant < 5; ++variant) {
+        EngineOptions options;
+        options.cuda_memory_policy = variant == 4 ? ninfer::CudaMemoryPolicy::StrictVram
+                                                  : ninfer::CudaMemoryPolicy::Mixed;
+        if (variant == 0) { options.enable_vision = true; }
+        if (variant == 1) { options.devices = {0, 1}; }
+        if (variant == 2) { options.wddm_evictable_budget = true; }
+        if (variant == 3) { options.purpose = ninfer::EnginePurpose::CausalScoring; }
+        if (variant == 4) { options.context_cache.enabled = false; }
+        bool rejected = false;
+        try { (void)normalize_engine_options(options); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "memory policy accepted an unsupported deployment or disabled strict cache");
+    }
+#else
+    for (const auto mode : {ninfer::CudaMemoryPolicy::Mixed, ninfer::CudaMemoryPolicy::StrictVram}) {
+        EngineOptions options;
+        options.cuda_memory_policy = mode;
+        bool rejected = false;
+        try { (void)normalize_engine_options(options); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "Windows memory policy normalized on another platform");
+    }
+#endif
+    {
+        EngineOptions options;
+        options.kv_capacity = ninfer::KvCapacityPolicy::automatic(1234);
+        const auto out = normalize_engine_options(options);
+        failures += check(out.cuda_memory_policy == ninfer::CudaMemoryPolicy::DriverDefault &&
+                              out.context_cache.mode == ninfer::ContextCacheMode::Legacy &&
+                              out.kv_capacity.automatic_headroom_bytes == 1234,
+                          "default memory policy normalization changed");
+    }
+
     // A single request can materialize up to kMaximumPreparedPromptCacheCandidatesPerRequest
     // distinct shared-prefix candidates on its own: four explicit markers plus the engine's
     // tool/leading-instruction/full-prompt automatic candidates. The default

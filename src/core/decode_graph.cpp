@@ -2,6 +2,7 @@
 
 #include "core/device.h"
 #include "core/nvtx.h"
+#include "core/resident_memory.h"
 
 #include <cstdio>
 #include <stdexcept>
@@ -124,6 +125,9 @@ void DecodeGraphExecutable::update(const DecodeGraphDefinition& definition) {
 
     cudaGraphExecUpdateResultInfo result{};
     const cudaError_t err = cudaGraphExecUpdate(exec_, definition.graph_, &result);
+    // Strict startup may retry a CUDA allocation failure, but a topology incompatibility is
+    // still fatal. Preserve the original combined error on the driver-default route.
+    if (err != cudaSuccess && core::current_resident_memory()) { CUDA_CHECK(err); }
     if (err != cudaSuccess || result.result != cudaGraphExecUpdateSuccess) {
         throw std::runtime_error(
             "CUDA Graph executable update failed: " + std::string(cudaGetErrorName(err)) +

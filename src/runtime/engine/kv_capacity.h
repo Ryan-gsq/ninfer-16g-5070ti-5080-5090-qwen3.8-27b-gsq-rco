@@ -16,4 +16,13 @@ resolve_kv_capacity(const KvCapacityPolicy& policy, const SequenceCapacityCurve&
                     std::size_t available_runtime_bytes,
                     std::span<const std::size_t> extra_rank_available_bytes = {});
 
+// Mixed allows the driver to satisfy an allocation beyond its reported free bytes. Explicit
+// capacity is preserved; automatic capacity is bounded by one full context window per lane and
+// the plan's representable page count. There is no memory probe or fallback to a smaller pool.
+// `available_runtime_bytes` remains the observed free memory, used only for reporting.
+[[nodiscard]] KvCapacityResolution
+resolve_mixed_kv_capacity(const KvCapacityPolicy& policy, const SequenceCapacityCurve& curve,
+                          std::uint32_t max_context, std::uint32_t max_concurrency,
+                          std::size_t available_runtime_bytes);
+
 } // namespace ninfer::runtime

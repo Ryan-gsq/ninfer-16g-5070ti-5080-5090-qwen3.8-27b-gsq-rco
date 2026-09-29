@@ -115,7 +115,35 @@ int main() {
     sample.stats.active_captures_completed        = 3;
     sample.stats.pressure_private_owners_demoted  = 2;
     sample.stats.pressure_private_owners_degraded = 2;
+    sample.stats.cuda_residency = {.enabled = true,
+                                  .verified = true,
+                                  .cuda_free_bytes = 0,
+                                  .cuda_total_bytes = 16ULL << 30,
+                                  .dedicated_bytes = 15ULL << 30,
+                                  .shared_bytes = 74ULL << 20,
+                                  .shared_baseline_bytes = 74ULL << 20,
+                                  .device_allocated_bytes = 14ULL << 30,
+                                  .host_pool_bytes = 4ULL << 30,
+                                  .host_used_bytes = 2ULL << 30,
+                                  .verified_reserve_bytes = 64ULL << 20};
     const Json stats = Json::parse(make_stats_report(capacity, sample));
+    const Json& residency = stats.at("memory").at("cuda_residency");
+    failures += check(residency.at("enabled") == true && residency.at("verified") == true &&
+                          residency.at("cuda_free_bytes") == 0 &&
+                          residency.at("cuda_total_bytes") == (16ULL << 30) &&
+                          residency.at("dedicated_bytes") == (15ULL << 30) &&
+                          residency.at("shared_bytes") == (74ULL << 20) &&
+                          residency.at("shared_baseline_bytes") == (74ULL << 20) &&
+                          residency.at("device_allocated_bytes") == (14ULL << 30) &&
+                          residency.at("host_pool_bytes") == (4ULL << 30) &&
+                          residency.at("host_used_bytes") == (2ULL << 30) &&
+                          residency.at("verified_reserve_bytes") == (64ULL << 20),
+                      "stats report lost cached residency verification or byte counters");
+    const Json disabled_residency = Json::parse(make_stats_report(capacity, LoadSample{}))
+                                        .at("memory").at("cuda_residency");
+    failures += check(disabled_residency.at("enabled") == false &&
+                          disabled_residency.at("verified") == false,
+                      "disabled residency monitoring must not claim verification");
     failures += check(stats.at("object") == "ninfer.stats" &&
                           stats.at("capacity") == report.at("capacity") &&
                           stats.at("requests").at("admitted") == 6 &&

@@ -5,6 +5,7 @@
 #include "models/qwen3_5/program/runtime_types.h"
 #include "runtime/engine/context_cache/context_cost.h"
 #include "runtime/engine/kv_capacity.h"
+#include "core/resident_memory.h"
 
 #include <memory>
 
@@ -15,6 +16,8 @@ namespace ninfer::runtime {
 struct ModelInstance {
     using ModelContract = models::qwen3_5::RuntimeTypes;
 
+    // Keep the fixed Host pool and device accounting alive through Program and weight destruction.
+    std::shared_ptr<core::ResidentMemorySession> residency;
     std::unique_ptr<models::qwen3_5::Model> model;
     const models::qwen3_5::execution::Parameters parameters;
     models::qwen3_5::Frontend frontend;

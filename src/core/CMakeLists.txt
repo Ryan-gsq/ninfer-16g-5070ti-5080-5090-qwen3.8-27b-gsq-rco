@@ -1,5 +1,7 @@
 add_library(ninfer_core STATIC
   arena.cu
+  resident_memory.cpp
+  resident_scan.cu
   device.cu
   stage_link.cu
   dtype.cpp
@@ -23,6 +25,9 @@ add_library(ninfer_core STATIC
 ninfer_internal_includes(ninfer_core)
 ninfer_cuda_archive(ninfer_core)
 target_link_libraries(ninfer_core PUBLIC ${NINFER_CUDART_TARGET} CUDA::nvtx3 Threads::Threads CUDA::cuda_driver)
+if(WIN32)
+  target_link_libraries(ninfer_core PUBLIC pdh dxgi)
+endif()
 if(WIN32 AND NINFER_D3D12_RESIDENCY)
   target_link_libraries(ninfer_core PUBLIC d3d12 dxgi)
 endif()

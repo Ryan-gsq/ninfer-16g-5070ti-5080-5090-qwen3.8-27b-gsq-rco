@@ -369,6 +369,17 @@ its Engine `request_id`, `position` and `wait_seconds`, refreshed at least once 
 requests wait. It needs the API key like `/v1/load` and, like it, reads only published snapshots.
 Dashboards poll it, or the same route on `--stats-port`.
 
+`memory.cuda_residency` contains the Engine worker's cached residency observation. Reading
+`/stats` does not query CUDA or Windows performance counters and does not acquire the execution
+lock. It has `enabled` and `verified` booleans and these byte counters:
+`cuda_free_bytes`, `cuda_total_bytes`, `dedicated_bytes`, `shared_bytes`,
+`shared_baseline_bytes`, `device_allocated_bytes`, `host_pool_bytes`,
+`host_used_bytes`, and `verified_reserve_bytes`. The startup JSONL record includes the
+same object under `memory.cuda_residency`, plus the selected policy, reserve and probe step in
+its `engine` object. When `enabled` is false, zero counters mean monitoring is disabled;
+they do not prove zero memory use. `verified` reports the latest admission/guard state,
+not permanent physical pinning.
+
 ### Metrics
 
 `GET /metrics` renders the same snapshot as `/v1/load`, plus totals accumulated from completed
@@ -1185,6 +1196,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--rope-scaling-original-context N` | the interpolation threshold | the native window |
 | `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory; omitted means `--max-context`, or `auto` with `--use-alt-prefix-caching` | `8192` |
 | `--kv-headroom-mib N` | device memory in MiB that `--kv-capacity auto` leaves free after sizing the KV pool; requires `auto`. `--vram-headroom-mib` is accepted as an alias | `1024` |
+| `--cuda-memory-policy default\|mixed\|strict\|strict-N-N` | choose reported-free sizing, allowed Windows system-RAM fallback, or verified VRAM residency; `strict` means reserve 64 MiB / probe step 128 MiB. [Policy details](rtx-5070ti-windows.en.md#4-choose-a-memory-policy) | `default` |
 | `--max-concurrency N` | maximum admitted requests; valid range `1..8` | `1` |
 | `--max-pending-requests N` | additional requests allowed to wait for admission | `16` |
 | `--pending-timeout-ms N` | maximum preparation-plus-admission wait | `600000` |
@@ -1454,6 +1466,10 @@ that same allocation; these bytes must not be added to `workspace.capacity_bytes
 `cuda_graph_allowance_bytes` is the CUDA Graph memory the KV sizing reserved, and
 `cuda_graph_measured_bytes` the Device memory graph preparation actually took at startup (`0`
 without CUDA Graphs); the startup log warns when the second exceeds the first.
+In `strict` mode this measurement uses the matching process/GPU Dedicated counter delta
+across Graph preparation. CUDA's free-memory delta can otherwise report zero once WDDM clamps
+free memory to zero. The observed preparation delta may include lazy driver/kernel allocations
+in that interval; it is not a per-Graph allocation ledger.
 
 `server_start.engine` records `ngram_draft_window` and `ngram_min_match` (`--ngram-draft-tokens`,
 `0` when n-gram drafting is off, and `--ngram-min-match`), the draft-archive budgets
@@ -1570,6 +1586,52 @@ through a DirectStorage queue, every page of a staging batch in flight at once, 
 from the mapped files. Each page is still checked against its CRC, and a batch that fails or does
 not complete within 10 seconds falls back to the mapped reads. This path has been checked to compile
 against Windows headers but has not been run.
+
+## Strict CUDA residency
+
+On Windows, `--cuda-memory-policy strict` automatically selects the Hybrid cache and enables controlled
+allocation above the CUDA-reported free-memory estimate. It currently requires one GPU, text
+generation and the Hybrid context cache. Vision, pipeline devices and
+`--wddm-evictable-budget` are rejected. Ordinary CUDA allocation remains the default; selecting
+this policy does not enable D3D12 or change inference kernels.
+
+The strict policy prepares intentional pinned Host resources before recording its process Shared
+baseline. Host cache remains system RAM and is accounted separately; its configured size must not
+simply be subtracted from Windows Shared usage. The startup probe estimates capacity with
+temporary allocations, then releases them and builds the actual contiguous weight, KV/state and
+workspace layout. `cudaMemGetInfo` supplies an estimate, not a hard rejection boundary.
+Successful `cudaMalloc` calls alone are insufficient: device data must be touched and the complete
+working set must pass the residency guard after initialization and Graph preparation.
+
+The second number in `strict-64-128` controls the temporary probe step in MiB. It does not split tensors,
+alter their pointer arithmetic or replace continuous device arenas with independent pointers.
+The first number requests an additional touched spare allocation at final admission;
+the allocation is released after validation. This default is an experimental margin, not a claim
+that 64 MiB is sufficient for every desktop workload or model configuration. Graph allowance and
+the spare allocation are separate resources. Both numbers apply only to strict mode.
+
+For `--kv-capacity auto`, strict mode uses the reserve from its policy value, counted once.
+`--kv-headroom-mib` is accepted only with `default + auto`. Mixed auto capacity is bounded
+to one full page-rounded context window per concurrent request; it does not fill system RAM.
+Mixed explicit capacity bypasses the CUDA-free planning rejection and attempts the requested
+allocation without rejecting driver Shared growth. Default retains the old free-based planning
+and also does not guarantee permanent dedicated residency. Neither mixed nor strict enables
+D3D12; they currently require Windows single-GPU text generation. See the English
+[memory-policy reference](rtx-5070ti-windows.en.md#4-choose-a-memory-policy)
+for exact values, Host-cache separation, limits and the manager form.
+
+An automatic KV candidate may fall back to a smaller legal capacity after an allocation or
+residency rejection, with at most eight startup attempts, but the Engine must still back the
+requested `--max-context`. It does not
+silently shorten the advertised context. Invalid data or CUDA execution errors are not treated
+as capacity failures. A candidate with unexplained Shared growth is not published as ready.
+
+This is an observational Windows guard, not an interface that permanently pins all CUDA device
+pages in physical VRAM. Counter sampling can detect and reject a spill after its first occurrence;
+it cannot prove that no transient migration ever happened. Other GPU workloads can also change
+residency after startup. Consider NVIDIA Control Panel's per-application **CUDA — Sysmem Fallback
+Policy → Prefer No Sysmem Fallback** if available, and recalibrate after changing that driver
+setting. The Engine does not modify driver profiles. See the [NVIDIA setting documentation](https://nvidia.custhelp.com/app/answers/detail/a_id/5490/).
 
 ## Execution behavior
 

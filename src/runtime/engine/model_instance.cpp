@@ -15,6 +15,7 @@
 #include <cmath>
 #include <filesystem>
 #include <memory>
+#include <limits>
 #include <optional>
 #include <string>
 #include <system_error>
@@ -29,7 +30,48 @@ namespace ninfer::runtime {
 namespace {
 using Clock = std::chrono::steady_clock;
 
+void validate_memory_policy(const EngineOptions& options) {
+    switch (options.cuda_memory_policy) {
+    case CudaMemoryPolicy::DriverDefault:
+        break;
+    case CudaMemoryPolicy::Mixed:
+#ifndef _WIN32
+        throw std::invalid_argument("mixed CUDA memory requires Windows driver paging");
+#endif
+        if (options.purpose != EnginePurpose::Generation || options.devices.size() > 1 ||
+            options.enable_vision || options.wddm_evictable_budget) {
+            throw std::invalid_argument(
+                "mixed CUDA memory supports single-GPU text generation and ordinary CUDA "
+                "allocation only; scoring, Vision, pipeline devices and wddm-evictable-budget "
+                "are not supported");
+        }
+        if (options.kv_capacity.automatic_headroom_bytes != 0) {
+            throw std::invalid_argument("mixed CUDA memory requires zero automatic KV headroom");
+        }
+        break;
+    case CudaMemoryPolicy::StrictVram:
+#ifndef _WIN32
+        throw std::invalid_argument("strict requires Windows GPU residency counters");
+#endif
+        if (options.purpose != EnginePurpose::Generation || options.devices.size() > 1 ||
+            options.enable_vision || options.wddm_evictable_budget ||
+            !options.context_cache.enabled || options.context_cache.mode != ContextCacheMode::Hybrid) {
+            throw std::invalid_argument(
+                "strict supports single-GPU text generation with the Hybrid prefix cache "
+                "only; scoring, Vision, pipeline devices, Legacy/disabled cache and "
+                "wddm-evictable-budget are not supported");
+        }
+        if (options.cuda_memory_probe_step_bytes == 0) {
+            throw std::invalid_argument("strict probe step must be positive");
+        }
+        break;
+    default:
+        throw std::invalid_argument("unknown CUDA memory policy");
+    }
+}
+
 void validate_options(const EngineOptions& options) {
+    validate_memory_policy(options);
     if (options.artifact_path.empty()) {
         throw std::invalid_argument("Engine artifact_path must not be empty");
     }
@@ -218,6 +260,22 @@ EngineOptions normalize_engine_options(EngineOptions options) {
     }
 
     ContextCacheOptions& cache = options.context_cache;
+    if (options.cuda_memory_policy == CudaMemoryPolicy::StrictVram) {
+        if (!cache.enabled) {
+            throw std::invalid_argument("strict CUDA memory requires prefix reuse and cannot disable the context cache");
+        }
+        // Select the cache before deriving its capacities. Host cache remains an independent
+        // setting: an explicit zero or nonzero budget must survive this normalization unchanged.
+        cache.mode = ContextCacheMode::Hybrid;
+    }
+    if (options.kv_capacity.mode == KvCapacityMode::Automatic) {
+        if (options.cuda_memory_policy == CudaMemoryPolicy::StrictVram) {
+            options.kv_capacity.automatic_headroom_bytes = options.cuda_vram_reserve_bytes;
+        } else if (options.cuda_memory_policy == CudaMemoryPolicy::Mixed) {
+            options.kv_capacity.automatic_headroom_bytes = 0;
+        }
+    }
+    validate_memory_policy(options);
     if (options.speculative.ngram_archive_bytes != 0 &&
         options.speculative.ngram_draft_tokens == 0) {
         throw std::invalid_argument(
@@ -454,6 +512,30 @@ void install_device_route_profile_for(const EngineOptions& options, const Device
 ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& device) {
     validate_options(requested);
     install_device_route_profile_for(requested, device);
+    std::shared_ptr<core::ResidentMemorySession> residency;
+    if (requested.cuda_memory_policy == CudaMemoryPolicy::StrictVram) {
+        constexpr std::size_t staging_and_control = 320ULL << 20;
+        const std::size_t host_cache = requested.context_cache.host_cache_budget_bytes.value();
+        if (host_cache > std::numeric_limits<std::size_t>::max() - staging_and_control) {
+            throw std::overflow_error("strict Host pool capacity overflows size_t");
+        }
+        const std::size_t reserve =
+            requested.kv_capacity.mode == KvCapacityMode::Automatic
+                ? std::max(requested.cuda_vram_reserve_bytes,
+                           requested.kv_capacity.automatic_headroom_bytes)
+                : requested.cuda_vram_reserve_bytes;
+        residency = std::make_shared<core::ResidentMemorySession>(core::ResidentMemoryConfig{
+            .device = device.rank(0).device,
+            .reserve_bytes = reserve,
+            .host_pool_bytes = host_cache + staging_and_control,
+            .probe_step_bytes = requested.cuda_memory_probe_step_bytes,
+        });
+        publish_diagnostic(requested.diagnostic_observer, DiagnosticLevel::Info,
+                           "strict: fixed Host pool %.1f MiB, verified reserve %.1f MiB",
+                           static_cast<double>(host_cache + staging_and_control) / 1048576.0,
+                           static_cast<double>(reserve) / 1048576.0);
+    }
+    core::ResidentMemoryBinding resident_binding(residency);
     const auto start = Clock::now();
     // Every later stage of startup checks its options against the ones the model was loaded with, so
     // the stage split is decided once, here, and carried in the options from then on.
@@ -478,8 +560,15 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
     auto model =
         models::qwen3_5::materialize_model(std::move(plan), device, &options.startup_observer);
     device.synchronize();
+    if (residency && model->storage_stats().pinned_bytes != 0) {
+        throw std::invalid_argument(
+            "strict requires all selected weights resident on the device; "
+            "the artifact materialized pinned Host weights");
+    }
     StartupPhaseScope frontend(options.startup_observer, StartupPhase::FrontendInitialize);
     auto instance = std::make_unique<ModelInstance>(std::move(model), options);
+    instance->residency = residency;
+    if (residency) { residency->verify_working_set(false); }
     frontend.complete();
     StartupPhaseScope planning(options.startup_observer, StartupPhase::TargetFinalize);
     const std::size_t overlay_window_bytes =
@@ -490,61 +579,143 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
                 context_cost_hardware_class(device.props.name, device.props.major, device.props.minor),
             .prefill_signature = signature},
         options.context_cost.preset_path);
-    auto planner = models::qwen3_5::make_sequence_planner(
-        instance->parameters, device,
-        artifact_scoped_disk_tier(options, instance->model->info().artifact_id));
-    const std::vector<std::size_t> free_by_rank =
+    const EngineOptions planning_options =
+        artifact_scoped_disk_tier(options, instance->model->info().artifact_id);
+    const auto curve = models::qwen3_5::make_sequence_planner(
+        instance->parameters, device, planning_options).capacity_curve();
+    std::vector<std::size_t> free_by_rank =
         free_bytes_by_rank(device, options.wddm_evictable_budget,
                            instance->model->storage_stats().device_capacity_bytes);
-    auto resolution = resolve_kv_capacity(
-        options.kv_capacity, planner.capacity_curve(), free_by_rank.front(),
-        std::span<const std::size_t>(free_by_rank).subspan(1));
-    auto sequence   = std::move(planner).finalize(resolution.main_page_groups);
-    if (sequence.device_reservation_bytes() != resolution.runtime_reservation_bytes ||
-        sequence.kv_capacity() != resolution.resolved_tokens ||
-        !std::ranges::equal(sequence.extra_rank_reservation_bytes(),
-                            resolution.extra_rank_reservation_bytes)) {
-        throw std::logic_error("resolved KV capacity does not match the finalized Program plan");
+    KvCapacityPolicy capacity_policy = options.kv_capacity;
+    if (residency) {
+        const auto memory = residency->stats();
+        const std::size_t physical_upper_bound =
+            memory.cuda_total_bytes > memory.device_allocated_bytes
+                ? memory.cuda_total_bytes - memory.device_allocated_bytes : 0;
+        if (capacity_policy.mode == KvCapacityMode::Automatic) {
+            capacity_policy.automatic_headroom_bytes =
+                std::max(capacity_policy.automatic_headroom_bytes,
+                         options.cuda_vram_reserve_bytes);
+            // Temporary probe blocks are released before constructing real contiguous arenas.
+            // The probe returns held bytes, without subtracting the reserve a second time.
+            free_by_rank.front() = residency->probe_available_bytes(physical_upper_bound);
+            residency->verify_working_set(false);
+        } else {
+            // WDDM free is an estimate, not an allocation limit. This upper bound rejects only
+            // impossible sizes; actual allocation and working-set verification decide admission.
+            free_by_rank.front() = physical_upper_bound > options.cuda_vram_reserve_bytes
+                ? physical_upper_bound - options.cuda_vram_reserve_bytes : 0;
+        }
     }
-    // The plan is the one authority for the resolved context-cache shape: its Host state slots,
-    // Host KV bytes and long-anchor count may have been derived from the single host RAM budget.
-    // Publishing that shape to the options the Engine keeps — and to the frontend grid built
-    // before the plan existed — keeps the reported options, the ResourceManager and the Program
-    // on the same capacity instead of a silently divergent default.
+    auto resolution = options.cuda_memory_policy == CudaMemoryPolicy::Mixed
+        ? resolve_mixed_kv_capacity(capacity_policy, curve, options.max_context,
+                                   options.max_concurrency, free_by_rank.front())
+        : resolve_kv_capacity(capacity_policy, curve, free_by_rank.front(),
+                              std::span<const std::size_t>(free_by_rank).subspan(1));
     EngineOptions resolved = options;
-    resolved.context_cache = sequence.context_cache_options();
+    LoadSummary::PrefixCacheRestore restore;
+    constexpr unsigned maximum_attempts = 8;
+    for (unsigned attempt = 0; ; ++attempt) {
+        auto planner = models::qwen3_5::make_sequence_planner(
+            instance->parameters, device, planning_options);
+        auto sequence = std::move(planner).finalize(resolution.main_page_groups);
+        if (sequence.device_reservation_bytes() != resolution.runtime_reservation_bytes ||
+            sequence.kv_capacity() != resolution.resolved_tokens ||
+            !std::ranges::equal(sequence.extra_rank_reservation_bytes(),
+                                resolution.extra_rank_reservation_bytes)) {
+            throw std::logic_error("resolved KV capacity does not match the finalized Program plan");
+        }
+        resolved.context_cache = sequence.context_cache_options();
+        if (attempt == 0) { planning.complete(); }
+        StartupPhaseScope program(options.startup_observer, StartupPhase::ProgramInitialize);
+        const auto retry_capacity = [&](const std::runtime_error& error) {
+            device.synchronize();
+            instance->program.reset();
+            if (!residency || capacity_policy.mode != KvCapacityMode::Automatic ||
+                resolution.main_page_groups <= curve.minimum_main_page_groups ||
+                attempt + 1 >= maximum_attempts) {
+                throw core::VramCapacityError(
+                    "strict could not admit max_context=" + std::to_string(options.max_context) +
+                    " with the requested KV capacity and reserve; context was not reduced: " +
+                    error.what());
+            }
+            // A poisoned CUDA context or displaced weight working set aborts recovery.
+            residency->verify_working_set(false);
+            const std::size_t stride = curve.bytes_per_additional_main_page_group;
+            const std::size_t step_pages =
+                1 + (options.cuda_memory_probe_step_bytes - 1) / stride;
+            const std::size_t extra_pages =
+                resolution.main_page_groups - curve.minimum_main_page_groups;
+            const auto next_pages = attempt + 2 == maximum_attempts
+                ? curve.minimum_main_page_groups
+                : resolution.main_page_groups - static_cast<std::uint32_t>(
+                      std::min(extra_pages, step_pages));
+            publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Warning,
+                               "strict: candidate %u KV tokens failed (%s); retrying %u tokens "
+                               "without reducing max_context %u",
+                               resolution.resolved_tokens, error.what(),
+                               curve.resolved_tokens(next_pages), options.max_context);
+            const std::size_t next_budget = curve.reservation_bytes(next_pages) +
+                                           capacity_policy.automatic_headroom_bytes;
+            resolution = resolve_kv_capacity(capacity_policy, curve, next_budget);
+            resolution.available_after_weights_bytes = free_by_rank.front();
+            resolution.planned_slack_bytes = free_by_rank.front() -
+                                             resolution.runtime_reservation_bytes;
+        };
+        try {
+            instance->program = models::qwen3_5::create_program(
+                instance->parameters, std::move(sequence), device, options.startup_observer);
+            restore = {};
+            if (resolved.context_cache.enabled &&
+                resolved.context_cache.mode == ContextCacheMode::Hybrid) {
+                instance->program->set_hybrid_cost(hybrid_cache_cost(context_cost.model));
+                instance->program->set_hybrid_coalesce_wait_limit(
+                    static_cast<double>(options.pending_timeout_ms) / 1000.0 / 2.0);
+                const std::filesystem::path& file = resolved.context_cache.hybrid.persistent_file;
+                if (!file.empty()) {
+                    const auto loaded = instance->program->attach_hybrid_cache_file(
+                        file, hybrid_cache_fingerprint(options, signature));
+                    restore = LoadSummary::PrefixCacheRestore{
+                        .attempted = true, .restored = loaded.ok, .message = loaded.message,
+                        .blocks = loaded.blocks, .snapshots = loaded.snapshots,
+                        .bytes = loaded.bytes, .seconds = loaded.seconds,
+                    };
+                }
+            }
+            device.synchronize();
+            if (residency) {
+                // Include all KV backing and existing weights after Graph and Host cache setup.
+                residency->verify_working_set(true);
+                const auto memory = residency->stats();
+                publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                                   "strict: admitted %u KV tokens, %.1f MiB device allocations, "
+                                   "Shared %.1f / baseline %.1f MiB, reserve %.1f MiB, %u retries",
+                                   resolution.resolved_tokens,
+                                   static_cast<double>(memory.device_allocated_bytes) / 1048576.0,
+                                   static_cast<double>(memory.shared_bytes) / 1048576.0,
+                                   static_cast<double>(memory.shared_baseline_bytes) / 1048576.0,
+                                   static_cast<double>(memory.verified_reserve_bytes) / 1048576.0,
+                                   attempt);
+            }
+            program.complete();
+            break;
+        } catch (const core::VramCapacityError& error) {
+            retry_capacity(error);
+        } catch (const CudaError& error) {
+            if (!residency || error.status() != cudaErrorMemoryAllocation) { throw; }
+            // Do not let a recoverable Graph allocation error leak through a later
+            // kernel's cudaGetLastError. Any distinct pending execution fault is fatal.
+            const auto pending = cudaGetLastError();
+            if (pending != cudaSuccess && pending != cudaErrorMemoryAllocation) {
+                CUDA_CHECK(pending);
+            }
+            retry_capacity(error);
+        }
+    }
+    // Publish only the fully constructed and verified candidate's shape.
     instance->frontend.publish_long_anchor_limit(
         resolved.context_cache.max_long_anchors_per_continuation.value_or(0));
     instance->kv_capacity_resolution = resolution;
-    planning.complete();
-    StartupPhaseScope program(options.startup_observer, StartupPhase::ProgramInitialize);
-    instance->program = models::qwen3_5::create_program(instance->parameters, std::move(sequence),
-                                                        device, options.startup_observer);
-    LoadSummary::PrefixCacheRestore restore;
-    if (resolved.context_cache.enabled && resolved.context_cache.mode == ContextCacheMode::Hybrid) {
-        instance->program->set_hybrid_cost(hybrid_cache_cost(context_cost.model));
-        // A request waiting for a sibling's snapshot stays in the FIFO, so the predicted wait
-        // is kept well inside its queue timeout.
-        instance->program->set_hybrid_coalesce_wait_limit(
-            static_cast<double>(options.pending_timeout_ms) / 1000.0 / 2.0);
-        const std::filesystem::path& file = resolved.context_cache.hybrid.persistent_file;
-        if (!file.empty()) {
-            const models::qwen3_5::HybridCachePersistence loaded =
-                instance->program->attach_hybrid_cache_file(
-                    file, hybrid_cache_fingerprint(options, signature));
-            restore = LoadSummary::PrefixCacheRestore{
-                .attempted = true,
-                .restored  = loaded.ok,
-                .message   = loaded.message,
-                .blocks    = loaded.blocks,
-                .snapshots = loaded.snapshots,
-                .bytes     = loaded.bytes,
-                .seconds   = loaded.seconds,
-            };
-        }
-    }
-    device.synchronize();
-    program.complete();
     instance->kv_capacity_resolution.available_after_startup_bytes = current_free_device_bytes();
     const auto& stats = instance->model->storage_stats();
     LoadSummary summary;
