@@ -4,9 +4,18 @@
 
 ## 1. 软件包下载
 
-**下载地址：待填写。**
+**[下载预编译引擎、管理器与 S / XXS 模型（夸克网盘）](https://pan.quark.cn/s/28b896c4b0c0)**
 
-本页说明当前 1.4.1 管理器及模型准备方法。软件包上传后，在这里填写下载链接。
+下载内容是完整的 `ninfer-manage` 运行目录，包含引擎、NInfer Manager 1.4.1、配置，
+以及已转换好的 **Swift S、Swift XXS** 两套 `.ninfer` 模型。两套模型约占 **20 多 GB 磁盘空间**：
+网盘当前显示 S 约 11.6GB、XXS 约 10.1GB，整个运行目录约 23.5GB，建议预留至少 30GB 磁盘空间。
+下载时保留完整目录结构，之后双击 `NInferManager.exe` 即可使用管理器，无需再转换这两套模型。
+
+**成品适用范围：本仓库的预编译引擎与配套 `.ninfer` 模型成品仅支持 RTX 50 系列。**
+实际测试设备为 RTX 5070 Ti 16GB。16GB 及以上独立显存的 RTX 30/40 系理论上也可尝试，
+但本分支尚未实测；其他系列需要从源码构建对应架构的引擎，并按目标显卡重新准备模型。
+可以把仓库、[构建说明](rtx-5070ti-windows.md#7-构建与适用范围)和本页的转换步骤交给 AI，
+协助完成编译、GGUF 转 `.ninfer` 与配置。下面的转换示例对应这套 RTX 50 系配置。
 
 | 项目 | 说明 |
 |---|---|
@@ -14,7 +23,7 @@
 | 引擎 | CUDA 13.4.2 / nvcc 13.4.92，Native SM120a，Release 发布版，关闭 D3D12 residency |
 | 已验证设备 | RTX 5070 Ti 16 GB，Windows x64，NVIDIA 驱动 617.14 |
 | 默认配置 | Swift XXS：160K / chunk 1024；Swift S：128K / chunk 256；显存策略均为 `strict` |
-| 模型权重 | 需要单独下载并转换，软件包不附带权重 |
+| 模型权重 | 已包含 Swift S 与 Swift XXS 的 `.ninfer` 成品，合计约 20 多 GB 磁盘占用 |
 
 软件运行目录包含 `NInferManager.exe`、`engine/`、`config/`、`wwwroot/`、`docs/`、
 `LICENSE` 和 `licenses/`。`model/` 用来放转换后的模型。管理器已包含监控界面和 .NET
@@ -26,6 +35,9 @@
 详细目录结构和自启动规则见上方使用说明。
 
 ## 2. 模型下载地址
+
+上述成品已经包含 S / XXS 模型。需要自己转换、换用其他量化规格或准备其他显卡的模型时，
+再从以下来源下载 GGUF，并参考后续转换步骤。
 
 | 模型 | GGUF 下载页面 | 配套配置与分词器来源 |
 |---|---|---|
@@ -65,8 +77,8 @@ Python 只在转换时需要；生成 `.ninfer` 后，日常运行仍由管理�
 先按[主指南第 7 节](rtx-5070ti-windows.md#7-构建与适用范围)准备本版本的完整源码，再安装
 **64 位 Python 3.11（含 `py` 启动器）**，打开 PowerShell。下面复用已有源码，假定它位于
 当前用户的 `Documents\ninfer-all`；请将 `$sourceRoot` 改成你实际准备好的源码目录。
-配套源码位于 [Ryan-gsq/ninfer-all 的 `rtx5070ti-cuda13-native` 分支](https://github.com/Ryan-gsq/ninfer-all/tree/rtx5070ti-cuda13-native)，
-包含 1.3.1 管理器与新显存策略。上游即使已有 GSQ 转换器，也不代表已经包含本版管理器和显存策略；
+配套源码位于 [Ryan-gsq/ninfer-16g-5070ti-5080-5090-qwen3.8-27b-gsq-rco 的 `main` 分支](https://github.com/Ryan-gsq/ninfer-16g-5070ti-5080-5090-qwen3.8-27b-gsq-rco/tree/main)，
+包含 1.4.1 管理器与新显存策略。上游即使已有 GSQ 转换器，也不代表已经包含本版管理器和显存策略；
 首次下载源码的命令见主指南第 7.1 节。
 
 磁盘需要同时放下下载的 GGUF、转换出的 `.ninfer` 和 Python 环境；

@@ -1,349 +1,145 @@
-# NInfer-all
+# NInfer · Windows 16GB · Qwen3.8-27B GSQ-RCO
 
-This branch adds Windows / RTX 5070 Ti support for the CUDA 13 native SM120 build.
-See the [5070 Ti build and serving guide](docs/rtx-5070ti-windows.md) for the measured
-configuration, device profile, and validation limits.
+**简体中文** | [English](README.en.md)
 
-One line of [NInfer](https://github.com/Neroued/ninfer) for the RTX 3090, RTX 4090, RTX 5090 and RTX
-PRO 6000 Blackwell, consolidated from the forks that carry it and extended with this repository's
-own work. The base is the `master` of
-[ashalliants/ninfer-3090](https://github.com/ashalliants/ninfer-3090): v0.11.0 and
-the multi-GPU pipeline stages, most of both written by [Warlax](https://github.com/WarlaxZ), on the
-line [Don-Chad/ninfer-3090](https://github.com/Don-Chad/ninfer-3090) started from Neroued's NInfer.
-On top of it come patches from [TertiumOrganum1/ninfer-3090](https://github.com/TertiumOrganum1/ninfer-3090),
-ideas from [UDPSendToFailed/ninfer-4090](https://github.com/UDPSendToFailed/ninfer-4090) and its
-contributors, open pull requests to [Neroued/ninfer](https://github.com/Neroued/ninfer), and work by
-[IMGillusion](https://github.com/IMGillusion/ninfer-disk-kv),
-[Mirko Covizzi](https://github.com/MirkoCovizzi/ninfer-rtx5090-mobile),
-Ian Ranson ([Wallawalla47](https://github.com/Wallawalla47/ninfer-custom)),
-[tmark00](https://github.com/tmark00/ninfer) and David Oelfke
-([gzenz/ninfer](https://github.com/gzenz/ninfer)). Each change keeps its
-author; the [maintainer map](docs/maintainer/consolidated-line.md) lists them with the files they
-touch.
+**RTX 5070 Ti / RTX 5080 / RTX 5090 · 本地推理与托盘管理**
 
-Everything the engine does beyond the list below (building, packages, serving APIs, supported models,
-flags) is described in the original READMEs of
-**[NInfer-3090](https://github.com/ashalliants/ninfer-3090#readme)** and
-**[NInfer-4090](https://github.com/UDPSendToFailed/ninfer-4090#readme)**. New features that change
-numbers or serving behaviour are opt-in, with three exceptions: the routes a card's measured device
-profile picks (`--device-profile off` keeps the compiled tables), prefill chunks rounded to whole
-waves of the card's SMs (`NINFER_PREFILL_ALIGN=0` keeps the requested chunk), and
-TertiumOrganum1's ternary prefill tile (`NINFER_T2_A8_TILE=off` restores the kernel it replaces).
+https://github.com/user-attachments/assets/9695e989-e3f2-4727-8735-48d00910d90a
 
-## Highlights
+**[下载引擎和模型（夸克网盘）](https://pan.quark.cn/s/28b896c4b0c0)** · **[单独打开视频](https://github.com/user-attachments/assets/9695e989-e3f2-4727-8735-48d00910d90a)** · **[5070 Ti 中文指南](docs/rtx-5070ti-windows.md)** · **[English guide](docs/rtx-5070ti-windows.en.md)** · **[下载与模型转换说明](docs/rtx-5070ti-windows-downloads.md)**
 
-Measured in September 2026 on one card each, greedy, one request at a time unless the row says
-otherwise; each number's setup and the full tables are in the
-[reference measurements](docs/performance/reference-2026-09.md).
+面向希望在 **Windows、约 16GB 独立显存**上运行 Qwen3.8-27B GSQ-RCO 的用户。本分支整理了 CUDA 13 Native 引擎、Windows 托盘管理器与日常启动配置：通过网页管理模型、保存参数、查看运行监控，并提供 **GSQ-RCO GGUF → `.ninfer`** 的转换步骤。
 
-| | RTX 3090 | RTX 4090 | RTX 5090 | RTX PRO 6000 |
+下载目录包含 **Swift S 和 Swift XXS 两套模型**，模型合计约 **20 多 GB 磁盘空间**，完整运行目录当前约 **23.5 GB**，建议预留至少 **30 GB 磁盘空间**。这是文件占用，不是显存要求。
+
+**本仓库提供的预编译引擎与配套 `.ninfer` 模型成品，发布支持范围仅限 RTX 50 系列；本分支实测硬件为 RTX 5070 Ti 16GB。** RTX 5080、RTX 5090 的显存容量、可用上下文和合适参数因硬件而异，本分支尚未逐卡实测。
+
+**独立显存 16GB 及以上的 RTX 30 / RTX 40 系列，理论上也可以尝试，但本分支没有相应实测。** 其他系列需要针对目标显卡从源码构建引擎，并按相应配方转换模型；RTX 50 系列成品不能直接当作通用部署包。RTX 30 / 40 的常用构建架构分别为 `86` / `89`，当前成品引擎仅包含 `sm_120a` 机器码。不要直接套用相同的上下文容量或性能结论。可以把本仓库和对应部署指南交给 AI，协助完成源码构建、GGUF 转换和启动配置。
+
+本仓库：**[ninfer-16g-5070ti-5080-5090-qwen3.8-27b-gsq-rco](https://github.com/Ryan-gsq/ninfer-16g-5070ti-5080-5090-qwen3.8-27b-gsq-rco)**。上游汇总仓库：**[iamwavecut/ninfer-all](https://github.com/iamwavecut/ninfer-all)**。原始推理引擎：**[Neroued/ninfer](https://github.com/Neroued/ninfer)**。
+
+本分支在上游基础上提供 Windows / RTX 5070 Ti 构建、显存策略和管理器。下方保留上游项目的重要信息和贡献者出处，方便继续查阅。
+
+---
+
+## 上游项目概览
+
+以下内容译自上游介绍。其中的硬件、模型、历史测试限制与性能数字属于上游工作，**不是本分支 Windows 16GB 运行包的实测或保证**。当前 RTX 5070 Ti 参数与性能请看 [Windows 部署指南](docs/rtx-5070ti-windows.md)。
+
+上游汇总线将多个 [NInfer](https://github.com/Neroued/ninfer) 分支整合到一起，覆盖 RTX 3090、RTX 4090、RTX 5090 和 RTX PRO 6000 Blackwell，并在此基础上继续开发。基础来自 [ashalliants/ninfer-3090](https://github.com/ashalliants/ninfer-3090) 的 `master`：包括 v0.11.0 和多 GPU 流水线阶段，其中大部分由 [Warlax](https://github.com/WarlaxZ) 编写，延续了 [Don-Chad/ninfer-3090](https://github.com/Don-Chad/ninfer-3090) 从 Neroued NInfer 开始的工作。
+
+另外还整合了 [TertiumOrganum1/ninfer-3090](https://github.com/TertiumOrganum1/ninfer-3090) 的补丁、[UDPSendToFailed/ninfer-4090](https://github.com/UDPSendToFailed/ninfer-4090) 及其贡献者的思路、提交给 [Neroued/ninfer](https://github.com/Neroued/ninfer) 的开放 PR，以及以下作者的工作：
+
+- [IMGillusion](https://github.com/IMGillusion/ninfer-disk-kv)
+- [Mirko Covizzi](https://github.com/MirkoCovizzi/ninfer-rtx5090-mobile)
+- Ian Ranson（[Wallawalla47](https://github.com/Wallawalla47/ninfer-custom)）
+- [tmark00](https://github.com/tmark00/ninfer)
+- David Oelfke（[gzenz/ninfer](https://github.com/gzenz/ninfer)）
+
+各项改动保留原作者署名；[维护者与改动对应表](docs/maintainer/consolidated-line.md)列出作者和涉及文件。
+
+下文之外的引擎说明，例如构建、软件包、服务 API、支持模型和参数，可参考 **[NInfer-3090 原始 README](https://github.com/ashalliants/ninfer-3090#readme)** 与 **[NInfer-4090 原始 README](https://github.com/UDPSendToFailed/ninfer-4090#readme)**。上游新增的、会影响数值或服务行为的功能通常需要手动开启，有三项例外：
+
+- 按显卡实测 device profile 选择内核路线；`--device-profile off` 保留编译时的路线表。
+- 将 prefill chunk 对齐到显卡 SM 的完整调度批次；`NINFER_PREFILL_ALIGN=0` 保留用户请求的 chunk。
+- TertiumOrganum1 的三值权重预填充 tile；`NINFER_T2_A8_TILE=off` 恢复被替换的内核。
+
+## 上游参考性能
+
+下列数字测于 2026 年 9 月，每种显卡各一张，采用 greedy 采样；除特别标注外，均为单请求。具体设置和完整数据见[参考测试](docs/performance/reference-2026-09.md)。
+
+| 项目 | RTX 3090 | RTX 4090 | RTX 5090 | RTX PRO 6000 |
 |---|---:|---:|---:|---:|
-| **Ternary Bonsai 2 27B**, short chat (DFlash2, 7 drafts) | 202 tok/s | 256 tok/s | 397 tok/s | 381 tok/s |
-| decode after a 261K-token document (fastest drafter) | 90 tok/s | 123 tok/s | 218 tok/s | 218 tok/s |
-| time to first token for a 261K-token prompt | 215 s | 102 s | 82 s | 78 s |
-| largest context, filled and all three needles found | 970,752 | 958,464 | 978,944 | 1,048,576\* |
-| eight requests at once (MTP, 3 drafts), total | 551 tok/s | 824 tok/s | 1,063 tok/s | 1,155 tok/s |
-| **Qwen3.8-27B**, short chat (DFlash2, 7 drafts) | 118 tok/s | 149 tok/s | 236 tok/s | 237 tok/s |
-| largest context, filled and all three needles found | 417,792 | 405,504 | 872,448 | 1,048,576\* |
-| eight requests at once (MTP, 3 drafts), total | 329 tok/s | 442 tok/s | 690 tok/s | 739 tok/s |
+| **Ternary Bonsai 2 27B**，短对话（DFlash2，7 个草稿） | 202 tok/s | 256 tok/s | 397 tok/s | 381 tok/s |
+| 读入 261K-token 文档后的解码速度（最快草稿方案） | 90 tok/s | 123 tok/s | 218 tok/s | 218 tok/s |
+| 261K-token 输入的首 token 延迟 | 215 s | 102 s | 82 s | 78 s |
+| 填满后仍找到全部三个检索目标的最大上下文 | 970,752 | 958,464 | 978,944 | 1,048,576\* |
+| 八请求并发总吞吐（MTP，3 个草稿） | 551 tok/s | 824 tok/s | 1,063 tok/s | 1,155 tok/s |
+| **Qwen3.8-27B**，短对话（DFlash2，7 个草稿） | 118 tok/s | 149 tok/s | 236 tok/s | 237 tok/s |
+| 填满后仍找到全部三个检索目标的最大上下文 | 417,792 | 405,504 | 872,448 | 1,048,576\* |
+| 八请求并发总吞吐（MTP，3 个草稿） | 329 tok/s | 442 tok/s | 690 tok/s | 739 tok/s |
 
-\* The engine's ceiling, which the RTX PRO 6000 (96 GB) starts with every KV storage and drafter;
-filled to it, both models find two of the three needles.
+\* 这是引擎上限。RTX PRO 6000（96 GB）在各种 KV 格式和草稿方案下都能以该容量启动；填满后，两个模型均找到三个目标中的两个。
 
-- **Against the previous `master` on the same card**, a 261K-token Bonsai prompt takes 215 s instead
-  of 315 s on the RTX 3090, 102 s instead of 138 s on the RTX 4090 and 82 s instead of 115 s on the
-  RTX 5090, and `rk4v4` decode after it is 11 to 13% faster on the 24 GB cards. Decode at short
-  context is unchanged, since it is bound by reading the weights, and Qwen3.8's 8K to 32K prompts on
-  the RTX 5090 take 8 to 10% longer.
-- **The RTX 3090's device profile** runs the `rk4v4` verify attention at 262K 3.2 times faster than
-  the compiled route, and the fast prompt kernel with FP16 P·V takes 19 to 30% less prompt-attention
-  time on all three cards.
-- **Draft length.** DFlash2 with seven drafts is fastest on short answers, while after long
-  documents the best count lies between three and seven; MTP runs up to fifteen drafts now but is
-  fastest at three to five.
-- **Past the native window.** Filled to about 880K tokens, Bonsai 2 returned all three planted codes
-  on every card; at 1,048,576 tokens, which only the RTX 5090 and the RTX PRO 6000 hold, it misses the
-  one at 943K.
-- **RTX PRO 6000.** Its 96 GB start every configuration at the engine's 1,048,576-token ceiling with
-  at least 50 GiB to spare. Against the RTX 5090 it prefills 4 to 6% faster and decodes 2 to 3% slower.
+- **与同卡此前的 `master` 比较：**261K-token Bonsai 输入在 RTX 3090 上从 315 秒降至 215 秒，4090 从 138 秒降至 102 秒，5090 从 115 秒降至 82 秒；24 GB 显卡上随后进行的 `rk4v4` 解码快了 11–13%。短上下文解码仍受读取权重带宽限制，速度基本不变。Qwen3.8 在 RTX 5090 上的 8K–32K 输入预填充反而慢了 8–10%。
+- **RTX 3090 的 device profile：**262K 下的 `rk4v4` 验证注意力比编译路线快 3.2 倍。三张卡上的快速 prompt 内核配合 FP16 P·V 累加，使 prompt 注意力耗时减少 19–30%。
+- **草稿长度：**DFlash2 的 7 个草稿最适合短回答；长文档后的最佳范围为 3–7。MTP 目前最多支持 15 个草稿，但最快通常为 3–5。
+- **超过原生窗口：**在约 880K tokens 下，Bonsai 2 在所有卡上都找到三个预埋代码；达到 1,048,576 tokens 时，仅 RTX 5090 和 RTX PRO 6000 能容纳，但会漏掉约 943K 位置的目标。
+- **RTX PRO 6000：**96 GB 显存让所有配置都能以 1,048,576-token 上限启动，并至少剩余 50 GiB。与 RTX 5090 相比，预填充快 4–6%，解码慢 2–3%。
 
-## What this line adds
+## 上游汇总线增加了什么
 
-- **GGUF block formats.** Qwen3.8-27B GGUF releases that choose a ggml quantization type per tensor,
-  such as ISTA-DASLab's GSQ-RCO models, import without requantization: the converter recipe
-  `qwen3_8_27b_gguf` copies every quantized tensor's blocks unchanged, and the runtime multiplies
-  all fifteen dense ggml block types in place, decode and verification through a vector kernel that
-  decodes each weight once for every column, prompts through llama.cpp's integer tensor-core kernel.
-  MTP, DFlash2 and Vision work as with the official artifact. The 3.5-bit GSQ-RCO IQ3_S model scores
-  the WikiText-2 perplexity its card states (7.071 against 7.07; the official artifact scores 7.286)
-  at 10.95 GiB of weights instead of 15.9, scores 80.3% on IFBench, 100% on AIME 2025 and 2026 and
-  88.4% on GPQA-Diamond (the official artifact: 77.7, 96.7, 96.7 and 87.4), and on the same card it
-  decodes faster than the official artifact: 59.9 against 40.3 tok/s on an RTX 3090 and 107.5
-  against 88.1 on an RTX 5090 without speculation, 146 against 109 on an RTX 4090 with MTP. See
-  [GGUF block formats](docs/gguf.md).
-- **Device route profiles for every GPU.** Which kernel schedule serves each operation and width
-  is looked up in the card's measured profile before the compiled tables, which were tuned on one
-  card. Profiles measured on the RTX 3090, 4090, 5090 and all three RTX PRO 6000 Blackwell editions
-  (Workstation, Max-Q, Server) are built in; any other GPU is calibrated
-  once at first start (20 to 40 seconds) and the result is saved, and `ninfer-calibrate`
-  re-measures on demand. On the RTX 3090 the profile makes the `rk4v4` verify attention at 262K
-  3.2 times faster; on all three it turns on FP16 accumulation of P·V (15 to 17% less time in that
-  attention, perplexity unchanged) and the fast prompt kernel (19 to 30% less prompt-attention
-  time). A greedy answer can then differ between a request served alone and the same request
-  batched with others, at near-tied tokens, more often than before; `--device-profile off` keeps
-  the compiled schedules of the previous master. See
-  [device profiles](docs/device-profiles.md).
-- **FP8 and NVFP4 at full speed on the default Blackwell build.** Every `120a` build compiles the FP8
-  A8 and NVFP4 W4A4 tensor-core units, so FP8 and NVFP4 weights run their own routes on the
-  `mma.sync` compatibility path as well. Before, an NVFP4 artifact failed at startup there and FP8
-  weights prefilled through a dequantizing route. On an RTX PRO 6000 the Qwen3.8-27B NVFP4/FP8
-  artifact prefills 4,096 tokens at 11,822 tok/s, within 1.4% of a native build, and the
-  Qwen3.6-35B-A3B NVFP4 artifact at 30,938 tok/s.
-- **Faster attention at long context.** The INT8-family small-T kernel gains tiers that split the
-  QK product across producer warps and fetch the next key tile a whole iteration ahead; the fast
-  prompt kernel now serves `rk8v4`, `rk4v4`, `rk4v4-e8` and `rk2v4-e8`; every prompt kernel's
-  prefill chunks are sized to whole waves of the card's SMs, as Ian Ranson's fast kernel did for its
-  own. On an RTX 3090 a 131K prompt with `rk8v4` takes 76 s instead of 101 s on the previous master.
-- **MTP up to fifteen drafts.** Draft windows past eight verify columns build one CUDA Graph per
-  context band, so `--spec mtp --draft-tokens 10..15` starts (it failed on graph update before).
-- **BF16 KV with graphs.** MTP with the default BF16 KV cache failed at startup on the previous
-  master, and so did Qwen3.8 without speculation at 512 and 1,024 tokens of context: the CUDA Graph
-  planner shared one executable between windows where BF16 takes the prompt kernel (up to 128 keys)
-  and windows where it takes small-T. The planner now asks the attention op which route each
-  captured call takes.
-- **Reference measurements** of Ternary Bonsai 2 27B and Qwen3.8-27B on the RTX 3090, 4090 and
-  5090 up to the full window, the largest context each card serves and fills, every draft length
-  from one to fifteen, several requests at once, and the previous master on the same hosts:
-  [September 2026](docs/performance/reference-2026-09.md).
-- **Ternary Bonsai 2 27B.** PrismML's [ternary Qwen3.8-27B](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf)
-  runs from `t2_g128_fp16` weights: 2.125 bits per weight, imported from the PQ2_0 GGUF without
-  rounding, with the checkpoint's Hadamard rotations fused into the norms and gates that produce
-  each projection input. The token table and the heads stay ternary, and the converter recipe
-  `bonsai2_27b_ternary` adds ProCreations' Bonsai-trained MTP head and DFlash2 adapter and an exact
-  proposal head.
-- **Integer activations for ternary projections.** Decode, speculative verification and prompts up
-  to 192 tokens use a small-T kernel over s8 activations. Longer prompts use the int8-activation
-  GEMM, which pads a ragged prompt to its cheapest tile. The output, draft and proposal heads take
-  the same route.
-- **RTX 3090 tuning.** The rotating producers run four warps per 1024-point transform. The small-T
-  attention over the INT8-family caches launches its splits in whole waves of the card's SMs. The GDN record stages its
-  window in shared memory. The DFlash2 adapter of a ternary target runs in Q4.
-- **DFlash2 with Vision in overlay.** An image encode can borrow the drafter's memory, so DFlash2,
-  Vision and the model's whole 262,144-token window fit on one 24 GB card.
-- **Serving fixes.**
-  - A forced `tool_choice` opens the named call in the generation prompt, and the template's
-    default thinking yields to it.
-  - A context-cache store that cannot place a request fails only that request (HTTP 429) instead of
-    the engine.
-  - A Paged KV exhaustion names its page numbers, and three in a row mark the engine unhealthy.
-  - Several context-cache fixes keep long agent sessions from re-prefilling: private reclamation,
-    the demand window, and the capture search for a zero-value candidate.
-- **Build.** Tests build against CUDA 13's `cudaGraphGetEdges`.
+- **GGUF 块量化格式。** 支持按张量选择 ggml 量化类型的 Qwen3.8-27B GGUF，例如 ISTA-DASLab 的 GSQ-RCO，无需重新量化。`qwen3_8_27b_gguf` 配方原样复制每个量化张量的数据块；运行时直接计算全部 15 种 dense ggml 块格式。解码和验证使用向量内核，每列只解码一次权重；prompt 使用 llama.cpp 的整数 Tensor Core 内核。MTP、DFlash2、Vision 的使用方式与官方产物一致。3.5-bit GSQ-RCO IQ3_S 的 WikiText-2 困惑度为 7.071，与模型卡的 7.07 一致，官方产物为 7.286；权重占用从 15.9 GiB 降为 10.95 GiB。IFBench 为 80.3%，AIME 2025/2026 均为 100%，GPQA-Diamond 为 88.4%；官方产物分别为 77.7、96.7、96.7、87.4。无推测解码时，RTX 3090 为 59.9 对 40.3 tok/s，RTX 5090 为 107.5 对 88.1；RTX 4090 开启 MTP 后为 146 对 109 tok/s。详见 [GGUF 块格式](docs/gguf.md)。
+- **按显卡实测的设备路线。** 每种操作和宽度优先查显卡 profile，再查针对单卡调优的编译路线表。已内置 RTX 3090、4090、5090 及 RTX PRO 6000 Blackwell 三个版本（Workstation、Max-Q、Server）的实测 profile。其他 GPU 首次启动自动校准一次，约 20–40 秒，随后保存结果；`ninfer-calibrate` 可按需重测。3090 的 262K `rk4v4` 验证注意力快 3.2 倍；三张卡都启用 FP16 P·V 累加（该注意力耗时减少 15–17%，困惑度不变）与快速 prompt 内核（prompt 注意力耗时减少 19–30%）。当两个候选 token 分数接近时，同一 greedy 请求单独执行或与其他请求组成批次，可能比以前更容易给出不同答案。`--device-profile off` 保留此前 master 的编译调度。详见[设备 profile](docs/device-profiles.md)。
+- **Blackwell 默认构建中的 FP8 / NVFP4 加速。** 所有 `120a` 构建都会编译 FP8 A8 与 NVFP4 W4A4 Tensor Core 单元，`mma.sync` 兼容路径也能使用其专用路线。此前 NVFP4 产物会在该路径启动失败，FP8 预填充则走反量化路线。RTX PRO 6000 上，Qwen3.8-27B NVFP4/FP8 产物的 4096-token 预填充为 11,822 tok/s，与 Native 构建差距在 1.4% 内；Qwen3.6-35B-A3B NVFP4 为 30,938 tok/s。
+- **更快的长上下文注意力。** INT8 系列 small-T 内核增加了分层策略，在 producer warp 之间分摊 QK 乘积，并提前一整轮读取下一块 key。快速 prompt 内核支持 `rk8v4`、`rk4v4`、`rk4v4-e8`、`rk2v4-e8`；所有 prompt 内核都将 chunk 对齐到完整 SM 调度批次，沿用 Ian Ranson 快速内核的思路。RTX 3090 的 131K `rk8v4` 输入耗时从此前 master 的 101 秒降至 76 秒。
+- **MTP 最多 15 个草稿。** 超过 8 列验证窗口时，按上下文区间分别构建 CUDA Graph，使 `--spec mtp --draft-tokens 10..15` 能正常启动；此前会在 graph update 时失败。
+- **BF16 KV 与 CUDA Graph。** 修复此前 master 中默认 BF16 KV 的 MTP 启动失败，以及 Qwen3.8 在无推测解码、512/1024 上下文时的启动失败。原因是 Graph 规划器把 BF16 使用 prompt 内核（最多 128 keys）和使用 small-T 内核的窗口共用了同一 executable；现在会向 attention op 查询每次捕获实际选择的路线。
+- **完整参考测试。** 覆盖 RTX 3090、4090、5090 上的 Ternary Bonsai 2 27B / Qwen3.8-27B：完整窗口、各卡能启动并填满的最大上下文、1–15 个草稿、多请求并发，以及同机器上的此前 master。见 [2026 年 9 月参考测试](docs/performance/reference-2026-09.md)。
+- **Ternary Bonsai 2 27B。** PrismML 的[三值 Qwen3.8-27B](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf) 使用 `t2_g128_fp16` 权重，每权重 2.125 bits，从 PQ2_0 GGUF 导入时不重新舍入。检查点中的 Hadamard 旋转融合到各投影输入的 norm 和 gate；token 表与输出头仍保持三值。`bonsai2_27b_ternary` 配方加入 ProCreations 为 Bonsai 训练的 MTP 头、DFlash2 adapter，以及精确 proposal 头。
+- **三值投影的整数激活。** 解码、推测验证以及不超过 192 tokens 的 prompt 使用 s8 激活 small-T 内核；更长输入使用 int8 激活 GEMM，将不整齐的尾部补齐到成本最低的 tile。输出头、draft 头、proposal 头也走同一路线。
+- **RTX 3090 调优。** 旋转 producer 每个 1024 点变换使用 4 个 warp；INT8 KV 的 small-T 注意力按完整 SM 批次启动分片；GDN 记录将窗口暂存共享内存；三值目标模型的 DFlash2 adapter 使用 Q4。
+- **DFlash2 与 Vision 叠加驻留。** 图像编码可以借用 drafter 的显存，使 DFlash2、Vision 和完整 262,144-token 窗口同时装入一张 24 GB 卡。
+- **服务修复。** 强制 `tool_choice` 会在生成提示中打开指定调用，模板默认思考让位于该要求。上下文缓存无法容纳请求时只让该请求失败（HTTP 429），不拖垮引擎。Paged KV 耗尽会报告页号，连续三次耗尽将引擎标为不健康。修复私有缓存回收、demand window 和零价值候选的捕获搜索，减少长 agent 会话重新预填充。
+- **构建。** 测试适配 CUDA 13 的 `cudaGraphGetEdges`。
 
-Taken from [TertiumOrganum1's fork](https://github.com/TertiumOrganum1/ninfer-3090):
+### 来自 TertiumOrganum1 的工作
 
-- **`rk4v4-e8` KV cache.** Keys are rotated as in `rk8v4` and snapped per octet to the E8 lattice
-  in int4, and values keep `rk8v4`'s int4 plane (the E8-lattice KV codecs first appeared in
-  NInfer-4090, by UDPSendToFailed with Daniel Parker). That is 280 bytes per token and KV head against
-  408. On Ternary Bonsai 2 the whole 262,144-token window takes 2.0 GiB less, two lanes get a
-  whole window each (524,288 tokens, where `rk8v4` fits 519,744) with 5.7 GiB to spare, the three
-  codes planted at 131K and 250K are still found, and quick-corpus perplexity moves from 5.631 to
-  5.650.
-- **A 128x64 int8 tile for the ternary prefill route.** Activations are quantised per token and
-  128-column group, so the int32 sum runs over a whole weight group. On Ternary Bonsai 2 prefill
-  runs 33% faster at 8K, 21% at 32K and 15% at 64K than with the kernel it replaces
-  (`NINFER_T2_A8_TILE=off`), and quick-corpus perplexity stays at 5.631.
-- **Tool calls.** A malformed tool-call region is recovered as far as it reads, instead of leaking
-  its markup into the answer.
-- **Shared captures.** A shared-prefix capture whose replacement releases less than was assessed is
-  abandoned. Before, the engine failed for good and answered 503 until a restart.
-- **Build.** `sm_120a` (RTX 50-series) builds on the `mma.sync` compatibility path.
+来源：[TertiumOrganum1/ninfer-3090](https://github.com/TertiumOrganum1/ninfer-3090)。
 
-Taken from [NInfer-4090](https://github.com/UDPSendToFailed/ninfer-4090) (UDPSendToFailed unless
-named), re-implemented here:
+- **`rk4v4-e8` KV。** Key 与 `rk8v4` 一样先旋转，再按 8 维组映射到 int4 的 E8 格点；Value 保留 `rk8v4` 的 int4 平面。E8 KV 编码最早由 UDPSendToFailed 与 Daniel Parker 在 NInfer-4090 中引入。每 token、每 KV head 占 280 bytes，而 `rk8v4` 为 408。Ternary Bonsai 2 的 262,144 窗口可节省 2.0 GiB；两个并发槽各放一个完整窗口（共 524,288 tokens，`rk8v4` 为 519,744）后还剩 5.7 GiB。131K / 250K 的三个预埋目标仍全部找到；快速语料困惑度从 5.631 变为 5.650。
+- **三值预填充的 128×64 int8 tile。** 激活按 token 和 128 列组量化，int32 求和覆盖整个权重组。与被替换的内核（`NINFER_T2_A8_TILE=off`）相比，Bonsai 2 在 8K、32K、64K 下的预填充分别快 33%、21%、15%，快速语料困惑度保持 5.631。
+- **工具调用。** 对格式损坏的调用区域尽量恢复已读内容，避免把标记泄漏到答案中。
+- **共享前缀捕获。** 若替换共享前缀捕获实际释放的空间少于预估，就放弃该候选；此前会使引擎持续失败并返回 503，直到重启。
+- **构建。** `sm_120a`（RTX 50 系列）可使用 `mma.sync` 兼容路径构建。
 
-- **Whole-program CUDA build** (Matt Anderson). The core and ops archives no longer build relocatable device code,
-  so ptxas keeps shuffles from a computed lane inline and pipelines loads across loops: a fifth
-  fewer kernels need a stack frame, and the server binary grows by a quarter.
-- **Shared-memory scale reads.** The INT8-family attention kernels read their query, key and value
-  scales from shared memory instead of shuffling them from a computed lane. With the whole-program
-  build, the `rk8v4` attention of a verify step takes 9 to 21% less time, so on Ternary Bonsai 2
-  an MTP step at 64K of context is 6.6% shorter and prefill 2 to 7% faster from 8K up, with the
-  same answers.
-- **`TCP_NODELAY`** on the server socket, so a streamed token leaves as soon as it is written.
-- **Sigmoid, SiLU and softplus on the SFU, opt-in.** A build with `-DNINFER_SFU_SIGMOID_SILU=ON`
-  evaluates sigmoid and SiLU with `ex2.approx` and a correctly rounded reciprocal instead of `expf`
-  and a divide: on Ternary Bonsai 2 prefill measured 2% faster from 8K up, quick-corpus perplexity
-  moves from 5.6306 to 5.6309, and MTP decode is unchanged. `-DNINFER_SFU_SOFTPLUS=ON` evaluates
-  the GDN decay gate's softplus the same way, switching to a log1p series where e^x is below 1/16
-  so the slow decays of long-memory heads keep their precision (quick-corpus perplexity 5.6302).
-- **Keys past 262,144.** The small-T attention kernels read each page's physical index from the
-  block table once a split spans more than the 64 page IDs it stages, and the visible-key limit
-  rises to 1,048,576.
-- **Four times the native window, with YaRN.** `--max-context` accepts up to 1,048,576 tokens on
-  the 262,144-token models. Past the native window positions run plain RoPE, or YaRN with
-  `--rope-yarn`, at Qwen's documented factor (`--max-context` / 262,144) and computed as Hugging
-  Face and vLLM do. On Ternary Bonsai 2 with `rk2v4-e8`, a needle test (three codes at 33, 66 and
-  90% of a prose document) finds all three at 500,000 tokens without the flag and two of three
-  with it at 131,072, 500,000 and 1,000,000 tokens, so YaRN stays off unless plain RoPE stops
-  answering. `--rope-yarn-factor F` fixes the factor instead, for every position whatever the
-  window.
-- **`rk2v4-e8` KV cache** (with Daniel Parker, who also proposed it upstream as Neroued/ninfer#173).
-  Each 8-dimension block of a rotated, G64-scaled key is stored in two
-  bytes: the nearest of E8's 240 roots, and a byte holding a 4-bit log-radius and a signed
-  residual axis. That is 216 bytes per token and KV head, against 280 for `rk4v4-e8` and 408 for
-  `rk8v4`, and the one format that holds 1,048,576 tokens beside Ternary Bonsai 2 on a 24 GB card
-  (2.8 GiB spare without speculation, 1.3 GiB with MTP). Two lanes over the 262,144-token window
-  leave 7.7 GiB spare. The price is quality: quick-corpus perplexity rises from 5.631 to 5.820
-  (`rk4v4-e8`: 5.651), and DFlash2 accepts fewer drafts (51.8% against 54.4%), so decode is 4%
-  slower. The three planted codes are all found at 131,072 and 250,000 tokens, and at 500,000 in
-  a 1,048,576-token window.
-- **D3D12-resident arenas on Windows** (with keylimesoda). A build with `-DNINFER_D3D12_RESIDENCY=ON` offers
-  `--wddm-evictable-budget`: the device arenas come from a shared D3D12 heap made resident at the
-  highest priority and imported into CUDA, and the KV cache is sized as if WDDM will evict other
-  allocations. Untested here, since this line has no Windows machine; the code only passes a
-  MinGW syntax check.
+### 来自 NInfer-4090 的工作
 
-Further 4090 ideas: a server default reasoning effort, MTP draft windows up to 15, `/metrics` and
-`/slots` (Sergiusz Michalik) and `/props`, a WebUI compiled in from `NINFER_WEBUI_DIR`, output limits bounded only by
-the context, the block sampler's candidates in shared memory, an opt-in bf16 residual add
-(`-DNINFER_BF16_RESIDUAL_ADD=ON`), vector stores in the chunked GDN prefill, and bounded split
-compilation with ptxas reports as build options.
+来源：[NInfer-4090](https://github.com/UDPSendToFailed/ninfer-4090)，除标注外作者为 UDPSendToFailed，已在汇总线中重新实现。
 
-From other forks:
+- **全程序 CUDA 构建**（Matt Anderson）。Core 和 ops 静态库不再使用可重定位设备代码，ptxas 能内联按动态 lane 计算的 shuffle，并跨循环安排加载；需要 stack frame 的内核减少约五分之一，服务端二进制增大约四分之一。
+- **从共享内存读取 scale。** INT8 注意力的 query/key/value scale 改为从共享内存读取，不再从计算出的 lane 做 shuffle。配合全程序构建，`rk8v4` 验证注意力耗时减少 9–21%；Bonsai 2 在 64K 下的 MTP 步耗时减少 6.6%，8K 及以上预填充快 2–7%，答案不变。
+- **服务 socket 使用 `TCP_NODELAY`。** 流式 token 写出后立即发送。
+- **可选 SFU sigmoid / SiLU / softplus。** `-DNINFER_SFU_SIGMOID_SILU=ON` 用 `ex2.approx` 和正确舍入的倒数替代 `expf` 与除法。Bonsai 2 在 8K 以上预填充快约 2%，快速语料困惑度从 5.6306 变为 5.6309，MTP 解码不变。`-DNINFER_SFU_SOFTPLUS=ON` 对 GDN decay gate 的 softplus 使用同样思路；当 e^x 小于 1/16 时改用 log1p 级数，保留长记忆 head 的慢衰减精度，困惑度为 5.6302。
+- **超过 262,144 的 key。** 当分片跨度超过暂存的 64 个页 ID 时，small-T 注意力从块表读取每页物理索引，将可见 key 上限提高到 1,048,576。
+- **四倍原生窗口与 YaRN。** 原生 262,144 模型的 `--max-context` 可达到 1,048,576。超出原生窗口后可用普通 RoPE，或通过 `--rope-yarn` 使用 YaRN；默认 factor 为 Qwen 文档中的 `--max-context / 262144`，计算与 Hugging Face / vLLM 一致。Bonsai 2 配合 `rk2v4-e8` 的三目标测试，在文档 33%、66%、90% 位置放入代码：500,000 tokens 不开 YaRN 找到全部三个；开启后在 131,072、500,000、1,000,000 下都只找到两个。因此默认不开，除非普通 RoPE 已无法回答。`--rope-yarn-factor F` 可为所有位置固定 factor，不随窗口变化。
+- **`rk2v4-e8` KV**（与 Daniel Parker 合作，他也通过 Neroued/ninfer#173 向上游提出该方案）。旋转并按 G64 缩放的 key 每 8 维仅占两个字节：一个记录最近的 E8 240 根向量，另一个记录 4-bit 对数半径和有符号残差轴。每 token、每 KV head 为 216 bytes，`rk4v4-e8` 为 280，`rk8v4` 为 408。这是 24 GB 卡上能与 Bonsai 2 同时容纳 1,048,576 tokens 的格式；不开推测剩 2.8 GiB，MTP 剩 1.3 GiB。两个完整 262,144 窗口剩 7.7 GiB。代价是质量：快速语料困惑度从 5.631 增为 5.820（`rk4v4-e8` 为 5.651），DFlash2 草稿接受率从 54.4% 降为 51.8%，解码慢 4%。131,072 / 250,000 tokens，以及 1,048,576 窗口中的 500,000-token 输入，都找到三个目标。
+- **Windows D3D12 驻留内存池**（与 keylimesoda 合作）。`-DNINFER_D3D12_RESIDENCY=ON` 提供 `--wddm-evictable-budget`：设备内存池来自最高优先级驻留的共享 D3D12 heap，再导入 CUDA；KV 容量按 WDDM 可驱逐其他分配来安排。上游记录当时没有 Windows 测试机，因此只做过 MinGW 语法检查，并非运行验证。
 
-- **A disk tier under the Host tier** ([IMGillusion](https://github.com/IMGillusion/ninfer-disk-kv)).
-  `--disk-kv-path DIR` writes an evicted conversation's KV pages and state images to CRC-checked,
-  LRU files keyed by the prompt digest, which survive restarts; with `--disk-kv-restore` a new
-  request whose prompt starts with a stored prefix is seeded from disk and prefills only the rest.
-  On Ternary Bonsai 2 with MTP, a 17,444-token prompt evicted by two others comes back from disk
-  in 1.2 s instead of 9.6 s, and in 1.0 s after a restart, with the same answer; DFlash2 and no
-  speculation restore the same way. On Windows, a build with `-DNINFER_DIRECTSTORAGE=ON` reads
-  those restores through DirectStorage (`--disk-kv-directstorage`; untested, as the D3D12
-  option).
-- **Adaptive MTP** ([Mirko Covizzi](https://github.com/MirkoCovizzi/ninfer-rtx5090-mobile)).
-  `--adaptive-mtp` lets each round verify 3..K of the K drafts, the width that measured draft
-  survival and measured round cost favour, with CUDA Graphs for each width. On Ternary Bonsai 2
-  on an RTX 3090 with K=5 it verified five drafts in 59% of rounds, four in 23% and three in 18%,
-  and did not beat the card's fixed K=3: 200 against 204 tok/s on short prompts, 150 against 163
-  at 8K. The graphs for every width cost memory too, so Huihui with a 198,400-token cache no
-  longer fits a 24 GB card with it. A near-tied token can come out differently at another width,
-  as it does between two fixed windows.
-- **A fast INT8 prompt-attention kernel** (Ian Ranson, [Wallawalla47](https://github.com/Wallawalla47/ninfer-custom)).
-  Every warp keeps its query rows, scores and output in registers and accumulates P·V in FP16 per
-  64-key tile. This line extends it to `rk8v4` and the packed key codings and lets the device
-  profile turn it on where it is faster (all three measured cards: 19 to 30% less prompt-attention
-  time); `--fast-prefill-kernel` forces it. Quick-corpus perplexity at 64K on Ternary Bonsai 2 moves
-  from 5.2074 to 5.2079 (`rk8v4`), and the three needles at 131K are all found.
-- **Agent-harness tool calls.** `<function name=...>`, `<invoke name=...>`, `<function_calls>` and
-  `<param name=...>` are read as tool calls (upstream PR #300 by Pavel Kochubey, via Wallawalla47), next
-  to the Qwen form, and go through the same recovery pass.
-- **Structured output** through xgrammar, speculative decoding included, opt-in with
-  `--structured-output` (upstream PR #294 by Andrey Shvartsman).
-- **First-token log probabilities.** With `--first-token-logprobs`, a Chat Completions request may ask
-  for `top_logprobs` and gets the first generated token's log probability with its alternatives
-  (IMGillusion).
-- **Rolling retention.** `--context-cache-policy rolling` lets one long conversation keep rolling
-  its cached frontier forward (IMGillusion).
-- **Diverged-branch release.** `--release-diverged-checkpoints` lets the cache drop first a private
-  checkpoint that its own conversation has moved away from (Ian Ranson, after pkochubey's upstream
-  PR #300).
-- **NVFP4 expert banks on Blackwell** (upstream PRs #286-#290 by Mykhailo Dementii). The published
-  Qwen3.6-35B-A3B NVFP4 checkpoint converts with `--recipe qwen3_6_35b_a3b_nvfp4` and runs on any
-  `120a` build: on an RTX 5090 (native build, `-DNINFER_SM120_NATIVE=ON`) the 20.6 GB text
-  artifact prefilled 27,663 tok/s at 4K and decoded 397 tok/s. Its prefill quantizes activations
-  to four bits for W4A4, which only Blackwell has, so sm_8x builds refuse the banks.
-- **N-gram copy drafting** (remesis, Ian Ranson). Beside any drafter, a round may verify up to
-  15 tokens copied from earlier prompt, tool-result or output text that the last 12 tokens match
-  (`--ngram-draft-tokens`, `--ngram-min-match`); it is on by default with `--spec` and exact, since
-  the target verifies every copy. An optional RAM archive keeps finished requests' copy sources for
-  later requests of the same `X-NInfer-Draft-Session` (`--ngram-archive-mib`).
-- **A hybrid prefix cache** (Ian Ranson, [Wallawalla47](https://github.com/Wallawalla47/ninfer-custom)).
-  `--use-alt-prefix-caching` swaps the checkpoint catalog for content-addressed 64-token KV blocks
-  shared across requests plus sparse state snapshots, sized from free memory and one
-  `--host-cache-mib` Host budget. Around the default catalog the same work adds opt-in
-  recency eviction with demotion to Host first (`--recency-eviction`), on-demand growth of an
-  answer's Device KV lease (`--kv-lease-growth`), one Host budget for the retention tier
-  (`--host-cache-mib`), automatic message-boundary anchors for rewritten transcripts
-  (`--auto-long-anchors`), and, on by default, the reuse of what an aborted request prefilled and
-  least-recently-used replacement of automatic shared prefixes when the catalog is full.
-- **Admission and eviction** (Gideon Zenz, David Oelfke, Ian Ranson). `--thorough-admission-search`
-  gives a new request's reuse plan up to 250 ms and every candidate, `--value-aware-demote` ranks
-  eviction by what a checkpoint would cost to rebuild, `--concurrent-prefill` admits while others
-  prefill, and `--recover-invariant-failures` keeps serving after an internal invariant fails.
-- **Drafting and sampling** (Gideon Zenz). `--mtp-attention-window N` lets the MTP draft head
-  attend to its first 64 keys and the newest `N` instead of the whole history, so the draft's read
-  stops growing with the context while verification still decides every token. Post-thinking
-  sampling switches a thinking request to its own preset (temperature 0.2) once the reasoning
-  closes, per server (`--post-thinking*`) or per request (a `post_thinking` object).
-- **Serving** (Gideon Zenz, Ian Ranson). `GET /stats` with every Engine counter and the waiting
-  queue, on the main port or a separate `--stats-port`; a terminal dashboard and a wedge watchdog in
-  [`tools/monitor`](tools/monitor/README.md); request-log rotation (`--request-log-max-mib`);
-  `--assistant-prefill`, `--unconstrained-response-format`, `--lenient-assistant-history` and
-  `--derive-session-keys` for clients that need them; Anthropic streams carry the protocol's `ping`
-  event with each heartbeat; grouped `--help` screens, `--log-colours` and a statistics panel
-  (`--log-stats-panel`); the build id in every product binary.
-- **Vision on CPU and position interpolation** (David Oelfke). `--vision-residency cpu` encodes
-  images on CPU threads from host FP32 weights with no device Vision memory, and
-  `--rope-scaling-factor` with `--rope-scaling-original-context` interpolates positions past the
-  native window.
-- **Kernels and conversion** (Ian Ranson, Duncan Betts). Programmatic dependent launches in decode
-  graphs (`-DNINFER_PDL=ON` on compatibility builds), split-KV attention for short prefill steps
-  over long contexts, a general BF16 GEMM fallback, MTP banks of mixed formats, the fused RMSNorm and
-  NVFP4 attention input at every width, and converters for ModelOpt NVFP4/FP8 checkpoints, the
-  Quasar NVFP4 checkpoint and a `grouped_mse` scale search. A native Windows build against a
-  prebuilt vcpkg tree.
-- **Unified Linear templates** (Neroued). The Q4, Q5, Q6 and Q8 A16 Linear templates with sliced-K
-  schedules sit beside this line's routes, and each card takes them only at the widths where two
-  sweeps on an RTX 3090, 4090 and 5090 measured them faster: Q5 from about 8 columns up to 96 (RTX
-  3090), 128 (4090) or 1,024 (5090), 1.5 to 1.7 times as fast over the shapes; Q6 from 4 to 32
-  columns; Q4 from 25 columns; Q8 at widths that differ per card. Q4 decode and verification widths
-  keep this line's kernels. `NINFER_LINEAR_ROUTES=legacy|unified` forces one table.
-- **FP8, NVFP4 and BF16 templates and the fused projections** (Neroued). Upstream's unified FP8,
-  NVFP4 and BF16 Linear templates, and its moves of the fused projections of every format onto
-  them (attention and GDN inputs with their conv forms, LinearAdd, SwiGLU, the Q8 pair, the top-k
-  heads, the Q8 grouped convolution and context-KV materialization), sit beside this line's routes
-  by the same rule: a card takes them at the widths where two rounds of every shape and Op
-  benchmark measured them faster. Where this line's FP8 and NVFP4 A16 routes loop a small-T kernel
-  over wide inputs, the unified ones run 1.7 to 7 (FP8) and 2.5 to 44 (NVFP4) times as fast at
-  verification and prefill widths on an RTX 3090, and similarly on a 4090; on an RTX 5090 the FP8,
-  NVFP4 and BF16 routes gain 1.1 to 3 times at most widths under A16, A8 and A4. The Q8
-  projections keep this line's routes at most widths. The unified SwiGLU keeps its gate and up
-  projections in FP32 through the activation.
-- **Two-stage GDN prefill** (Neroued). A prompt chunk of 16 tokens or more can run the gated delta
-  rule as one preparation pass (Q/K normalization, the gate factors and each chunk's solve) and one
-  FP32-state recurrence that also writes the output, in place of the WY, state-passing and output
-  kernels. The GDN op ran 1.4 to 4.3 times as fast at every width from 16 to 8,192 tokens on an
-  RTX 3090, 4090 and 5090, so their built-in profiles take it; Engine prefill of the Qwen3.8 27B
-  artifact on the 3090 moved by about 1 %, the recurrence being a small part of a prefill step.
-  `NINFER_GDN_TWO_STAGE=0|1` forces either.
-- **PackGQA** (Gideon Zenz). The INT8 prompt kernel can pack each KV head's query heads into its
-  tiles (`NINFER_PROMPT_PACK_GQA=1`, or a profile's `attn_pack_gqa`). A 1024-token chunk at 32K
-  and 131K of context ran 2.7 % faster on an RTX 3090 and 0.5 % and 3.9 % slower on a 4090 and
-  5090, so no built-in profile turns it on.
-- **Engine and serving fixes**: out-of-memory recovery of the worker (David Oelfke's, ported by
-  Ian Ranson), `--kv-headroom-mib`, `--cuda-graph-allowance-mib`, `--thinking-budget-message` (Ian
-  Ranson); the WebUI's MCP traffic relayed behind `--webui-mcp-proxy`, E8 root codes decoded from
-  tables and an SM-count RMSNorm cutoff ([tmark00](https://github.com/tmark00/ninfer));
-  MTP graph profiles with topology classes (Mykhailo Dementii, upstream PR #221); openable server URLs and CORS
-  preflight echoes (pelebel, natpate); and the upstream pull requests listed in the map, among them
-  GGUF as a conversion source (giveen), a Q6 recipe (bingchengcc), sparse-MoE, NVFP4 and
-  attention-epilogue tuning (Mykhailo Dementii, Duncan Betts, MOVIBALE), quoted-marker and
-  duplicate-parameter tool-call fixes (Fedor Suchkov, adubkov) and Copilot tool shapes (Damian
-  Sromek).
+其他来自 4090 分支的思路包括：服务端默认思考级别、最多 15 个 MTP 草稿、`/metrics` 和 `/slots`（Sergiusz Michalik）及 `/props`、从 `NINFER_WEBUI_DIR` 编译内嵌 WebUI、仅受上下文约束的输出上限、块采样器候选驻留共享内存、可选 bf16 残差加法（`-DNINFER_BF16_RESIDUAL_ADD=ON`）、分块 GDN 预填充的向量存储，以及受限分片编译和 ptxas 报告构建选项。
 
-The [maintainer map](docs/maintainer/consolidated-line.md) lists each change with the files it
-touches and the tests that cover it.
+### 来自其他分支的工作
 
-## Running
+- **Host 缓存下方的磁盘层**（[IMGillusion](https://github.com/IMGillusion/ninfer-disk-kv)）。`--disk-kv-path DIR` 将被驱逐会话的 KV 页与状态图像写入按 prompt 摘要索引、带 CRC 检查和 LRU 管理的文件，重启后仍保留。`--disk-kv-restore` 可从相同已存前缀恢复，只预填充剩余部分。Bonsai 2 + MTP 中，一个 17,444-token 输入被另两个请求驱逐后，从磁盘恢复耗时由 9.6 秒降至 1.2 秒，重启后为 1.0 秒，答案一致；DFlash2 与无推测解码也可恢复。Windows 的 `-DNINFER_DIRECTSTORAGE=ON` 构建可用 `--disk-kv-directstorage` 经 DirectStorage 读取；上游当时与 D3D12 一样尚未实测。
+- **自适应 MTP**（[Mirko Covizzi](https://github.com/MirkoCovizzi/ninfer-rtx5090-mobile)）。`--adaptive-mtp` 根据实测草稿存活率和轮次成本，每轮在 K 个草稿中验证 3..K 个，并为各宽度准备 CUDA Graph。RTX 3090 上的 Bonsai 2、K=5，59% 轮次验证 5 个，23% 验证 4 个，18% 验证 3 个；没有超过固定 K=3：短输入为 200 对 204 tok/s，8K 为 150 对 163。各宽度 Graph 也占显存，因此 Huihui 的 198,400-token 缓存在开启后无法再装入 24 GB 卡。宽度改变可能让接近同分的 token 结果不同，与切换固定窗口时类似。
+- **快速 INT8 prompt 注意力**（Ian Ranson，[Wallawalla47](https://github.com/Wallawalla47/ninfer-custom)）。每个 warp 将 query 行、score、output 留在寄存器中，每 64-key tile 用 FP16 累加 P·V。汇总线将其扩展到 `rk8v4` 和打包 key 编码，并让 device profile 在更快时开启；三张实测卡的 prompt 注意力耗时减少 19–30%。`--fast-prefill-kernel` 可强制开启。Bonsai 2 的 64K `rk8v4` 快速语料困惑度从 5.2074 变为 5.2079，131K 三目标测试全部找到。
+- **Agent 工具调用格式。** 除 Qwen 格式外，支持 `<function name=...>`、`<invoke name=...>`、`<function_calls>`、`<param name=...>`，并经过同一恢复流程；来自 Pavel Kochubey 的上游 PR #300，经 Wallawalla47 引入。
+- **结构化输出。** `--structured-output` 启用 xgrammar，支持推测解码；来自 Andrey Shvartsman 的上游 PR #294。
+- **首 token 对数概率。** 开启 `--first-token-logprobs` 后，Chat Completions 请求可使用 `top_logprobs` 获取第一个生成 token 及其候选的对数概率（IMGillusion）。
+- **滚动保留。** `--context-cache-policy rolling` 让一个长会话不断向前移动已缓存边界（IMGillusion）。
+- **释放分叉检查点。** `--release-diverged-checkpoints` 优先丢弃所属会话已经不再使用的私有检查点；Ian Ranson 根据 pkochubey 的上游 PR #300 实现。
+- **Blackwell NVFP4 专家权重库。** Mykhailo Dementii 的上游 PR #286–#290。Qwen3.6-35B-A3B NVFP4 检查点可用 `--recipe qwen3_6_35b_a3b_nvfp4` 转换，并运行于任意 `120a` 构建。RTX 5090 Native 构建（`-DNINFER_SM120_NATIVE=ON`）上，20.6 GB 纯文本产物的 4K 预填充为 27,663 tok/s、解码 397 tok/s。预填充把激活量化为 4 bits，走 Blackwell 独有 W4A4，所以 sm_8x 构建会拒绝这种权重库。
+- **N-gram 复制草稿**（remesis、Ian Ranson）。搭配 drafter 时，可根据最近 12 个 token 的匹配，从已有 prompt、工具结果或输出中复制最多 15 个 token 供验证（`--ngram-draft-tokens`、`--ngram-min-match`）。开启 `--spec` 后默认启用；每个复制 token 都由目标模型验证，属于精确推测。可选 RAM 归档 `--ngram-archive-mib` 为同一 `X-NInfer-Draft-Session` 后续请求保留已完成请求的复制来源。
+- **Hybrid 前缀缓存**（Ian Ranson，[Wallawalla47](https://github.com/Wallawalla47/ninfer-custom)）。`--use-alt-prefix-caching` 用按内容寻址、跨请求共享的 64-token KV 块和稀疏状态快照替换检查点目录，按可用显存和一个 `--host-cache-mib` Host 预算安排容量。围绕默认目录还增加了可选近期访问驱逐、先降级到 Host（`--recency-eviction`），按需扩展回答的 Device KV 租用量（`--kv-lease-growth`），统一 Host 保留预算（`--host-cache-mib`），对重写会话自动设置消息边界锚点（`--auto-long-anchors`）；默认还会复用中止请求已预填充内容，并在目录满时以 LRU 替换自动共享前缀。
+- **请求接纳与缓存驱逐**（Gideon Zenz、David Oelfke、Ian Ranson）。`--thorough-admission-search` 最多花 250 ms 检查所有复用候选；`--value-aware-demote` 按检查点重建成本排序驱逐；`--concurrent-prefill` 在其他请求预填充时接纳新请求；`--recover-invariant-failures` 在内部不变量失败后继续服务。
+- **草稿与采样**（Gideon Zenz）。`--mtp-attention-window N` 让 MTP 草稿头只关注开头 64 个 key 和最近 N 个，避免草稿读取量随历史持续增长，最终 token 仍由目标模型验证。思考结束后的采样可切到单独预设（temperature 0.2），支持服务端 `--post-thinking*` 或请求中的 `post_thinking` 对象。
+- **服务功能**（Gideon Zenz、Ian Ranson）。`GET /stats` 提供全部 Engine 计数和等待队列，可用主端口或独立 `--stats-port`；[`tools/monitor`](tools/monitor/README.md) 提供终端仪表盘与卡死 watchdog；支持请求日志轮转（`--request-log-max-mib`）。还提供 `--assistant-prefill`、`--unconstrained-response-format`、`--lenient-assistant-history`、`--derive-session-keys`；Anthropic 流每个心跳发送协议 `ping` 事件；分组 `--help`、`--log-colours`、统计面板 `--log-stats-panel`，以及每个产品二进制中的 build id。
+- **CPU 视觉与位置插值**（David Oelfke）。`--vision-residency cpu` 使用 Host FP32 权重和 CPU 线程编码图片，不分配设备 Vision 显存；`--rope-scaling-factor` 配合 `--rope-scaling-original-context` 对超过原生窗口的位置做插值。
+- **内核与转换**（Ian Ranson、Duncan Betts）。包含兼容构建的 decode Graph 程序依赖启动（`-DNINFER_PDL=ON`）、长上下文上短 prefill 步的 split-KV 注意力、通用 BF16 GEMM fallback、混合格式 MTP 权重库、所有宽度的融合 RMSNorm 与 NVFP4 attention 输入，以及 ModelOpt NVFP4/FP8、Quasar NVFP4 和 `grouped_mse` scale 搜索转换器；还提供基于预构建 vcpkg 树的 Windows 原生构建。
+- **统一 Linear 模板**（Neroued）。上游带 sliced-K 调度的 Q4/Q5/Q6/Q8 A16 模板与汇总线原路线并存。每张卡只在两轮实测更快的宽度使用它们：Q5 从约 8 列到 96（3090）、128（4090）、1024（5090），各形状快 1.5–1.7 倍；Q6 为 4–32 列；Q4 从 25 列开始；Q8 的适用宽度随卡变化。Q4 解码和验证宽度保留原内核。`NINFER_LINEAR_ROUTES=legacy|unified` 可强制路线表。
+- **FP8 / NVFP4 / BF16 模板与融合投影**（Neroued）。上游统一模板及各格式融合投影，包括 attention/GDN 输入及卷积形式、LinearAdd、SwiGLU、Q8 pair、top-k heads、Q8 grouped convolution、context-KV materialization，都按同样原则与原路线并存：每种形状和 Op 测两轮，在哪些宽度更快才选用。3090 的原 FP8 / NVFP4 A16 路线会在宽输入上循环 small-T，统一模板在验证和预填充宽度分别快 1.7–7 倍、2.5–44 倍，4090 类似；5090 的 FP8/NVFP4/BF16 在多数 A16/A8/A4 宽度快 1.1–3 倍。Q8 投影多数宽度保留原路线；统一 SwiGLU 的 gate/up 投影在激活阶段保持 FP32。
+- **两阶段 GDN 预填充**（Neroued）。16 tokens 及以上的 prompt chunk 可以先完成 Q/K 归一化、gate 因子和每 chunk 求解，再做 FP32 状态递推并写出结果，替代原 WY、状态传递和输出内核。3090/4090/5090 在 16–8192 tokens 各宽度的 GDN Op 快 1.4–4.3 倍，内置 profile 因而采用此路线；由于递推只占 prefill 一小部分，3090 的 Qwen3.8 27B 整体 Engine prefill 变化约 1%。`NINFER_GDN_TWO_STAGE=0|1` 可强制选择。
+- **PackGQA**（Gideon Zenz）。INT8 prompt 内核可把同一 KV head 的 query heads 打包进 tile（`NINFER_PROMPT_PACK_GQA=1` 或 profile 的 `attn_pack_gqa`）。1024-token chunk 在 32K / 131K 上下文中，3090 快 2.7%，4090 / 5090 分别慢 0.5% / 3.9%，因此内置 profile 均未开启。
+- **引擎与服务修复。** 包括 worker OOM 恢复（David Oelfke 编写、Ian Ranson 移植）；`--kv-headroom-mib`、`--cuda-graph-allowance-mib`、`--thinking-budget-message`（Ian Ranson）；`--webui-mcp-proxy` 转发 WebUI MCP 流量、E8 根码查表解码、按 SM 数量设置 RMSNorm 阈值（[tmark00](https://github.com/tmark00/ninfer)）；带拓扑分类的 MTP Graph profile（Mykhailo Dementii，上游 PR #221）；可直接打开的服务 URL 与 CORS 预检回显（pelebel、natpate）。还有 GGUF 转换源（giveen）、Q6 配方（bingchengcc）、稀疏 MoE/NVFP4/attention epilogue 调优（Mykhailo Dementii、Duncan Betts、MOVIBALE）、带引号标记与重复参数工具调用修复（Fedor Suchkov、adubkov）、Copilot 工具格式（Damian Sromek）。
 
-Download an artifact from the table below and point `ninfer-serve` at it. The server speaks the
-OpenAI and Anthropic APIs on `127.0.0.1:8080` by default. The card's device profile is picked up
-on its own; the configurations below are the ones the [reference tables](docs/performance/reference-2026-09.md)
-measure.
+[维护者与改动对应表](docs/maintainer/consolidated-line.md)列出各项改动涉及的文件和测试。
+
+## 运行示例
+
+以下是上游参考测试使用的命令，**不等于本分支 16GB 运行包的默认配置**。从下方模型表选择相应产物并交给 `ninfer-serve`。原始命令行服务默认在 `127.0.0.1:8080` 提供 OpenAI / Anthropic API，自动选择显卡 profile；[参考表](docs/performance/reference-2026-09.md)记录了这些配置的实测。
 
 <details>
-<summary>Ternary Bonsai 2 27B, fastest single stream: DFlash2 with five drafts over the full 262,144-token window</summary>
+<summary>Ternary Bonsai 2 27B：单请求综合配置，DFlash2 五草稿与完整 262,144 窗口</summary>
 
 ```bash
 ninfer-serve Ternary-Bonsai-2-27B-ninfer-v3.ninfer --model-id bonsai2-27b \
@@ -351,14 +147,11 @@ ninfer-serve Ternary-Bonsai-2-27B-ninfer-v3.ninfer --model-id bonsai2-27b \
   --spec dflash2 --draft-tokens 5
 ```
 
-Five drafts are the all-round choice: seven are faster on short answers, and three to seven win
-after long documents ([draft length](docs/performance/reference-2026-09.md#draft-length)). Add
-`--vision --vision-residency overlay --vision-max-merged 12288` for images: the encode borrows the
-drafter's memory, so the whole window still fits a 24 GB card.
+5 个草稿是综合选择：短回答 7 个更快，长文档后最佳为 3–7 个，见[草稿长度测试](docs/performance/reference-2026-09.md#draft-length)。图片输入可添加 `--vision --vision-residency overlay --vision-max-merged 12288`；图像编码借用 drafter 显存，完整窗口仍可装入 24 GB 卡。
 </details>
 
 <details>
-<summary>Ternary Bonsai 2 27B with MTP drafting through the proposal head</summary>
+<summary>Ternary Bonsai 2 27B：通过 proposal 头生成 MTP 草稿</summary>
 
 ```bash
 ninfer-serve Ternary-Bonsai-2-27B-ninfer-v3.ninfer --model-id bonsai2-27b \
@@ -368,21 +161,18 @@ ninfer-serve Ternary-Bonsai-2-27B-ninfer-v3.ninfer --model-id bonsai2-27b \
 </details>
 
 <details>
-<summary>Ternary Bonsai 2 27B with the largest context a 24 GB card holds (958,464 tokens, <code>rk4v4</code>)</summary>
+<summary>Ternary Bonsai 2 27B：24 GB 卡的大上下文示例，958,464 tokens，<code>rk4v4</code></summary>
 
 ```bash
 ninfer-serve Ternary-Bonsai-2-27B-ninfer-v3.ninfer --model-id bonsai2-27b \
   --max-context 958464 --kv-capacity 958464 --kv-dtype rk4v4 --gdn-state-fp16 --rope-yarn
 ```
 
-An RTX 5090 holds the 1,048,576-token maximum with `rk4v4`, DFlash2 or MTP included, and
-978,944 tokens with `rk8v4`. Filled to 1,048,576 tokens, the model still finds codes planted at 33
-and 66% but misses the one at 90% (about 943K), with YaRN or plain RoPE; up to about 880K it found
-every code on all three cards.
+RTX 5090 使用 `rk4v4` 可容纳 1,048,576-token 上限，包括 DFlash2 或 MTP；`rk8v4` 为 978,944。填到 1,048,576 时，无论 YaRN 还是普通 RoPE，都找到 33%、66% 的代码，但漏掉 90%（约 943K）的目标；约 880K 以内，三张卡均找到全部目标。
 </details>
 
 <details>
-<summary>Ternary Bonsai 2 27B with adaptive MTP and a disk tier that keeps evicted conversations</summary>
+<summary>Ternary Bonsai 2 27B：自适应 MTP，加磁盘层保留被驱逐的会话</summary>
 
 ```bash
 ninfer-serve Ternary-Bonsai-2-27B-ninfer-v3.ninfer --model-id bonsai2-27b \
@@ -393,7 +183,7 @@ ninfer-serve Ternary-Bonsai-2-27B-ninfer-v3.ninfer --model-id bonsai2-27b \
 </details>
 
 <details>
-<summary>Qwen3.8-27B on a 24 GB card: DFlash2 with five drafts over 245,760 tokens of <code>rk4v4</code></summary>
+<summary>Qwen3.8-27B：24 GB 卡，DFlash2 五草稿、245,760-token <code>rk4v4</code></summary>
 
 ```bash
 ninfer-serve Qwen3.8-27B-NInfer/qwen3_8_27b.ninfer --model-id qwen3.8-27b \
@@ -401,54 +191,46 @@ ninfer-serve Qwen3.8-27B-NInfer/qwen3_8_27b.ninfer --model-id qwen3.8-27b \
   --spec dflash2 --draft-tokens 5
 ```
 
-With `rk8v4` the same speculation fits 167,936 tokens on an RTX 4090 and 176,128 on an RTX 3090;
-an RTX 5090 takes the full 262,144 with either.
+相同推测方案换成 `rk8v4`，RTX 4090 可放 167,936 tokens，3090 可放 176,128；RTX 5090 两种格式都能放完整 262,144。
 </details>
 
 <details>
-<summary>Measuring a card that has no built-in profile</summary>
+<summary>为没有内置 profile 的显卡测量配置</summary>
 
 ```bash
 ninfer-calibrate --print > my-gpu.json
 ```
 
-The engine does this by itself at first start; running it by hand refreshes the profile after a
-driver or clock change. See [device profiles](docs/device-profiles.md).
+引擎首次启动会自动执行；手动运行可在驱动或时钟变化后刷新 profile。详见[设备 profile](docs/device-profiles.md)。
 </details>
 
-## Artifacts
+## 上游模型产物
 
-| model | artifact | notes |
+这张表保留上游发布的模型，体积、组件和要求各不相同；它们不是顶部下载目录中那两份 Swift text/MTP 模型的说明。
+
+| 模型 | 产物 | 说明 |
 |---|---|---|
-| Ternary Bonsai 2 27B | [WaveCut/Ternary-Bonsai-2-27B-NInfer-v3](https://huggingface.co/WaveCut/Ternary-Bonsai-2-27B-NInfer-v3) | 8.87 GiB. Ternary text tower, token table and head, Vision, Bonsai-trained MTP head and DFlash2 adapter, and an exact proposal head. Runs only on this line. |
-| Qwen3.8-27B GSQ-RCO IQ3_S | [WaveCut/Qwen3.8-27B-GSQ-RCO-IQ3_S-NInfer-v3](https://huggingface.co/WaveCut/Qwen3.8-27B-GSQ-RCO-IQ3_S-NInfer-v3) | 13.99 GiB. ISTA-DASLab's 3.5-bit GGUF blocks kept byte for byte, their Q6_K MTP head, Vision, the DFlash2 adapter and a proposal head. Runs only on this line. |
-| Qwen3.8-27B | [neroued/Qwen3.8-27B-NInfer](https://huggingface.co/neroued/Qwen3.8-27B-NInfer) | 19 GiB, `groupwise-int` (Q4/Q5), the upstream artifact the reference tables use |
-| Qwen3.8-27B, abliterated | [WaveCut/Huihui-Qwen3.8-27B-abliterated-NInfer-v3](https://huggingface.co/WaveCut/Huihui-Qwen3.8-27B-abliterated-NInfer-v3) | 19.03 GiB, official `qwen3_8_27b` recipe with MTP, DFlash2 and a proposal head |
-| Qwen3.6-35B-A3B NVFP4 | [WaveCut/Qwen3.6-35B-A3B-NVFP4-NInfer-v3](https://huggingface.co/WaveCut/Qwen3.6-35B-A3B-NVFP4-NInfer-v3) | 20.39 GiB. RedHatAI's NVFP4 experts kept code for code, Q8 projections, Vision, MTP and a proposal head. Needs an `sm_120a` GPU. |
+| Ternary Bonsai 2 27B | [WaveCut/Ternary-Bonsai-2-27B-NInfer-v3](https://huggingface.co/WaveCut/Ternary-Bonsai-2-27B-NInfer-v3) | 8.87 GiB。三值文本网络、token 表和输出头，含 Vision、Bonsai 专用 MTP 头、DFlash2 adapter 与精确 proposal 头。仅适用于此汇总线。 |
+| Qwen3.8-27B GSQ-RCO IQ3_S | [WaveCut/Qwen3.8-27B-GSQ-RCO-IQ3_S-NInfer-v3](https://huggingface.co/WaveCut/Qwen3.8-27B-GSQ-RCO-IQ3_S-NInfer-v3) | 13.99 GiB。逐字节保留 ISTA-DASLab 的 3.5-bit GGUF 块，包含其 Q6_K MTP 头、Vision、DFlash2 adapter 和 proposal 头。仅适用于此汇总线。 |
+| Qwen3.8-27B | [neroued/Qwen3.8-27B-NInfer](https://huggingface.co/neroued/Qwen3.8-27B-NInfer) | 19 GiB，`groupwise-int`（Q4/Q5）；参考测试使用的官方产物。 |
+| Qwen3.8-27B，abliterated 版本 | [WaveCut/Huihui-Qwen3.8-27B-abliterated-NInfer-v3](https://huggingface.co/WaveCut/Huihui-Qwen3.8-27B-abliterated-NInfer-v3) | 19.03 GiB，官方 `qwen3_8_27b` 配方，含 MTP、DFlash2 和 proposal 头。 |
+| Qwen3.6-35B-A3B NVFP4 | [WaveCut/Qwen3.6-35B-A3B-NVFP4-NInfer-v3](https://huggingface.co/WaveCut/Qwen3.6-35B-A3B-NVFP4-NInfer-v3) | 20.39 GiB。原样保留 RedHatAI NVFP4 专家权重编码，含 Q8 投影、Vision、MTP、proposal 头，需要 `sm_120a` GPU。 |
 
-The official NInfer artifacts listed in the original READMEs load here too.
-Weight conversion shows how the [Bonsai](docs/weight-conversion.md#ternary-bonsai-2-27b) and
-[GSQ-RCO](docs/weight-conversion.md#a-mixed-precision-qwen38-27b-gguf) artifacts are built.
+原始 README 列出的官方 NInfer 产物也可在此汇总线加载。[权重转换说明](docs/weight-conversion.md)介绍 [Bonsai](docs/weight-conversion.md#ternary-bonsai-2-27b) 和 [GSQ-RCO](docs/weight-conversion.md#a-mixed-precision-qwen38-27b-gguf) 产物的生成方法。
 
-## Building
+## 构建示例
 
 <details>
-<summary>Linux with CUDA 13.1</summary>
+<summary>Linux + CUDA 13.1</summary>
 
 ```bash
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CUDA_ARCHITECTURES=86
 cmake --build build --target ninfer-serve ninfer-calibrate
 ```
 
-`CMAKE_CUDA_ARCHITECTURES` is `86` for the RTX 30 series, `89` for the RTX 40 series and `120a`
-for the RTX 50 series and the RTX PRO 6000 Blackwell (on the `mma.sync` compatibility path, which the
-ternary route needs). The
-opt-in build options are listed in the [Linux build guide](docs/rtx-3090-linux.md#build-options).
-Windows builds, release packages, tests and benchmarks work as in the
-[NInfer-3090 README](https://github.com/ashalliants/ninfer-3090#readme).
+`CMAKE_CUDA_ARCHITECTURES`：RTX 30 系列为 `86`，RTX 40 系列为 `89`，RTX 50 系列和 RTX PRO 6000 Blackwell 为 `120a`，后者使用三值路线需要的 `mma.sync` 兼容路径。可选开关见 [Linux 构建指南](docs/rtx-3090-linux.md#build-options)。上游 Windows 构建、发行包、测试和基准流程参见 [NInfer-3090 README](https://github.com/ashalliants/ninfer-3090#readme)。本分支 Windows RTX 5070 Ti 的构建方法见顶部专用指南。
 </details>
 
-## License
+## 许可证
 
-Apache-2.0, as upstream. The Bonsai artifact's weights come from PrismML, ProCreations and Qwen,
-all Apache-2.0; its card lists the notices.
+与上游一致，采用 Apache-2.0。Bonsai 产物中的权重来自 PrismML、ProCreations 和 Qwen，均为 Apache-2.0；相关声明见其模型卡。

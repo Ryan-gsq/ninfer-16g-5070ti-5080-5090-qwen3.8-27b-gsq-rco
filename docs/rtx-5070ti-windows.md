@@ -12,8 +12,8 @@ CMD 或 PowerShell 脚本。
 
 ## 1. 先启动管理器
 
-1. 将完整运行包解压到固定目录，例如 `qwen27b`。不要只复制 EXE。
-2. 把 `.ninfer` 模型主文件及其全部分卷放入 `model/`。下载包不含模型权重。
+1. 从[夸克网盘下载完整运行目录](https://pan.quark.cn/s/28b896c4b0c0)，保存到固定目录，例如 `qwen27b`；若下载为压缩包，请先解压。不要只复制 EXE。
+2. 成品已包含 Swift S / XXS 两套 `.ninfer` 模型，合计约 20 多 GB 磁盘占用；完整运行目录当前约 23.5GB。保留 `model/` 中的完整模型文件；自行添加模型时，也要保留全部分卷。
 3. 双击 `NInferManager.exe`。它没有主窗口或终端窗口，图标出现在 Windows 托盘中。
 4. 右键图标，选择“管理模型”检查配置；从“启动模型”的二级菜单选择 XXS 或 S。
 5. 就绪后打开监控，或从托盘复制 API base 和模型名供客户端使用。
@@ -340,9 +340,16 @@ CUDA 一列是引擎驻留检查保存的可用显存快照，不是连续每秒
 
 ### 运行条件
 
-已验证 **Windows x64 + RTX 5070 Ti + 驱动 617.14**。这份引擎只保留 SM120a 机器码，
-不是适用于所有 CUDA 显卡的通用包。其他计算能力 12.0 显卡预期架构兼容，但没有逐型号
-验证；RTX 30/40 系需要相应架构的构建。
+已验证 **Windows x64 + RTX 5070 Ti + 驱动 617.14**。本仓库的预编译引擎与配套
+`.ninfer` 模型成品仅支持 **RTX 50 系列**；引擎只保留 SM120a 机器码。
+其他 RTX 50 系型号预期架构兼容，但尚未逐型号实测。
+
+拥有 **16GB 及以上独立显存**的 RTX 30/40 系理论上也可以尝试，但本分支尚未实测，
+不能直接使用这套 50 系成品。需要从源码构建对应架构的引擎（30 系为 `86`，40 系为 `89`），
+并按目标显卡选择配方、转换模型；可用上下文与速度需自行验证。
+可以把本仓库、构建说明和[模型转换指南](rtx-5070ti-windows-downloads.md)交给 AI，
+协助完成环境准备、编译、GGUF 转 `.ninfer` 和启动配置。下面的构建命令针对 RTX 50 系，
+其他系列需要按目标架构调整。
 
 CUDA 13.4 的部署建议是 R615 或更新驱动，本包未验证较旧驱动的兼容下限。参考
 [NVIDIA GPU 列表](https://developer.nvidia.com/cuda/gpus)、
@@ -354,12 +361,12 @@ CUDA 13.4 的部署建议是 R615 或更新驱动，本包未验证较旧驱动�
 
 ### 7.1 从完整源码开始
 
-使用 [Ryan-gsq/ninfer-all 的 `rtx5070ti-cuda13-native` 分支](https://github.com/Ryan-gsq/ninfer-all/tree/rtx5070ti-cuda13-native)，
+使用 [Ryan-gsq/ninfer-16g-5070ti-5080-5090-qwen3.8-27b-gsq-rco 的 `main` 分支](https://github.com/Ryan-gsq/ninfer-16g-5070ti-5080-5090-qwen3.8-27b-gsq-rco/tree/main)，
 其中包含本指南、1.3.1 管理器和 strict/mixed 显存策略。上游默认分支或旧提交未必包含这些改动。
 首次获取源码时，在 PowerShell 中执行下面的命令；目标目录应尚不存在：
 
 ```powershell
-git clone --branch rtx5070ti-cuda13-native --single-branch https://github.com/Ryan-gsq/ninfer-all.git C:\src\ninfer-all
+git clone --branch main --single-branch https://github.com/Ryan-gsq/ninfer-16g-5070ti-5080-5090-qwen3.8-27b-gsq-rco.git C:\src\ninfer-all
 ```
 
 如果已经有这条分支的完整源码，可以沿用已有目录并调整后面的路径。

@@ -14,10 +14,12 @@ settings and the evidence behind those defaults.
 
 ## 1. Start the manager
 
-1. Extract the complete package to a permanent directory, such as `qwen27b`.
+1. [Download the complete runtime directory from Quark Drive](https://pan.quark.cn/s/28b896c4b0c0)
+   and save it to a permanent location, such as `qwen27b`. Extract it first if downloaded as an archive.
    Do not copy the EXE alone.
-2. Put each `.ninfer` model and all its continuation volumes in `model/`.
-   The software download does not include model weights.
+2. The package includes converted Swift S / XXS `.ninfer` models, using a little over 20GB
+   of disk space together; the complete runtime directory currently totals approximately 23.5GB.
+   Preserve the complete files in `model/`, including all continuation volumes when adding your own models.
 3. Double-click `NInferManager.exe`. It has no main window or terminal;
    look for its icon in the Windows notification area.
 4. Right-click the icon and open Manage Models to check the configuration.
@@ -401,10 +403,20 @@ Strict configurations with three valid near-limit requests in this run: S 64K, S
 
 ### Runtime requirements
 
-Validated: **Windows x64, RTX 5070 Ti, driver 617.14**. This executable retains only
-SM120a machine code and is not a universal CUDA build. Other compute-capability
-12.0 devices are expected to be architecture-compatible but were not individually
-tested. RTX 30/40-series GPUs need builds for their supported architectures.
+Validated: **Windows x64, RTX 5070 Ti, driver 617.14**. This repository's prebuilt
+engine and accompanying converted `.ninfer` model artifacts support **RTX 50-series GPUs only**;
+the engine retains only SM120a machine code. Other RTX 50-series models are expected
+to be architecture-compatible but have not been individually tested.
+
+RTX 30/40-series GPUs with **at least 16GB of dedicated VRAM** may also be able to run
+the project, but this branch has not tested them. They cannot use this RTX 50-series
+package directly. Build the engine from source for the target architecture (`86` for
+RTX 30-series, `89` for RTX 40-series), then select an appropriate conversion recipe
+and prepare the model. Context capacity and speed need validation on the actual GPU.
+You can give this repository, its build instructions, and the
+[model conversion guide](rtx-5070ti-windows-downloads.md) to an AI assistant to help
+prepare the environment, compile the engine, convert GGUF to `.ninfer`, and configure
+startup. The commands below target RTX 50-series GPUs and must be adapted for other architectures.
 
 R615 or newer is the deployment recommendation for CUDA 13.4; this package has not
 validated compatibility limits on older drivers. References:
@@ -419,12 +431,12 @@ measurements for the 5090 or 3090.
 
 ### 7.1 Start with the complete source
 
-Use the [`rtx5070ti-cuda13-native` branch of Ryan-gsq/ninfer-all](https://github.com/Ryan-gsq/ninfer-all/tree/rtx5070ti-cuda13-native).
+Use the [`main` branch of Ryan-gsq/ninfer-16g-5070ti-5080-5090-qwen3.8-27b-gsq-rco](https://github.com/Ryan-gsq/ninfer-16g-5070ti-5080-5090-qwen3.8-27b-gsq-rco/tree/main).
 It contains this guide, Manager 1.3.1 and the strict/mixed memory policies. The upstream default branch or an older commit may not include these changes.
 For a first checkout, run this command in PowerShell; the destination directory should not already exist:
 
 ```powershell
-git clone --branch rtx5070ti-cuda13-native --single-branch https://github.com/Ryan-gsq/ninfer-all.git C:\src\ninfer-all
+git clone --branch main --single-branch https://github.com/Ryan-gsq/ninfer-16g-5070ti-5080-5090-qwen3.8-27b-gsq-rco.git C:\src\ninfer-all
 ```
 
 If you already have the complete source from this branch, reuse that directory and adjust the paths below.
