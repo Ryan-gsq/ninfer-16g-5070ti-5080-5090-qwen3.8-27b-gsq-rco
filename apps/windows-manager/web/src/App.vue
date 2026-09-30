@@ -2,7 +2,10 @@
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import MonitorPanel from './MonitorPanel.vue'
 import HelpTip from './HelpTip.vue'
-import { groups, identityHelp, strictMemoryHelp, words, type Bilingual, type Language } from './parameterHelp'
+import { groups as basicGroups, identityHelp, strictMemoryHelp, words, type Bilingual, type Language, type ParameterGroup } from './parameterHelp'
+import { advancedGroups } from './advancedParameterHelp'
+
+const groups = [...basicGroups, ...advancedGroups]
 
 type Profile = { id:string; name:string; modelPath:string; enginePath:string; parameters:Record<string,string|null>; environment:Record<string,string|null> }
 type Page = 'monitor' | 'models' | 'settings'
@@ -14,7 +17,7 @@ const t = (zh:string,en:string) => language.value === 'zh' ? zh : en
 const local = (value:Bilingual) => value[language.value]
 const error = ref(''), connectionError = ref(''), notice = ref<Bilingual|null>(null), connected = ref(false), busy = ref(false), exiting = ref(false)
 const displayedError = computed(() => error.value || (connectionError.value ? t('无法连接管理器，请从托盘重新打开页面。','Cannot connect to the manager. Reopen this page from the tray.')+' '+connectionError.value : ''))
-const launchProfileId = ref(''), edit = ref<Profile|null>(null), dirty = ref(false), advanced = ref(false)
+const launchProfileId = ref(''), edit = ref<Profile|null>(null), dirty = ref(false), advanced = ref(false), advancedOptions = ref(false)
 const jsonText = ref(''), envText = ref(''), settingsEdit = ref<any>(null), directories = ref('')
 const engine = computed(() => connected.value ? (data.value.engine || {state:'Stopped'}) : {...data.value.engine,state:exiting.value ? 'Stopped' : 'Offline'})
 const stateName = computed(() => ({Stopped:t('已停止','Stopped'),Starting:t('正在加载','Loading'),Running:t('运行中','Running'),Stopping:t('正在停止','Stopping'),Failed:t('启动 / 运行异常','Engine error'),Offline:t('管理器未连接','Manager offline')}[engine.value.state as string] || engine.value.state))
@@ -30,6 +33,58 @@ const strictPreview = computed(() => `strict-${strictReserve.value || '…'}-${s
 const hybridParameters = ['--device-snapshot-slots','--cache-taps-per-request','--cache-tap-ladder','--cache-tap-min-gap','--prefix-cache-file']
 const knownKeys = new Set(groups.flatMap(group => group.fields.map(field => field.key)))
 const extraParameters = computed(() => Object.entries(edit.value?.parameters || {}).filter(([key]) => !knownKeys.has(key)))
+const advancedParameterCount = computed(() => Object.keys(edit.value?.parameters || {}).filter(key => advancedGroups.some(group => group.fields.some(field => field.key === key))).length)
+const visionEnabled = computed(() => !!edit.value && ('--vision' in edit.value.parameters || '--vision-cpu' in edit.value.parameters))
+const selectedModel = computed(() => data.value.models.find((model:any) => model.path.toLowerCase().replaceAll('\\','/') === edit.value?.modelPath.toLowerCase().replaceAll('\\','/')))
+function groupNotes(group:ParameterGroup):string[] {
+  const parameters=edit.value?.parameters || {}, notes:string[]=[]
+  const has=(key:string)=>key in parameters
+  const contains=(key:string)=>group.fields.some(field=>field.key===key)
+  const hybrid=memoryMode.value==='strict' || has('--use-alt-prefix-caching')
+  if(group.fields.some(field => field.key === '--spec')) {
+    notes.push(t('未填写的项目使用引擎或管理器默认值。切换后端会保留其他设置；下方提示帮助你处理依赖。','Blank options use engine or manager defaults. Changing the backend preserves your other settings; the notes below explain dependencies.'))
+    const backend=parameters['--spec'], drafts=Number(parameters['--draft-tokens'] || 0), ngram=Number(parameters['--ngram-draft-tokens'] ?? (backend ? 15 : 0)), archive=Number(parameters['--ngram-archive-mib'] || 0), session=Number(parameters['--ngram-session-mib'] ?? 128), window=Number(parameters['--mtp-attention-window'] || 0)
+    if(!backend && (drafts!==0 || ngram>0 || '--lm-head-draft' in parameters || '--adaptive-mtp' in parameters || window>0))notes.push(t('草稿后端已关闭；请清空每轮草稿数、关闭优化输出头及自适应 MTP，并把复制草稿和 MTP 窗口设为 0 或留空。上下文查找值可以保留，但当前路线只有 MTP 会使用它。','The draft backend is off. Clear drafts per round, disable the optimized head and adaptive MTP, and clear or set copied drafts and the MTP window to zero. The context lookup value may be retained, but the current path uses it only with MTP.'))
+    if(backend && (drafts<1 || drafts>15))notes.push(t('启用草稿后端后，每轮草稿数必须为 1–15，不能留空。','With a backend enabled, drafts per round must be set to 1–15.'))
+    if(backend && backend!=='mtp' && ('--adaptive-mtp' in parameters || window>0))notes.push(t('自适应 MTP 与非零 MTP 注意力窗口仅适用于 mtp。','Adaptive MTP and a nonzero MTP attention window require mtp.'))
+    if(backend==='mtp' && window>0 && window<drafts+1)notes.push(t('MTP 注意力窗口至少要比每轮草稿数多 1。','The MTP attention window must be at least drafts per round + 1.'))
+    if(ngram>15 && Number(parameters['--max-concurrency'] ?? 1)!==1)notes.push(t('复制草稿超过 15 时，并行请求数必须为 1。','More than 15 copied drafts requires concurrency 1.'))
+    if(archive>0 && (ngram<=0 || session<1 || session>archive))notes.push(t('跨请求复制来源需要启用复制草稿；每会话预算须在 1 MiB 到总预算之间。','The copy archive requires ngram drafting and a per-session budget from 1 MiB to the total archive budget.'))
+    if('--ngram-native-sessions' in parameters && archive<=0)notes.push(t('识别客户端会话标识需要大于 0 的跨请求复制来源预算。','Client session recognition requires a positive copy archive budget.'))
+    if(Number(parameters['--lookup-ngram'] || 0)>0 && backend!=='mtp')notes.push(t('上下文查找值已保留；当前未选择 MTP，因此不会执行这项查找草稿加速。','The context lookup value is retained. It is inactive because MTP is not selected.'))
+  }
+  if(group.fields.some(field => field.key === '--vision')) {
+    notes.push(t('视觉默认关闭。当前 Swift XXS / S 的 text + MTP 文件不包含 Vision；只有换用包含视觉组件的模型后才能接收图片或视频。','Vision is off by default. The current Swift XXS / S text + MTP artifacts do not include Vision; image or video input needs a model with a Vision component.'))
+    if(visionEnabled.value && selectedModel.value && !(selectedModel.value.components || []).some((component:string) => component.toLowerCase()==='vision'))notes.push(t('所选模型的扫描结果没有 Vision 组件。请更换包含视觉组件的模型，或关闭视觉。','The selected model’s scan found no Vision component. Select a Vision-capable model or disable vision.'))
+    if(visionEnabled.value && memoryMode.value!=='default')notes.push(t('当前显存策略仅支持纯文本。启用视觉前，请手动把显存策略改为 default；此处不会替你改动。','The current memory policy is text-only. Select default memory policy yourself before enabling vision.'))
+    if(!visionEnabled.value && ['overlay','cpu'].includes(parameters['--vision-residency'] || ''))notes.push(t('已保留视觉放置位置；overlay / cpu 需要开启视觉。若保持视觉关闭，请把放置位置改为 resident 或引擎默认。','The saved placement is preserved. overlay / cpu require vision. To leave vision off, select resident or the engine default.'))
+  }
+  if(contains('--use-alt-prefix-caching')) {
+    if(memoryMode.value==='strict')notes.push(t('当前 strict 已自动选择混合前缀缓存。传统缓存与关闭前缀复用不适用于此模式；更换路线需要先调整显存策略。','Strict currently selects hybrid prefix caching automatically. Traditional caching and disabled prefix reuse do not apply; change the memory policy before choosing another route.'))
+    if(has('--kv-headroom-mib') && memoryMode.value!=='default')notes.push(t('已填写自动 KV 规划预留，但此项仅适用于 default 显存策略。strict 的余量在常用选项的显存策略中设置。','Auto-KV headroom is set but requires default memory policy. Set the strict reserve in the common memory-policy controls instead.'))
+  }
+  if(contains('--device-state-slots') || contains('--disk-kv-path')) {
+    notes.push(hybrid?t('这些项目属于传统缓存。当前使用混合缓存，填写之前请先切换缓存路线；收起此分组不会删除已保存值。','These options belong to the traditional cache. Hybrid caching is currently selected; change the cache route before setting them. Collapsing the group preserves saved values.'):t('这些项目用于传统前缀缓存；统一 Host 缓存预算与独立 Host 槽位 / KV 预算只能选择一种。','These options apply to the traditional prefix cache. Choose either the unified Host budget or the separate Host slots / KV budgets.'))
+  }
+  if(contains('--cache-taps-per-request') && !hybrid)notes.push(t('这些项目需要混合前缀缓存。填写时会自动启用该缓存路线；它与显存不足时借用系统内存无关。','These options need hybrid prefix caching. Setting one enables that cache route automatically; this is separate from borrowing system RAM when VRAM is insufficient.'))
+  if(contains('--no-cuda-graph') && has('--no-cuda-graph') && Number(parameters['--cuda-graph-allowance-mib'] || 0)>0)notes.push(t('已关闭 CUDA Graph，请把常用选项中的 Graph 启动预算设为 0 或清空。','CUDA Graphs are disabled. Clear the common Graph startup budget or set it to zero.'))
+  if(contains('--no-thinking') && has('--no-thinking') && parameters['--default-reasoning-effort'] && parameters['--default-reasoning-effort']!=='none')notes.push(t('默认关闭思考与当前思考强度冲突；请在常用选项中清空思考强度或选 none。','Disabling thinking conflicts with the current default effort. Clear it in the common controls or select none.'))
+  if(contains('--assistant-prefill') && has('--assistant-prefill') && !has('--no-thinking'))notes.push(t('续写末尾 assistant 消息需要默认关闭思考；可在“思考预算与回答阶段采样”中设置。','Continuing a trailing assistant message requires thinking disabled by default; set it in Thinking budgets and answer-stage sampling.'))
+  return notes
+}
+function validateNumericFields(parameters:Record<string,string|null>) {
+  for(const group of groups)for(const field of group.fields) {
+    if(field.inputType!=='number' || !(field.key in parameters))continue
+    const raw=parameters[field.key], value=Number(raw)
+    if(raw===null || raw.trim()==='' || !Number.isFinite(value) ||
+       (field.min!==undefined && value<field.min) || (field.max!==undefined && value>field.max) ||
+       (field.step!==undefined && Number.isInteger(field.step) && (!Number.isInteger(value) || (value-(field.min ?? 0))%field.step!==0))) {
+      const range=[field.min,field.max].filter(bound=>bound!==undefined).join('–')
+      const whole=field.step!==undefined && Number.isInteger(field.step)
+      throw new Error(t(`${local(field.label)}（${field.key}）请输入${range}${whole?' 范围内的整数':' 范围内的数值'}${field.step && field.step>1?`，步长 ${field.step}`:''}，或留空使用默认值。`,`${local(field.label)} (${field.key}): enter ${whole?'an integer':'a number'} in ${range}${field.step && field.step>1?`, step ${field.step}`:''}, or leave blank for the default.`))
+    }
+  }
+}
 const n = (value:unknown,digits=1) => value === null || value === undefined || !Number.isFinite(Number(value)) ? '—' : Number(value).toLocaleString(language.value === 'zh' ? 'zh-CN' : 'en-US',{maximumFractionDigits:digits})
 let timer:ReturnType<typeof setInterval> | undefined
 let languageVersion = 0
@@ -112,9 +167,19 @@ function setParam(key:string,value:string) {
     edit.value.parameters[key]=value
     if(hybridParameters.includes(key) && memoryMode.value !== 'strict')edit.value.parameters['--use-alt-prefix-caching']=null
   }
+  if(key==='--vision-residency' && value!=='cpu')delete edit.value.parameters['--vision-cpu']
   dirty.value=true
 }
-function setFlag(key:string,value:boolean) { if(!edit.value)return; if(value)edit.value.parameters[key]=null; else delete edit.value.parameters[key]; dirty.value=true }
+function setFlag(key:string,value:boolean) {
+  if(!edit.value)return
+  if(value)edit.value.parameters[key]=null; else delete edit.value.parameters[key]
+  if(key==='--vision-cpu') {
+    if(value)edit.value.parameters['--vision']=null
+    edit.value.parameters['--vision-residency']=value ? 'cpu' : 'resident'
+  }
+  if(key==='--vision' && !value)delete edit.value.parameters['--vision-cpu']
+  dirty.value=true
+}
 function newProfile() {
   if(dirty.value && !window.confirm(t('放弃当前未保存修改？','Discard the current unsaved changes?')))return
   edit.value=data.value.profiles.length ? clone(data.value.profiles[0]) : {id:'',name:'',modelPath:data.value.models[0]?.path || '',enginePath:'engine/ninfer-serve.exe',parameters:{},environment:{}}
@@ -135,7 +200,7 @@ function duplicate() {
 }
 async function save() {
   if(!edit.value)return
-  await action(async() => { if(advanced.value)applyAdvanced(); validateMemoryPolicy(edit.value!.parameters);await api('/profiles/'+edit.value!.id,'PUT',edit.value);dirty.value=false;syncJson() },words('配置已保存，下次启动生效。','Profile saved. Changes apply on the next start.'))
+  await action(async() => { if(advanced.value)applyAdvanced(); validateMemoryPolicy(edit.value!.parameters);validateNumericFields(edit.value!.parameters);await api('/profiles/'+edit.value!.id,'PUT',edit.value);dirty.value=false;syncJson() },words('配置已保存，下次启动生效。','Profile saved. Changes apply on the next start.'))
 }
 async function remove() {
   if(!edit.value || !saved.value || !window.confirm(t(`删除配置“${edit.value.name}”？模型文件会保留。`,`Delete “${edit.value.name}”? The model files will be kept.`)))return
@@ -186,29 +251,36 @@ onUnmounted(() => clearInterval(timer))
        <div class="field"><div class="field-label"><label for="model-path">{{t('模型文件','Model file')}}</label><HelpTip :title="t('模型文件','Model file')" :text="local(identityHelp.model)" parameter="MODEL" :language="language" restart /></div><select id="model-path" v-model="edit.modelPath" @change="dirty=true"><option :value="edit.modelPath">{{edit.modelPath||t('选择模型文件','Choose a model file')}}</option><option v-for="m in data.models.filter((m:any)=>m.path!==edit!.modelPath)" :key="m.path" :value="m.path">{{m.name}}</option></select></div>
        <div class="field"><div class="field-label"><label for="engine-path">{{t('引擎路径','Engine path')}}</label><HelpTip :title="t('引擎路径','Engine path')" :text="local(identityHelp.engine)" :language="language" restart /></div><input id="engine-path" v-model="edit.enginePath" @input="dirty=true"></div>
       </div>
-      <template v-if="!advanced">
-       <section class="parameter-group" v-for="(group,index) in groups" :key="index"><h4>{{local(group.title)}}</h4><div class="form-grid">
+      <div class="profile-parameters">
+       <p v-if="advanced" class="hint">{{t('专家 JSON 编辑已打开，下面的参数表暂时只读。收起 JSON 后会将修改应用到表单，点击保存才会写入配置。','Expert JSON editing is open, so the parameter form is read-only. Closing JSON applies your edits to the form; Save writes the profile.')}}</p>
+       <template v-for="(group,index) in groups" :key="index">
+       <button v-if="index===basicGroups.length" class="advanced-options-toggle" :aria-expanded="advancedOptions" :aria-controls="advancedGroups.map((_,i)=>'advanced-parameter-group-'+i).join(' ')" @click="advancedOptions=!advancedOptions"><span>{{advancedOptions?'▾':'▸'}} {{t('高级选项','Advanced options')}}</span><small>{{t('服务、缓存、内核、请求限制与日志','Serving, caches, kernels, request limits and logs')}} · {{advancedParameterCount}} {{t('项已配置','configured')}}</small></button>
+       <section v-show="!group.advanced||advancedOptions" :id="group.advanced?'advanced-parameter-group-'+(index-basicGroups.length):undefined" class="parameter-group" :class="{'advanced-parameter-group':group.advanced}"><h4>{{local(group.title)}}</h4><div v-if="groupNotes(group).length" class="parameter-notes"><p v-for="note in groupNotes(group)" :key="note">{{note}}</p></div><div class="form-grid">
         <div v-for="field in group.fields" :key="field.key" class="field" :class="{'flag-field':field.flag,'memory-policy-field':field.key==='--cuda-memory-policy'}">
          <div class="field-label"><label :for="field.key">{{local(field.label)}}<span v-if="field.key==='--max-context'" class="muted"> · {{n(context/1024)}}K</span></label><HelpTip :title="local(field.label)" :text="local(field.help)" :parameter="field.key" :language="language" restart /></div><code class="field-option">{{field.key}}</code>
          <template v-if="field.key==='--cuda-memory-policy'">
-          <select :id="field.key" :value="memoryMode" @change="setMemoryMode(($event.target as HTMLSelectElement).value)"><option value="default">{{t('默认策略','Default policy')}}</option><option value="mixed">{{t('允许借用系统内存','Allow borrowing system RAM')}}</option><option value="strict">{{t('仅使用独立显存','Dedicated VRAM only')}}</option></select>
+          <select :id="field.key" :value="memoryMode" :disabled="advanced" @change="setMemoryMode(($event.target as HTMLSelectElement).value)"><option value="default">{{t('默认策略','Default policy')}}</option><option value="mixed">{{t('允许借用系统内存','Allow borrowing system RAM')}}</option><option value="strict">{{t('仅使用独立显存','Dedicated VRAM only')}}</option></select>
           <div v-if="memoryMode==='strict'" class="strict-settings">
-           <div class="field"><div class="field-label"><label for="strict-reserve">{{t('显存余量 · MiB','VRAM reserve · MiB')}}</label><HelpTip :title="t('显存余量','VRAM reserve')" :text="local(strictMemoryHelp.reserve)" parameter="--cuda-memory-policy strict-RESERVE-STEP" :language="language" restart /></div><input id="strict-reserve" type="number" min="0" max="17592186044415" step="1" :value="strictReserve" @input="setStrictValue('reserve',($event.target as HTMLInputElement).value)"></div>
-           <div class="field"><div class="field-label"><label for="strict-step">{{t('探测步长 · MiB','Probe step · MiB')}}</label><HelpTip :title="t('探测步长','Probe step')" :text="local(strictMemoryHelp.step)" parameter="--cuda-memory-policy strict-RESERVE-STEP" :language="language" restart /></div><input id="strict-step" type="number" min="1" max="16384" step="1" :value="strictStep" @input="setStrictValue('step',($event.target as HTMLInputElement).value)"></div>
+           <div class="field"><div class="field-label"><label for="strict-reserve">{{t('显存余量 · MiB','VRAM reserve · MiB')}}</label><HelpTip :title="t('显存余量','VRAM reserve')" :text="local(strictMemoryHelp.reserve)" parameter="--cuda-memory-policy strict-RESERVE-STEP" :language="language" restart /></div><input id="strict-reserve" type="number" min="0" max="17592186044415" step="1" :disabled="advanced" :value="strictReserve" @input="setStrictValue('reserve',($event.target as HTMLInputElement).value)"></div>
+           <div class="field"><div class="field-label"><label for="strict-step">{{t('探测步长 · MiB','Probe step · MiB')}}</label><HelpTip :title="t('探测步长','Probe step')" :text="local(strictMemoryHelp.step)" parameter="--cuda-memory-policy strict-RESERVE-STEP" :language="language" restart /></div><input id="strict-step" type="number" min="1" max="16384" step="1" :disabled="advanced" :value="strictStep" @input="setStrictValue('step',($event.target as HTMLInputElement).value)"></div>
            <p class="policy-preview">{{t('对应参数','Policy value')}} <code>{{strictPreview}}</code><span v-if="strictValue()==='strict'">{{t('（64/128 保存为 strict）','(64/128 is saved as strict)')}}</span></p>
           </div>
           <p v-if="memoryMode==='strict'" class="hint">{{t('自动选择所需上下文缓存实现。CPU Host cache 独立配置，不属于显存不足时的系统内存借用。','Automatically selects the required context-cache implementation. CPU Host cache is independent and is not system-RAM borrowing caused by a VRAM shortfall.')}}</p>
           <p v-else-if="memoryMode==='mixed'" class="hint">{{t('显存不足时允许 Windows 用系统内存承接 CUDA 设备数据，放置由驱动决定，并非强制分配到 Shared。可能降低速度；auto 最多为每个并发规划一个完整上下文窗口，仍可能分配失败。','When VRAM is insufficient, Windows may use system RAM for CUDA device data. The driver decides placement; Shared allocation is not forced. Performance may decrease. Auto plans at most one complete context window per concurrent request, and allocation may still fail.')}}</p>
           <p v-else class="hint">{{t('保留按 CUDA free 规划的原分配行为，不做严格驻留探测；也不保证绝不使用共享系统内存。','Keeps the original CUDA-free planning behavior without strict residency probing. It does not guarantee that shared system memory will never be used.')}}</p>
-          <p v-if="memoryMode!=='strict'&&'--use-alt-prefix-caching' in edit.parameters" class="hint">{{t('已保留混合前缀缓存以继续使用现有快照参数；高级 JSON 中可查看。这是缓存路线，不是 Shared 显存许可。','Hybrid prefix caching is retained for the existing snapshot options; it is visible in advanced JSON. This cache route is separate from permission to use Shared GPU memory.')}}</p>
+          <p v-if="memoryMode!=='strict'&&'--use-alt-prefix-caching' in edit.parameters" class="hint">{{t('已保留混合前缀缓存以继续使用现有快照参数；高级选项中可查看。这是缓存路线，不是 Shared 显存许可。','Hybrid prefix caching is retained for the existing snapshot options; it is visible in Advanced options. This cache route is separate from permission to use Shared GPU memory.')}}</p>
          </template>
-         <label v-else-if="field.flag" class="flag-value"><input :id="field.key" type="checkbox" :checked="field.key in edit.parameters" @change="setFlag(field.key,($event.target as HTMLInputElement).checked)"><span>{{field.key in edit.parameters?t('已开启','Enabled'):t('已关闭','Disabled')}}</span></label>
-         <input v-else :id="field.key" :value="edit.parameters[field.key]??''" :placeholder="field.placeholder||t('留空使用引擎默认值','Leave blank for engine default')" @input="setParam(field.key,($event.target as HTMLInputElement).value)">
+         <label v-else-if="field.flag" class="flag-value"><input :id="field.key" type="checkbox" :disabled="advanced||field.readOnly" :checked="field.key==='--vision'?visionEnabled:field.key in edit.parameters" @change="setFlag(field.key,($event.target as HTMLInputElement).checked)"><span>{{(field.key==='--vision'?visionEnabled:field.key in edit.parameters)?t('已开启','Enabled'):t('已关闭','Disabled')}}</span></label>
+         <select v-else-if="field.choices" :id="field.key" :value="edit.parameters[field.key]??''" :disabled="advanced||field.readOnly" @change="setParam(field.key,($event.target as HTMLSelectElement).value)"><option v-if="edit.parameters[field.key]&&!field.choices.some(option=>option.value===edit!.parameters[field.key])" :value="edit.parameters[field.key]!">{{t('已保存值，请核对：','Saved value, please check: ')}}{{edit.parameters[field.key]}}</option><option v-for="option in field.choices" :key="option.value" :value="option.value">{{local(option.label)}}</option></select>
+         <input v-else :id="field.key" :type="field.inputType||'text'" :min="field.min" :max="field.max" :step="field.step" :disabled="advanced||field.readOnly" :value="edit.parameters[field.key]??''" :placeholder="field.placeholder||t('留空使用默认值','Leave blank for default')" :autocomplete="field.inputType==='password'?'new-password':undefined" @input="setParam(field.key,($event.target as HTMLInputElement).value)">
+         <small v-if="field.defaultValue" class="field-default">{{t('未填写时：','When omitted: ')}}{{local(field.defaultValue)}}</small>
+         <small v-if="field.readOnly" class="field-default">{{t('当前 Windows 管理器不支持启用此参数。','This option cannot be enabled in the Windows manager.')}}</small>
         </div>
        </div></section>
-       <section v-if="extraParameters.length" class="parameter-group"><h4>{{t('其他已保存参数','Other saved parameters')}}</h4><p class="hint">{{t('这些参数会原样保留。具体作用请查所选引擎 --help，可在高级 JSON 中编辑。','These options are preserved as written. Consult the selected engine’s --help for their meaning and edit them in advanced JSON.')}}</p><div class="extra-parameters"><code v-for="[key,value] in extraParameters" :key="key">{{key}}{{value===null?'':' '+value}}</code></div></section>
-      </template>
-      <button class="link" :aria-expanded="advanced" @click="toggleAdvanced">{{advanced?t('收起高级参数与环境变量','Close advanced parameters and environment'):t('展开高级参数与环境变量','Open advanced parameters and environment')}}</button>
+       </template>
+       <section v-if="extraParameters.length" class="parameter-group"><h4>{{t('其他已保存参数','Other saved parameters')}}</h4><p class="hint">{{t('这些参数会原样保留。具体作用请查所选引擎 --help，可在专家 JSON 中编辑。','These options are preserved as written. Consult the selected engine’s --help for their meaning and edit them in expert JSON.')}}</p><div class="extra-parameters"><code v-for="[key,value] in extraParameters" :key="key">{{key}}{{value===null?'':' '+value}}</code></div></section>
+      </div>
+      <button class="link" :aria-expanded="advanced" @click="toggleAdvanced">{{advanced?t('收起专家 JSON 并应用到表单','Close expert JSON and apply to form'):t('专家编辑：完整参数与环境变量 JSON','Expert editor: complete parameters and environment JSON')}}</button>
       <div v-if="advanced" class="two-col advanced"><div class="field"><div class="field-label"><label for="parameters-json">{{t('完整启动参数 JSON','Complete launch parameters · JSON')}}</label><HelpTip :title="t('完整启动参数 JSON','Launch parameter JSON')" :text="local(identityHelp.json)" :language="language" restart /></div><textarea id="parameters-json" v-model="jsonText" @input="dirty=true" spellcheck="false"></textarea></div><div class="field"><div class="field-label"><label for="environment-json">{{t('环境变量 JSON','Environment · JSON')}}</label><HelpTip :title="t('环境变量','Environment variables')" :text="local(identityHelp.environment)" :language="language" restart /></div><textarea id="environment-json" v-model="envText" @input="dirty=true" spellcheck="false"></textarea></div></div>
       <div class="save-bar"><p>{{t('每次保存保留修订记录。修改配置不会立即重启服务。','Each save keeps a revision. Editing a profile does not restart the running service.')}}</p><button class="primary" :disabled="busy||!connected||!dirty" @click="save">{{busy?t('正在保存…','Saving…'):t('保存配置','Save profile')}}</button></div>
      </div>

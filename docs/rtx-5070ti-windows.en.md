@@ -4,7 +4,7 @@
 
 This package targets **RTX 5070 Ti 16 GB, Windows x64, one model and one concurrent
 request**. It combines the CUDA 13.4.2 Native SM120a Release engine with
-**NInfer Manager 1.3.1**. Double-click `NInferManager.exe` for everyday use.
+**NInfer Manager 1.4.1**. Double-click `NInferManager.exe` for everyday use.
 Model management and monitoring run in your browser; no separate Python,
 CMD or PowerShell launcher is needed.
 
@@ -176,7 +176,7 @@ capacity and performance check.
 | Prefill chunk | 1024 | 256 |
 | Concurrency | 1 | 1 |
 | KV / GDN state | rk8v4 / FP16 | Same |
-| Drafting | MTP 2, ngram 31, full MTP attention window | Same |
+| Drafting | Maximum 4 MTP drafts, adaptive MTP enabled, ngram 31, full MTP attention window | Same |
 | Graph allowance | 72 MiB | Same |
 | `--lm-head-draft` | Off | Off |
 | CPU context cache | 6144 MiB, one device snapshot | Same |
@@ -186,10 +186,13 @@ capacity and performance check.
 | Penalties and seed | presence/frequency 0, seed 42; neutral repetition penalty 1 | Same |
 | Thinking | Enabled, xhigh, preserve thinking | Same |
 
-The complete source defaults are
+The table records the current package's saved everyday settings as of 2026-09-30.
+Adaptive MTP adjusts draft length at runtime: 4 is the maximum, not a fixed count
+for every round. Active profiles are read from `config/profiles/` in the data directory.
+The repository's initialization profiles are
 `apps/windows-manager/config/profiles/xxs-160k.json` and
-`apps/windows-manager/config/profiles/s-128k.json`. Active profiles are read from
-`config/profiles/` in the data directory.
+`apps/windows-manager/config/profiles/s-128k.json`. They seed the first launch,
+do not overwrite existing personal settings, and may differ from settings saved later on this machine.
 
 An output cap of 0 removes the fixed default cap; clients can still supply their
 own limit. It does not expand the context window. Input, reasoning and final output
@@ -209,6 +212,33 @@ mode can update the active file if the device does not match.
 `NINFER_PROMPT_FAST` and `CUDA_LAUNCH_BLOCKING` overrides are cleared.
 The device profile already enables the fast prompt kernel; a reported
 `fast_prefill_kernel=false` only means no additional CLI force-enable flag was supplied.
+
+### 3.1 Using the parameter editor
+
+Common controls are visible directly: API/context, GPU memory/cache, speculative decoding,
+vision/media, sampling/reasoning, and templates/device routes. Advanced options are collapsed
+initially and grouped by device/execution, precision/kernels, positional encoding, context
+cache, disk cache, post-thinking sampling, API behavior, networking/queues and logging.
+Complete JSON and environment variables have a separate editor. Collapsing a group never
+disables or removes its saved parameters. Save changes to apply them on the next model start.
+
+The question mark beside each parameter explains its purpose, effects, default and dependencies.
+A blank field usually omits the option and uses engine/model defaults. The manager supplies
+163840 (160K) for an omitted context limit and 18081 for an omitted API port. A placeholder is not an active value.
+For example, MTP and copy drafts need the matching backend, while cross-request copy archives
+also need a RAM budget. The current `--lookup-ngram` execution path is used by MTP;
+the setting can be saved without MTP but does not take effect then.
+
+Vision requires a model containing visual components. The Swift XXS/S artifacts converted here
+contain only text/MTP; enabling a switch does not add image understanding. Vision uses the
+`default` memory policy and cannot be combined with this version's `mixed/strict` policies.
+CPU vision defaults to 256 merged media tokens when no explicit limit is set. Multi-GPU pipeline
+options are Linux-only and marked unavailable in the Windows editor. D3D12 and DirectStorage
+also require an engine built with their respective support.
+
+When an API key or separate stats port is configured, the manager uses that authentication and
+port for monitoring. A custom request-log path is supported; leaving it blank keeps the manager's
+generated path. Relative output paths are resolved under the personal data directory.
 
 ## 4. Choose a memory policy
 
@@ -284,126 +314,88 @@ does not clear it; manager exit or a new model run resets it.
 | GPU utilization, power, temperature and memory | GPU activity and capacity pressure |
 | Successful, failed and rejected requests | Cumulative results, rather than the length of a recent-request list |
 
-Live throughput uses token-counter deltas; completed-request rates use actual
-request duration, with separate labels. Latency, throughput, MTP and cache-hit
+Prefill and Decode are sampled every two seconds and handled independently.
+A zero token delta keeps that metric's last valid rate in both its card and chart;
+zero-delta intervals are excluded from the average. A positive delta updates the rate
+using non-zero intervals within the last ten seconds: their token deltas divided by
+their combined duration. Startup uses the valid intervals collected so far. After
+more than ten seconds of idle sampling, resumed calculations use only new intervals
+inside the window. Missing data, stops and counter resets clear the held value;
+no rate appears before a valid interval is available. Completed-request rates still use
+each request's actual duration, with separate labels. Latency, throughput, MTP and cache-hit
 aggregates have a last-hour window. Logs are read incrementally with bounded tails,
 and catch-up is indicated for large existing logs. Unsupported counters remain
 unknown instead of becoming zero. NVML whole-card free, CUDA free, and process
 Shared baseline/growth are displayed separately.
 
-## 6. Current package performance: 2026-09-29
+## 6. Current package performance: 2026-09-30
 
-This section separates the earlier user-stopped main matrix's first round from the later, independently completed three-round XXS 160K chunk 640/1024 comparison at its end. The main matrix was not resumed as a three-round campaign. Both used the current package engine/models and the AppData profiles/template effective at test time, without rebuilding the engine. After the follow-up, the XXS 160K default chunk was changed to 1024; historical tables retain the chunk used in each measurement.
+The manager is version 1.4.1; the engine is CUDA 13.4.2 / Native SM120a Release, with D3D12 residency disabled.
 
-**The user stopped the original main matrix at 19:26 on 29 September. Its tables below remain first-round observations, not best-of-three results.** All four strict configurations completed their first round; mixed completed the 1K, 8K, 32K and 61K requests. Its near-196K request was interrupted during prefill. Rounds two and three were not run. There are 22 complete measured requests and five warmups.
+**Test environment:** RTX 5070 Ti 16 GB (16303 MiB total reported by NVML), Ryzen 7 9800X3D, approximately 32 GB system RAM, Windows 11 build 26200, NVIDIA driver 617.14. Other applications' GPU allocations were released before this fresh run; NVML reported 4 MiB used and 15992 MiB free.
 
-**Hardware and software:** RTX 5070 Ti 16 GB (NVML reports 16,303 MiB total), Ryzen 7 9800X3D, about 32 GB system RAM; Windows 11 build 26200, NVIDIA driver 617.14, CUDA 13.4.2 / Native SM120a Release, D3D12 residency disabled.
+### Setup and how to read the results
 
-### Method and how to read the results
+- The four strict configurations test only inputs near their own context limits: S/XXS 64K, default S 128K, and default XXS 160K. S mixed 196K tests only approximately 1K input. K means 1024 tokens; context and fixed KV capacity are equal, so 196K = 200704 tokens. Context capacity is not the actual input length; the table lists both.
+- Each configuration starts once, then receives a warmup request for an SVG of a penguin riding a bicycle, capped at 1024 output tokens and excluded from results. xhigh thinking stays enabled, so the cap includes reasoning and does not guarantee complete SVG markup. Each measured workload then runs three times with seeds 42/142/242 and a 512-token output cap. The engine is not reloaded between repetitions.
+- Actual settings: one concurrent request, rk8v4 / FP16 GDN state, maximum 4 MTP drafts with adaptive MTP, ngram 31, 72 MiB graph allowance, 6144 MiB Host cache, one device snapshot, xhigh with preserved thinking, and lm-head-draft off. Sampling: temperature 1, top-p 0.95, top-k 20, min-p 0, presence/frequency penalties 0. S uses chunk 256 and XXS chunk 1024; the additional S mixed configuration uses chunk 1024. Mixed explicitly selects the same Hybrid context cache used by strict.
+- Inputs contain synthetic English observation records, retrieval keys, and a final analysis instruction. Every request has a different prefix. Eligibility requires zero cached input, root reuse, a completed SSE stream, and matching HTTP and exactly associated engine request_done token counts. This measures capacity and speed, not coding ability or answer quality.
+- **Best of three means the complete request with the shortest total wall time.** Throughput, TTFT and memory headroom in a row come from that same request, not independent per-column maxima. The second table shows all three ranges. A best result requires three valid repetitions; otherwise the row is incomplete.
+- Prefill = uncached input tokens / engine prompt time. Decode = (output tokens − 1) / engine predicted time. Client TTFT runs from request dispatch to the first nonempty reasoning, content, or tool stream event. It includes prefill and is not time to the final answer.
+- GPU headroom is the **lowest sampled whole-GPU NVML free value during the HTTP request**, sampled approximately every 0.5 seconds. Process WDDM Dedicated/Shared is sampled approximately every second; invalid counters are excluded. Brief peaks may be missed. NVML free is not guaranteed CUDA allocation capacity and is not calculated as total minus used.
+- Each mixed HTTP request has a 300-second limit covering prefill and generation; strict has a 600-second protective deadline. These limits also apply to warmup. The first timeout stops the remaining requests for that configuration and unloads the engine. Incomplete requests do not yield an inferred full TTFT, decode result, or best-of-three score.
 
-- Five configurations were tested at the time: S 64K and its default 128K used chunk 256; XXS 64K and its then-default 160K used chunk 640; the additional S mixed 196K case used chunk 640. Context and fixed KV capacity are equal. 196K means 200704 tokens.
-- All other saved inference settings match section 3: one request at a time, rk8v4, MTP 2 + ngram 31, graph allowance 72 MiB, host cache 6144 MiB, xhigh thinking enabled, and no lm-head-draft. Mixed explicitly selects the same alternate prefix cache; strict selects it automatically.
-- Three independent starts per configuration were planned. The completed first round used seed 42 throughout, with a small warmup (93 input / 64 output tokens) before each configuration. Warmups are excluded. Complete measured requests generated exactly 512 tokens. Planned seeds 142 and 242 were not used because the remaining queue was stopped.
-- The input is a synthetic English document with repeated laboratory observations, three embedded keys and a final analysis instruction. A changing prefix prevents prompt reuse. Every accepted request has zero cached tokens, root reuse path, a complete SSE response and matching client/server token counts. This is a speed/capacity test, not a coding or answer-quality evaluation.
-- Every populated row is one complete request. The count 1/3 means one observation out of three planned runs; it is neither an average nor a selected maximum. No best-of-three result or small statistically significant difference is claimed.
-- Prefill is uncached input tokens divided by engine prompt time. Decode is (output tokens − 1) divided by engine predicted time. Client TTFT runs from sending the request to the first nonempty reasoning/content/tool event, including prompt processing. 22/22 valid requests (100.0%) are confirmed to contain only 512 reasoning tokens and no final content/tool calls. Reasoning counts are available for 22/22 requests; reasoning accounts for 100.0% of their output tokens. TTFT is not time to the final answer.
-- GPU free is the **lowest sampled whole-card NVML free memory during that request**, in MiB. It is not a promise that cudaMalloc can allocate that amount. GPU samples are approximately every 0.5 seconds; per-process WDDM samples are approximately every second, so shorter peaks may be missed.
+This run produced **15 valid measured requests, with all three repetitions valid for 5/5 workloads**; 5/5 SVG warmups completed. Among valid measured requests, 15/15 produced reasoning only, without final content or tool calls; 15/15 have reasoning-token counts. Every valid measured request generated 512 tokens, so these results do not measure delivery of a 512-token final answer.
 
-[All 22 complete measurements](assets/rtx5070ti-benchmark-20260929-all.csv). The CSV also includes server TTFT, full request duration, sampled power, CUDA residency snapshots where enabled, WDDM Dedicated/Shared, and combined MTP/ngram acceptance.
+[All measured requests](assets/rtx5070ti-benchmark-20260930-reduced-all.csv) · [Selected complete best requests](assets/rtx5070ti-benchmark-20260930-reduced-best.csv) · [Three-run ranges and medians](assets/rtx5070ti-benchmark-20260930-reduced-ranges.csv). The CSVs also include server TTFT, power, CUDA residency snapshots, WDDM counters, combined MTP/ngram speculative acceptance, and output classification.
 
-### Same input: 62,439 tokens, plus 512 generated tokens
+### Best complete request
 
-| Configuration | Chunk | Valid runs | Prefill tok/s | Decode tok/s | Client TTFT s | Whole request s | GPU free MiB |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| S 64K | 256 | 1/3 | 1,671.4 | 111.0 | 37.44 | 42.05 | 1,910 |
-| XXS 64K | 640 | 1/3 | 1,692.4 | 106.9 | 36.98 | 41.77 | 3,134 |
-| S 128K | 256 | 1/3 | 1,670.2 | 111.0 | 37.47 | 42.08 | 176 |
-| XXS 160K | 640 | 1/3 | 1,684.7 | 106.9 | 37.15 | 41.93 | 534 |
-| S mixed 196K | 640 | 1/3 | 53.0 | 4.6 | 1,177.16 | 1,288.76 | 24 |
+| Configuration / policy | Chunk | Actual input / output | Valid runs; selected repeat | Prefill tok/s | Decode tok/s | Client TTFT s | Total s | GPU headroom MiB |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| S 64K / strict | 256 | 62,439 / 512 | 3/3; 3 | 1,666.2 | 105.59 | 37.557 | 42.459 | 1,911 |
+| S 128K / strict | 256 | 127,970 / 512 | 3/3; 2 | 1,356.3 | 97.82 | 94.525 | 100.018 | 177 |
+| XXS 64K / strict | 1024 | 62,439 / 512 | 3/3; 1 | 1,695.4 | 99.36 | 36.918 | 42.064 | 2,761 |
+| XXS 160K / strict | 1024 | 160,726 / 512 | 3/3; 1 | 1,340.8 | 91.08 | 120.130 | 125.751 | 161 |
+| S mixed 196K / 1K | 1024 | 993 / 512 | 3/3; 2 | 54.5 | 4.65 | 18.244 | 128.166 | 27 |
 
-These rows are first-round observations. The interrupted near-196K request has no complete TTFT or decode result; it is documented separately below.
+S 64K and XXS 64K use equal-length input and can be compared as complete configurations. Other strict rows use different input lengths, so their TTFT is not a direct model-speed ranking. This reduced matrix has no matched input lengths between mixed and strict; it does not establish a controlled slowdown ratio or percentage.
 
-### Every measured input length
+### Ranges across the three measurements
 
-Context capacity is not the number of input tokens. Read the actual input column; leave room for thinking and the answer. The near-capacity rows use different inputs and are not a same-work comparison.
+Ranges show the minimum–maximum across the three repetitions. This small sample describes observed variation, not statistical significance or universal performance.
 
-| Configuration | Actual input | Valid runs | Measured round | Prefill tok/s | Decode tok/s | Client TTFT s | GPU free MiB |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| S 64K | 993 | 1/3 | 1 | 1,940.1 | 110.4 | 0.53 | 1,910 |
-| S 64K | 8,156 | 1/3 | 1 | 2,048.8 | 121.8 | 3.99 | 1,910 |
-| S 64K | 32,742 | 1/3 | 1 | 1,863.5 | 123.5 | 17.64 | 1,910 |
-| S 64K | 62,439 | 1/3 | 1 | 1,671.4 | 111.0 | 37.44 | 1,910 |
-| XXS 64K | 993 | 1/3 | 1 | 1,873.4 | 121.3 | 0.55 | 3,134 |
-| XXS 64K | 8,156 | 1/3 | 1 | 1,987.0 | 130.2 | 4.13 | 3,134 |
-| XXS 64K | 32,742 | 1/3 | 1 | 1,850.9 | 121.5 | 17.73 | 3,134 |
-| XXS 64K | 62,439 | 1/3 | 1 | 1,692.4 | 106.9 | 36.98 | 3,134 |
-| S 128K | 993 | 1/3 | 1 | 1,941.0 | 110.2 | 0.51 | 176 |
-| S 128K | 8,156 | 1/3 | 1 | 2,041.3 | 121.5 | 4.00 | 176 |
-| S 128K | 32,742 | 1/3 | 1 | 1,862.1 | 123.3 | 17.62 | 176 |
-| S 128K | 62,439 | 1/3 | 1 | 1,670.2 | 111.0 | 37.47 | 176 |
-| S 128K (near capacity) | 127,970 | 1/3 | 1 | 1,358.8 | 92.9 | 94.34 | 176 |
-| XXS 160K | 993 | 1/3 | 1 | 1,868.9 | 121.3 | 0.55 | 534 |
-| XXS 160K | 8,156 | 1/3 | 1 | 1,985.3 | 130.1 | 4.12 | 534 |
-| XXS 160K | 32,742 | 1/3 | 1 | 1,844.3 | 121.8 | 17.79 | 534 |
-| XXS 160K | 62,439 | 1/3 | 1 | 1,684.7 | 106.9 | 37.15 | 534 |
-| XXS 160K (near capacity) | 160,726 | 1/3 | 1 | 1,317.4 | 93.2 | 122.22 | 534 |
-| S mixed 196K | 993 | 1/3 | 1 | 45.2 | 4.9 | 21.98 | 24 |
-| S mixed 196K | 8,156 | 1/3 | 1 | 53.0 | 5.2 | 153.87 | 24 |
-| S mixed 196K | 32,742 | 1/3 | 1 | 53.4 | 5.2 | 613.58 | 24 |
-| S mixed 196K | 62,439 | 1/3 | 1 | 53.0 | 4.6 | 1,177.16 | 24 |
-| S mixed 196K (near capacity) | — | 0/3 | — | — | — | — | — |
+| Configuration / input | Prefill tok/s | Decode tok/s | Client TTFT s | Total s | GPU headroom MiB |
+|---|---:|---:|---:|---:|---:|
+| S 64K / 61k | 1,666.25–1,667.82 | 96.09–105.59 | 37.52–37.56 | 42.46–42.87 | 1,911.00–1,911.00 |
+| S 128K / near | 1,356.31–1,356.77 | 91.88–97.82 | 94.48–94.53 | 100.02–100.68 | 177.00–177.00 |
+| XXS 64K / 61k | 1,690.51–1,695.37 | 97.60–99.36 | 36.92–37.04 | 42.06–42.34 | 2,761.00–2,761.00 |
+| XXS 160K / near | 1,339.69–1,340.77 | 82.81–91.08 | 120.13–120.20 | 125.75–126.89 | 161.00–161.00 |
+| S mixed 196K / 1k | 54.36–54.54 | 4.46–4.65 | 18.23–18.27 | 128.17–132.68 | 27.00–27.00 |
 
-### Interrupted request and remaining queue
+### Memory headroom and the purpose of mixed
 
-The user stopped the near-196K request and the remaining queue. This was not an engine crash or out-of-memory failure. It does not establish full-context performance at 196K.
+**This S mixed 196K configuration deliberately attempts a capacity beyond dedicated VRAM and allows Windows to back device data with system RAM. It trades speed for capacity; it is not an acceleration mode.** Moving device data between GPU and system memory can sharply reduce both prefill and decode throughput. The driver still controls whether and how data is placed in Shared; mixed is not an API that forces Shared placement.
 
-At interruption, about 40,960 input tokens had been computed over 770.2 seconds (12.8 minutes), and the request was still in prefill. No complete TTFT or decode speed is available. This count sums complete logging intervals within this request; a boundary interval carrying 18 decode tokens from the previous request was excluded.
+The following memory table aggregates all valid measured requests for each configuration, rather than only the selected best request.
 
-- s-mixed-196k / near: 0/3; no complete measurement.
+| Configuration | Min NVML free MiB | Min CUDA free check snapshot MiB | Peak process Dedicated MiB | Peak process Shared MiB | Strict Shared baseline MiB | Max delta from strict baseline MiB |
+|---|---:|---:|---:|---:|---:|---:|
+| S 64K | 1,911 | 1,149 | 14,094.3 | 6,538.0 | 6,538.0 | 0.0 |
+| S 128K | 177 | 0 | 15,828.3 | 6,538.0 | 6,538.0 | 0.0 |
+| XXS 64K | 2,761 | 1,999 | 13,244.3 | 6,538.0 | 6,538.0 | 0.0 |
+| XXS 160K | 161 | 0 | 15,844.3 | 6,538.0 | 6,538.0 | 0.0 |
+| S mixed 196K | 27 | — | 15,982.5 | 8,660.0 | — | — |
 
-### Memory and practical configuration choices
+The CUDA column contains free-memory snapshots saved by the engine residency checks, not continuous once-per-second direct CUDA polling. For S 64K / XXS 64K, minimum NVML free was 1911 / 2761 MiB, while minimum CUDA check snapshots were 1149 / 1999 MiB. S 128K / XXS 160K still showed 177 / 161 MiB NVML free, but their saved CUDA check snapshots both reached 0 MiB. That NVML headroom is not evidence that more context or other device allocations can be added freely. The interfaces use different accounting and observation times.
 
-- **S 64K:** the lowest sampled GPU free across its valid runs was 1,910 MiB; peak process Shared was 6,538 MiB.
-- **XXS 64K:** the lowest sampled GPU free across its valid runs was 3,134 MiB; peak process Shared was 6,538 MiB.
-- **S 128K:** the lowest sampled GPU free across its valid runs was 176 MiB; peak process Shared was 6,538 MiB.
-- **XXS 160K:** the lowest sampled GPU free across its valid runs was 534 MiB; peak process Shared was 6,538 MiB.
-- **S mixed 196K:** the lowest sampled GPU free across its valid runs was 24 MiB; peak process Shared was 8,284 MiB.
+Across the 12 valid measured requests in the four strict configurations, both the Shared baseline and sampled peak were 6538 MiB, with a maximum baseline-relative increase of 0 MiB. This means no additional Shared growth was observed in this run; it does not mean Windows permanently pins device data in dedicated VRAM.
 
-Across valid strict requests, the recorded Shared baseline is 6,538.0 MiB; the maximum sampled increase relative to each request's own baseline is 0.0 MiB (baseline/delta available for 18/18 of 18 requests). The baseline includes the deliberately allocated CPU context cache. Shared being nonzero therefore does not by itself mean CUDA device data spilled. Mixed disables strict residency checks: its CUDA-free field is left blank, and a zero disabled-counter value is not reported as a real measurement. Changes in Mixed Shared alone cannot distinguish driver spill from explicit Host cache use.
+The explicitly configured 6144 MiB CPU context cache also contributes to Shared. The entire Shared total must not be attributed to spilled CUDA device data. Strict baseline/delta fields distinguish that normal Host cache. Mixed disables strict residency checks, so its runtime CUDA residency snapshots and strict-baseline fields are blank. Mixed Shared growth alone cannot precisely separate active Host cache from driver-managed spill.
 
-For this 16 GB card, 64K leaves considerably more room for the desktop and other GPU applications. The shipped S 128K and XXS 160K profiles prioritize context capacity; S 128K in particular has little sampled headroom. Treat these as verified configurations for this machine, not universal guarantees for every 5070 Ti desktop. Increasing capacity does not make a short request faster, because the fixed KV pool still reserves the larger capacity.
+A smaller fixed KV capacity leaves more room for the desktop and other GPU applications; default S 128K and XXS 160K prioritize context capacity. A larger fixed KV pool does not automatically shrink for a short request. Use the mixed configuration only when the extra capacity is needed and the wait is acceptable.
 
-The measured S mixed 196K / chunk 640 combination is not recommended for everyday agent use on this machine: even the 8K request took about 251 seconds, while the 61K request took about 21.5 minutes. This comparison changes capacity and chunk as well as policy; it does not imply every mixed configuration has this slowdown.
-
-<!-- xxs-160k-chunks-20260929:start -->
-### XXS 160K chunk 640/1024: three-round follow-up
-
-This separate follow-up completed three independent starts for each chunk (six starts, twelve formal requests). Each start used a 93-input/64-output-token warmup, excluded below, followed by 8K and near-160K inputs with 512 generated tokens. Context and fixed KV capacity remain 163840; strict and all other saved inference settings stay unchanged. Paired seeds are 42/142/242; rounds 1 and 3 run 640→1024, while round 2 reverses the order. The same-round pair uses identical input messages and matching effective settings except chunk and log destination. These are new requests, not completion of the stopped main matrix.
-
-**Practical choice:** chunk 1024 completed all 3 independent 160K strict runs on this machine. For near-160K input, paired median prefill improved by 1.54%, and TTFT was 1.845 seconds shorter. The memory cost was 374 MiB more sampled GPU use, with minimum free memory changing from 534 to 160 MiB. **After this follow-up, the XXS 160K default was changed to chunk 1024** for its measured long-input performance. You can select chunk 640 manually when you need more memory headroom for other GPU applications.
-
-**Best whole request from three valid runs:** choose the shortest full wall time in each group. Every metric in a row belongs to that selected request; columns are not independent maxima.
-
-| Chunk / workload | Input / output tokens | Round / seed | Prefill tok/s | Decode tok/s | Client / server TTFT s | Wall s | NVML free MiB |
-|---|---:|---:|---:|---:|---:|---:|---:|
-| 640 / 8K | 8,156 / 512 | 2 / 142 | 1,985.97 | 129.08 | 4.131 / 4.115 | 8.091 | 534 |
-| 1024 / 8K | 8,156 / 512 | 2 / 142 | 1,966.74 | 131.60 | 4.170 / 4.155 | 8.055 | 160 |
-| 640 / Near 160K | 160,726 / 512 | 2 / 142 | 1,318.34 | 94.83 | 122.118 / 122.111 | 127.516 | 534 |
-| 1024 / Near 160K | 160,726 / 512 | 3 / 242 | 1,338.62 | 97.97 | 120.291 / 120.263 | 125.517 | 160 |
-
-**Paired changes, 1024 relative to 640:** median [minimum, maximum] of three same-round pairs, not the ratio of the selected best rows. Positive throughput change is faster; negative TTFT change is shorter.
-
-| Workload | Prefill change % | Decode change % | Client TTFT change s | Client TTFT change % |
-|---|---:|---:|---:|---:|
-| 8K | -1.01 [-1.01, -0.97] | -3.15 [-10.68, +1.95] | +0.043 [+0.040, +0.046] | +1.03 [+0.96, +1.11] |
-| Near 160K | +1.54 [+1.42, +1.57] | +1.90 [-2.36, +5.51] | -1.845 [-1.867, -1.714] | -1.51 [-1.53, -1.41] |
-
-**Memory:** chunk 640/1024 minimum sampled whole-GPU NVML free is **534 / 160 MiB**. Maximum strict Shared increase above each request's own baseline is **0.0 / 0.0 MiB** and the recorded baselines are 6,538.0 / 6,538.0 MiB. These are sampled counters, not guaranteed allocatable headroom or a permanent residency lock. Explicit Host cache contributes to the Shared baseline.
-
-Only three paired measurements per length were collected; medians and ranges describe this sample, not statistical significance or a general speed guarantee. Complete generated output matched in 0/6 pairs; 12/12 requests are confirmed to contain only 512 reasoning tokens and no final content/tool calls. Decode can vary with generated text and draft acceptance, and TTFT is the first stream output, not the final answer. Saved profiles were unchanged during the experiment; **after it completed, the saved XXS 160K profile and default resources were updated to chunk 1024**, with all other launch settings unchanged.
-
-[All twelve follow-up measurements](assets/rtx5070ti-xxs-chunks-20260929.csv) include server TTFT, sampling power, CUDA/WDDM counters, draft acceptance and output classification. They are separate from the main matrix's 22-request CSV.
-<!-- xxs-160k-chunks-20260929:end -->
+Strict configurations with three valid near-limit requests in this run: S 64K, S 128K, XXS 64K, XXS 160K. Capacity validation is limited to these configurations and this desktop load; incomplete configurations are not counted as successes. Mixed tests only short 1K input; completing it does not validate performance near 196K input.
 
 ## 7. Building and supported scope
 

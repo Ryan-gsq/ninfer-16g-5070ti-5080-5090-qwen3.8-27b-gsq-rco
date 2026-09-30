@@ -6,11 +6,11 @@
 
 **下载地址：待填写。**
 
-本页说明当前 1.3.1 管理器及模型准备方法。软件包上传后，在这里填写下载链接。
+本页说明当前 1.4.1 管理器及模型准备方法。软件包上传后，在这里填写下载链接。
 
 | 项目 | 说明 |
 |---|---|
-| 管理器 | NInfer Manager 1.3.1，Release 发布版，Windows x64，自带 .NET 运行环境 |
+| 管理器 | NInfer Manager 1.4.1，Release 发布版，Windows x64，自带 .NET 运行环境 |
 | 引擎 | CUDA 13.4.2 / nvcc 13.4.92，Native SM120a，Release 发布版，关闭 D3D12 residency |
 | 已验证设备 | RTX 5070 Ti 16 GB，Windows x64，NVIDIA 驱动 617.14 |
 | 默认配置 | Swift XXS：160K / chunk 1024；Swift S：128K / chunk 256；显存策略均为 `strict` |
@@ -201,7 +201,8 @@ if ($LASTEXITCODE -ne 0) { throw '转换失败，请根据上方报错处理；�
 如果下载的是不带 MTP 的普通 GGUF，应改为 `--components text`，并另存不使用推测解码的
 启动配置：移除 `--spec`、`--draft-tokens` 和 `--ngram-draft-tokens`，手动设置过的
 `--lm-head-draft`、`--adaptive-mtp`、`--mtp-attention-window` 也要移除。
-只清空 `--spec` 而保留其他草稿参数，会导致参数检查报错。
+只清空 `--spec`，却保留正数的 MTP／复制草稿或其他依赖它的参数，会导致检查报错；
+`--lookup-ngram` 可保留在配置里，但当前执行路径仅在启用 MTP 时生效。
 
 本例没有导入 vision 组件，生成的模型不包含图像编码能力。
 

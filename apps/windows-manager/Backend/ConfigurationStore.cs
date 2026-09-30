@@ -145,12 +145,16 @@ public sealed class ConfigurationStore
         if (model.MaxContext is > 0 && context > model.MaxContext) throw new ArgumentException($"Context {context} exceeds model metadata limit {model.MaxContext}.");
         var port = Integer(profile.Parameters, "--port", 1, 65535, 18081);
         if (port == Settings.WebPort) throw new ArgumentException("Engine and management website must use different ports.");
+        if (Integer(profile.Parameters, "--stats-port", 0, 65535, 0) == Settings.WebPort)
+            throw new ArgumentException("Engine statistics and management website must use different ports.");
         var host = profile.Parameters.GetValueOrDefault("--host") ?? "127.0.0.1";
         var modelId = profile.Parameters.GetValueOrDefault("--model-id") ?? Path.GetFileNameWithoutExtension(modelPath);
         var label = DateTimeOffset.Now.ToString("yyyyMMdd-HHmmss-fff", CultureInfo.InvariantCulture) + "-" + profile.Id + "-" + Guid.NewGuid().ToString("N")[..6];
         var logs = Path.Combine(DataRoot, "logs");
         Directory.CreateDirectory(logs);
-        var requests = Path.Combine(logs, label + ".requests.jsonl");
+        var requests = profile.Parameters.TryGetValue("--request-log-jsonl", out var requestPath)
+            ? ResolveDataPath(requestPath!) : Path.Combine(logs, label + ".requests.jsonl");
+        Directory.CreateDirectory(Path.GetDirectoryName(requests)!);
         var arguments = new List<string> { modelPath };
         var parameters = new Dictionary<string, string?>(profile.Parameters, StringComparer.Ordinal)
         {
@@ -163,13 +167,15 @@ public sealed class ConfigurationStore
             arguments.Add(pair.Key);
             if (pair.Value is null) continue;
             var value = pair.Value;
-            if (pair.Key is "--chat-template" or "--device-profile-path")
+            if (pair.Key is "--chat-template" or "--context-cost-presets")
             {
                 value = ResolveResourcePath(value);
                 if (!File.Exists(value)) throw new FileNotFoundException("Profile resource is missing.", value);
             }
-            else if (pair.Key == "--prefix-cache-file")
-                value = Path.GetFullPath(Path.IsPathRooted(value) ? value : Path.Combine(DataRoot, value));
+            else if (pair.Key == "--device-profile-path")
+                value = ResolveResourcePath(value);
+            else if (pair.Key is "--prefix-cache-file" or "--disk-kv-path")
+                value = ResolveDataPath(value);
             arguments.Add(value);
         }
         return new LaunchSpec(profile.Id, profile.Name, executable, PackageRoot, arguments,
@@ -178,6 +184,7 @@ public sealed class ConfigurationStore
     }
 
     public string ResolvePath(string path) => Path.GetFullPath(Path.IsPathRooted(path) ? path : Path.Combine(PackageRoot, path));
+    private string ResolveDataPath(string path) => Path.GetFullPath(Path.IsPathRooted(path) ? path : Path.Combine(DataRoot, path));
     private string ResolveResourcePath(string path)
     {
         if (Path.IsPathRooted(path)) return Path.GetFullPath(path);
@@ -253,6 +260,9 @@ public sealed class ConfigurationStore
         foreach (var pair in value.Environment)
             if (string.IsNullOrWhiteSpace(pair.Key) || pair.Key.Contains('=') || pair.Key.Contains('\0') || pair.Value?.Contains('\0') == true) throw new ArgumentException("Invalid environment variable.");
         var p = value.Parameters;
+        foreach (var option in new[] { "--chat-template", "--device-profile-path", "--context-cost-presets", "--prefix-cache-file", "--disk-kv-path", "--request-log-jsonl" })
+            if (p.TryGetValue(option, out var path) && string.IsNullOrWhiteSpace(path))
+                throw new ArgumentException($"{option} requires a non-empty path.");
         var memoryPolicy = p.TryGetValue("--cuda-memory-policy", out var policy) ? CanonicalMemoryPolicy(policy) : "default";
         if (memoryPolicy != "default")
         {
@@ -270,22 +280,97 @@ public sealed class ConfigurationStore
             if (!hybrid && p.ContainsKey(option)) throw new ArgumentException($"{option} requires --use-alt-prefix-caching with default/mixed, or --cuda-memory-policy strict.");
         if (p.ContainsKey("--device-snapshot-slots")) Integer(p, "--device-snapshot-slots", 1, 64, 1);
         if (p.TryGetValue("--host", out var host) && host is not "127.0.0.1" and not "localhost") throw new ArgumentException("The manager supports a local engine host (127.0.0.1 or localhost).");
-        Integer(p, "--port", 1, 65535, 18081);
+        var port = Integer(p, "--port", 1, 65535, 18081);
+        var statsPort = Integer(p, "--stats-port", 0, 65535, 0);
+        if (statsPort == port) throw new ArgumentException("--stats-port must differ from --port; 0 disables the separate statistics listener.");
+        if (p.TryGetValue("--api-key", out var apiKey) && (apiKey is null || apiKey.Contains('\r') || apiKey.Contains('\n')))
+            throw new ArgumentException("--api-key must be a string without line breaks; an empty string disables authentication.");
         var context = Integer(p, "--max-context", 1, int.MaxValue, 163840);
         var output = Integer(p, "--default-max-tokens", 0, int.MaxValue, 0);
         if (output > context) throw new ArgumentException("Default output tokens must not exceed the context limit; 0 means engine default without a fixed cap.");
         if (p.TryGetValue("--kv-capacity", out var kv) && kv != "auto" && Integer(p, "--kv-capacity", 1, int.MaxValue, context) < context) throw new ArgumentException("KV capacity must cover the requested context.");
         Integer(p, "--prefill-chunk", 1, int.MaxValue, 640);
-        Integer(p, "--max-concurrency", 1, 8, 1);
+        var concurrency = Integer(p, "--max-concurrency", 1, 8, 1);
         Integer(p, "--cuda-graph-allowance-mib", 0, int.MaxValue, 72);
         Integer(p, "--host-cache-mib", 0, int.MaxValue, 6144);
-        Integer(p, "--draft-tokens", 0, 15, 2);
-        Integer(p, "--ngram-draft-tokens", 0, int.MaxValue, 31);
+        ValidateSpeculativeOptions(p, concurrency);
+        ValidateVisionOptions(p);
         Integer(p, "--top-k", 0, int.MaxValue, 20);
         if (p.TryGetValue("--model-id", out var modelId) && (string.IsNullOrWhiteSpace(modelId) || modelId.Length > 256)) throw new ArgumentException("Model ID is required and limited to 256 characters.");
         if (p.TryGetValue("--default-reasoning-effort", out var effort) && effort is not "none" and not "minimal" and not "low" and not "medium" and not "high" and not "xhigh" and not "max") throw new ArgumentException("Unknown reasoning effort.");
         foreach (var key in new[] { "--temperature", "--top-p", "--min-p", "--presence-penalty", "--frequency-penalty" })
             if (p.TryGetValue(key, out var number) && (!double.TryParse(number, NumberStyles.Float, CultureInfo.InvariantCulture, out var numeric) || !double.IsFinite(numeric))) throw new ArgumentException($"{key} must be a finite number.");
+    }
+    private static void ValidateSpeculativeOptions(IReadOnlyDictionary<string, string?> p, int concurrency)
+    {
+        var enabled = p.TryGetValue("--spec", out var backend);
+        if (enabled && backend is not ("mtp" or "dflash" or "dflash2"))
+            throw new ArgumentException("--spec must be mtp, dflash or dflash2; omit it to disable speculative decoding.");
+        var drafts = Integer(p, "--draft-tokens", 0, 15, 0);
+        var proposal = Flag(p, "--lm-head-draft");
+        var adaptive = Flag(p, "--adaptive-mtp");
+        if (enabled && drafts == 0)
+            throw new ArgumentException("--spec requires --draft-tokens between 1 and 15.");
+        if (!enabled && (drafts != 0 || proposal))
+            throw new ArgumentException("--draft-tokens and --lm-head-draft require --spec mtp, dflash or dflash2.");
+        if (adaptive && backend != "mtp")
+            throw new ArgumentException("--adaptive-mtp requires --spec mtp.");
+        var window = Integer(p, "--mtp-attention-window", 0, int.MaxValue, 0);
+        if (window != 0 && (backend != "mtp" || window < drafts + 1))
+            throw new ArgumentException("--mtp-attention-window requires --spec mtp and at least --draft-tokens + 1 keys; 0 uses the whole history.");
+        var ngram = Integer(p, "--ngram-draft-tokens", 0, 63, enabled ? 15 : 0);
+        Integer(p, "--ngram-min-match", 4, 64, 12);
+        if (ngram != 0 && !enabled)
+            throw new ArgumentException("--ngram-draft-tokens above 0 requires --spec mtp, dflash or dflash2.");
+        if (ngram > 15 && concurrency != 1)
+            throw new ArgumentException("--ngram-draft-tokens above 15 requires --max-concurrency 1.");
+        var archive = Mebibytes(p, "--ngram-archive-mib", 0, 0);
+        var session = Mebibytes(p, "--ngram-session-mib", 0, 128);
+        if (archive > 0 && (ngram == 0 || session == 0 || session > archive))
+            throw new ArgumentException("--ngram-archive-mib above 0 requires ngram drafting and --ngram-session-mib between 1 and the total archive MiB.");
+        if (Flag(p, "--ngram-native-sessions") && archive == 0)
+            throw new ArgumentException("--ngram-native-sessions requires --ngram-archive-mib above 0.");
+        // The server permits a dormant lookup value without --spec; retain it for later use.
+        Integer(p, "--lookup-ngram", 0, int.MaxValue, 0);
+    }
+    private static void ValidateVisionOptions(IReadOnlyDictionary<string, string?> p)
+    {
+        var enabled = Flag(p, "--vision");
+        var cpu = Flag(p, "--vision-cpu");
+        var residency = p.TryGetValue("--vision-residency", out var selected) ? selected : "resident";
+        if (residency is not ("resident" or "overlay" or "cpu"))
+            throw new ArgumentException("--vision-residency must be resident, overlay or cpu.");
+        if (cpu && p.ContainsKey("--vision-residency") && residency != "cpu")
+            throw new ArgumentException("--vision-cpu conflicts with a --vision-residency other than cpu.");
+        if (cpu) residency = "cpu";
+        if (p.TryGetValue("--vision-offload", out var offload))
+        {
+            if (offload is not ("on" or "off")) throw new ArgumentException("--vision-offload must be on or off.");
+            var offloadResidency = offload == "on" ? "overlay" : "resident";
+            if ((cpu || p.ContainsKey("--vision-residency")) && residency != offloadResidency)
+                throw new ArgumentException("--vision-offload conflicts with the selected Vision residency.");
+            residency = offloadResidency;
+        }
+        if (residency != "resident" && !enabled && !cpu)
+            throw new ArgumentException("--vision-residency overlay or cpu requires --vision or --vision-cpu.");
+        Integer(p, "--vision-max-merged", 64, 16384, residency == "cpu" ? 256 : 16384);
+        Mebibytes(p, "--media-cache-mib", 0, 1024);
+        Mebibytes(p, "--media-live-mib", 1, 2048);
+        Integer(p, "--media-preprocess-threads", 0, 64, 0);
+    }
+    private static bool Flag(IReadOnlyDictionary<string, string?> p, string option)
+    {
+        if (!p.TryGetValue(option, out var value)) return false;
+        if (value is not null) throw new ArgumentException($"{option} is a switch and does not accept a value.");
+        return true;
+    }
+    private static ulong Mebibytes(IReadOnlyDictionary<string, string?> p, string option, ulong minimum, ulong fallback)
+    {
+        if (!p.TryGetValue(option, out var raw)) return fallback;
+        const ulong maximum = ulong.MaxValue / (1024UL * 1024UL);
+        if (!ulong.TryParse(raw, NumberStyles.None, CultureInfo.InvariantCulture, out var value) || value < minimum || value > maximum)
+            throw new ArgumentException($"{option} must be an integer between {minimum} and {maximum} MiB.");
+        return value;
     }
     private static string CanonicalMemoryPolicy(string? policy)
     {

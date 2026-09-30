@@ -19,7 +19,7 @@ public sealed record MonitorPoint(long T, bool Valid, double? PrefillTps, double
     double? Waiting, double? Running, double? Prefilling, double? Materializing);
 public sealed record MonitorSnapshot(string? SessionId, DateTimeOffset SampledAt, int IntervalSeconds, int HistorySeconds,
     MonitorCounts Counts, MonitorWindow Window, IReadOnlyList<MonitorPoint> History, MonitorPoint? Latest,
-    int HistoryStoredSamples = 0, bool HistoryDownsampled = false);
+    int HistoryStoredSamples = 0, bool HistoryDownsampled = false, int ThroughputWindowSeconds = ThroughputWindow.Seconds);
 public sealed record TelemetrySnapshot(JsonElement? Stats, IReadOnlyList<JsonElement> RecentRequests,
     string LogTail, string? Error, DateTimeOffset SampledAt, GpuTelemetrySample? Gpu, MonitorSnapshot Monitor);
 
@@ -71,7 +71,8 @@ internal sealed class TelemetryReader : IDisposable
                 {
                     using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
                     deadline.CancelAfter(TimeSpan.FromMilliseconds(1200));
-                    using var response = await client.GetAsync(new Uri(api.GetLeftPart(UriPartial.Authority) + "/stats"), HttpCompletionOption.ResponseHeadersRead, deadline.Token);
+                    using var request = EngineTelemetryRequest.Create(engine, api);
+                    using var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, deadline.Token);
                     response.EnsureSuccessStatusCode();
                     await using var stream = await response.Content.ReadAsStreamAsync(deadline.Token);
                     using var bytes = new MemoryStream();
@@ -183,22 +184,24 @@ internal sealed class MonitorSession : IDisposable
     private string? requestPath;
     private long completed, errors, rejected, truncatedUntil;
     private JsonElement? previousStats;
-    private DateTimeOffset? previousTime;
+    private readonly ThroughputWindow throughput = new();
     private readonly HashSet<string> seen = new(StringComparer.Ordinal);
     private readonly Queue<(string Key, long Time)> seenOrder = new();
-    private long replayBefore, latestTimestamp;
+    private long replayBefore, latestTimestamp, runStartedAt;
     public IReadOnlyList<JsonElement> RecentRequests => recent.Reverse().ToArray();
 
     public void UseEngine(EngineSnapshot engine)
     {
-        // The launch log is unique per run. State changes and PID removal on stop must not reset a run.
-        var next = engine.RequestLogPath ?? (engine.StartedAt.HasValue ? $"{engine.StartedAt:O}|{engine.Pid}" : null);
+        // A custom log can be reused. Process start identifies the run; stopping retains its history.
+        if (engine.State == "Starting" && !engine.StartedAt.HasValue) return;
+        var next = engine.StartedAt.HasValue ? $"{engine.StartedAt:O}|{engine.RequestLogPath}" : engine.RequestLogPath;
         if (next is null || next == identity) return;
         identity = next;
         requestPath = engine.RequestLogPath;
         window.Clear(); recent.Clear(); history.Clear(); reader.Reset(); seen.Clear(); seenOrder.Clear();
         completed = errors = rejected = truncatedUntil = replayBefore = latestTimestamp = 0;
-        previousStats = null; previousTime = null;
+        runStartedAt = engine.StartedAt?.ToUnixTimeMilliseconds() ?? 0;
+        previousStats = null; throughput.Reset();
     }
 
     public void ReadRequests() => reader.Read(requestPath, record => AddRequest(record, DateTimeOffset.UtcNow), () => replayBefore = latestTimestamp);
@@ -208,6 +211,7 @@ internal sealed class MonitorSession : IDisposable
         var kind = Field(record, "event");
         if (kind.ValueKind != JsonValueKind.String || kind.GetString() is not ("request_done" or "request_error" or "request_rejected")) return;
         var timestamp = Number(record, "timestamp_unix_ms") is double stamp ? (long)stamp : now.ToUnixTimeMilliseconds();
+        if (timestamp < runStartedAt) return;
         var key = $"{Field(record, "server_instance_id")}|{Field(record, "request", "request_id")}|{kind}|{Number(record, "timestamp_unix_ms")}";
         // On rewind, older records were already counted. Recent boundary keys cover concurrent equal timestamps.
         if (timestamp < replayBefore || !seen.Add(key)) return;
@@ -232,8 +236,6 @@ internal sealed class MonitorSession : IDisposable
         var cutoff = now.AddSeconds(-WindowSeconds).ToUnixTimeMilliseconds();
         window.RemoveAll(item => item.Time < cutoff);
         var summary = Summarize(now);
-        double? Rate(string key) => Delta(stats, previousStats, "counters", key) is double delta && previousTime.HasValue && now > previousTime
-            ? delta / (now - previousTime.Value).TotalSeconds : null;
         double? Transfer(string direction)
         {
             var main = Delta(stats, previousStats, "context_cache", "main_kv_transfers", direction, "bytes");
@@ -241,14 +243,14 @@ internal sealed class MonitorSession : IDisposable
             return main.HasValue && backend.HasValue ? main + backend : null;
         }
         double? N(params string[] path) => stats.HasValue ? Number(stats.Value, path) : null;
-        var point = new MonitorPoint(now.ToUnixTimeMilliseconds(), stats.HasValue, Rate("computed_prefill_tokens"), Rate("committed_decode_tokens"),
+        var rates = throughput.Add(now, N("counters", "computed_prefill_tokens"), N("counters", "committed_decode_tokens"));
+        var point = new MonitorPoint(now.ToUnixTimeMilliseconds(), stats.HasValue, rates.Prefill, rates.Decode,
             summary.TtftP50Ms, summary.TtftP95Ms, summary.Mtp.AcceptanceRate,
             gpu.UtilizationPercent, gpu.PowerWatts, gpu.PowerLimitWatts, gpu.TemperatureC, gpu.FreeBytes,
             N("memory", "cuda_residency", "dedicated_bytes"), N("occupancy", "device_main_kv_tokens"), N("occupancy", "host_kv_bytes"),
             Transfer("h2d"), Transfer("d2h"), Transfer("d2d"), N("requests", "waiting"), N("requests", "running"), N("requests", "prefilling"), N("requests", "materializing"));
         // A failed poll breaks rates. The next successful sample becomes a fresh baseline.
         previousStats = stats;
-        previousTime = stats.HasValue ? now : null;
         if (identity is not null)
         {
             history.Enqueue(point);
@@ -259,7 +261,9 @@ internal sealed class MonitorSession : IDisposable
             CompactHistory(history.ToArray()), point, history.Count, history.Count > 1800);
     }
 
-    // Retain raw two-second samples internally. Network snapshots retain bucket endpoints and extrema
+    // Retain two-second observations; throughput averages non-zero intervals over ten seconds
+    // and holds the last valid value during zero-delta samples.
+    // Network snapshots retain bucket endpoints and extrema
     // so long sessions stay small without flattening token-rate, GPU power, or memory spikes.
     internal static IReadOnlyList<MonitorPoint> CompactHistory(MonitorPoint[] points)
     {
@@ -288,8 +292,9 @@ internal sealed class MonitorSession : IDisposable
                 if (min.HasValue) selected.Add(min.Value);
                 if (max.HasValue) selected.Add(max.Value);
             }
-            var failed = Array.FindIndex(points, start, end - start, point => !point.Valid);
-            if (failed >= 0) selected.Add(failed);
+            // Counter resets can break throughput even when the rest of /stats remains valid.
+            var gap = Array.FindIndex(points, start, end - start, point => !point.Valid || point.PrefillTps is null || point.DecodeTps is null);
+            if (gap >= 0) selected.Add(gap);
             output.AddRange(selected.Select(index => points[index]));
         }
         return output;

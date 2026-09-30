@@ -120,6 +120,97 @@ foreach(var option in new[]{"--use-original-prefix-caching","--no-prefix-reuse"}
  Reject(()=>store.SaveProfile(candidate),"strict rejects incompatible cache choice: "+option);
 }
 Check(File.ReadAllText(Path.Combine(scratch,"config","profiles",profile.Id+".json"))==storedBeforeInvalid&&Directory.GetFiles(Path.Combine(scratch,"config","history")).Length==revisionsBeforeInvalid,"rejected memory policies do not change saved parameters or create revisions");
+LaunchProfile WithOptions(params (string Key, string? Value)[] options)
+{
+ var candidate=profile with {Parameters=new(profile.Parameters)};
+ foreach(var (key,value) in options)candidate.Parameters[key]=value;
+ return candidate;
+}
+string? ArgumentValue(LaunchSpec launch,string option)
+{
+ var index=launch.Arguments.ToList().IndexOf(option);
+ return index<0?null:launch.Arguments[index+1];
+}
+foreach(var backend in new[]{"mtp","dflash","dflash2"})
+{
+ var candidate=WithOptions(("--spec",backend),("--draft-tokens","15"),("--lm-head-draft",null),
+  ("--ngram-draft-tokens","63"),("--ngram-min-match","64"),("--ngram-archive-mib","512"),
+  ("--ngram-session-mib","128"),("--ngram-native-sessions",null),("--lookup-ngram","12"));
+ if(backend=="mtp") {candidate.Parameters["--adaptive-mtp"]=null;candidate.Parameters["--mtp-attention-window"]="16";}
+ store.SaveProfile(candidate);
+ var persisted=new ConfigurationStore(ManagerPaths.Select(scratch,""),defaults).Profiles.Single(p=>p.Id==profile.Id);
+ var launch=store.BuildLaunchSpec(profile.Id);
+ Check(candidate.Parameters.All(pair=>persisted.Parameters.ContainsKey(pair.Key)&&persisted.Parameters[pair.Key]==pair.Value)&&
+  ArgumentValue(launch,"--spec")==backend&&ArgumentValue(launch,"--draft-tokens")=="15"&&
+  ArgumentValue(launch,"--ngram-session-mib")=="128"&&launch.Arguments.Contains("--ngram-native-sessions"),
+  "speculative configuration saves, reloads and launches with values and switches intact: "+backend);
+}
+foreach(var width in new[]{"1","2","3","15"})
+{
+ var candidate=WithOptions(("--spec","mtp"),("--draft-tokens",width),("--adaptive-mtp",null),("--max-concurrency","8"));
+ store.SaveProfile(candidate);
+ Check(!store.BuildLaunchSpec(profile.Id).Arguments.Contains("--ngram-draft-tokens"),"adaptive MTP supports draft width "+width+" and leaves the server's concurrency-safe default ngram width implicit");
+}
+var disabledDrafting=WithOptions(("--draft-tokens","0"),("--ngram-draft-tokens","0"),("--mtp-attention-window","0"),("--lookup-ngram","8"),("--ngram-session-mib","0"));
+store.SaveProfile(disabledDrafting);
+Check(ArgumentValue(store.BuildLaunchSpec(profile.Id),"--lookup-ngram")=="8","disabled speculative decoding preserves a dormant lookup value and zero disabled capacities");
+foreach(var pair in new (string,string?)[]{("--spec",null),("--spec","off"),("--draft-tokens","1"),("--lm-head-draft",null),
+ ("--adaptive-mtp",null),("--mtp-attention-window","8192"),("--ngram-draft-tokens","1"),("--ngram-native-sessions",null)})
+ Reject(()=>store.SaveProfile(WithOptions(pair)),"inactive speculative backend rejects dependent option "+pair.Item1);
+foreach(var pair in new (string,string?)[]{("--draft-tokens","0"),("--draft-tokens","16"),("--draft-tokens",null),
+ ("--ngram-draft-tokens","64"),("--ngram-draft-tokens","-1"),("--ngram-min-match","3"),("--ngram-min-match","65"),
+ ("--mtp-attention-window","2"),("--lookup-ngram","-1"),("--ngram-archive-mib","17592186044416"),
+ ("--ngram-session-mib",null),("--lm-head-draft","true"),("--adaptive-mtp","false"),("--ngram-native-sessions","true")})
+{
+ var candidate=WithOptions(("--spec","mtp"),("--draft-tokens","2"));candidate.Parameters[pair.Item1]=pair.Item2;
+ Reject(()=>store.SaveProfile(candidate),"invalid speculative value rejected: "+pair.Item1+"="+(pair.Item2??"null"));
+}
+Reject(()=>store.SaveProfile(WithOptions(("--spec","mtp"))),"enabled backend requires explicit positive draft width");
+foreach(var backend in new[]{"dflash","dflash2"})
+ foreach(var pair in new (string,string?)[]{("--adaptive-mtp",null),("--mtp-attention-window","8192")})
+  Reject(()=>store.SaveProfile(WithOptions(("--spec",backend),("--draft-tokens","2"),pair)),backend+" rejects MTP-only option "+pair.Item1);
+Reject(()=>store.SaveProfile(WithOptions(("--spec","mtp"),("--draft-tokens","2"),("--ngram-draft-tokens","16"),("--max-concurrency","2"))),"wide ngram drafting requires single concurrency");
+foreach(var options in new (string,string?)[][]{
+ [("--ngram-archive-mib","64")],
+ [("--ngram-archive-mib","128"),("--ngram-session-mib","0")],
+ [("--ngram-archive-mib","128"),("--ngram-session-mib","129")],
+ [("--ngram-archive-mib","128"),("--ngram-draft-tokens","0")]})
+{
+ var candidate=WithOptions(("--spec","mtp"),("--draft-tokens","2"));foreach(var pair in options)candidate.Parameters[pair.Item1]=pair.Item2;
+ Reject(()=>store.SaveProfile(candidate),"ngram archive enforces active copy drafting and a bounded positive session share");
+}
+foreach(var residency in new[]{"resident","overlay","cpu"})
+{
+ var candidate=WithOptions(("--vision",null),("--vision-residency",residency),("--media-cache-mib","0"),
+  ("--media-live-mib","4096"),("--media-preprocess-threads","64"));
+ if(residency=="cpu")candidate.Parameters["--vision-cpu"]=null;
+ store.SaveProfile(candidate);
+ var persisted=new ConfigurationStore(ManagerPaths.Select(scratch,""),defaults).Profiles.Single(p=>p.Id==profile.Id);
+ var launch=store.BuildLaunchSpec(profile.Id);
+ Check(ArgumentValue(launch,"--vision-residency")==residency&&ArgumentValue(launch,"--media-preprocess-threads")=="64"&&
+  persisted.Parameters["--media-cache-mib"]=="0"&&!launch.Arguments.Contains("--vision-max-merged"),
+  "Vision "+residency+" preserves media settings and the server's implicit merged-token limit");
+}
+var cpuVision=WithOptions(("--vision-cpu",null),("--vision-max-merged","16384"));
+store.SaveProfile(cpuVision);
+Check(store.BuildLaunchSpec(profile.Id).Arguments.Contains("--vision-cpu")&&ArgumentValue(store.BuildLaunchSpec(profile.Id),"--vision-max-merged")=="16384","CPU Vision shorthand enables Vision without an injected --vision and accepts an explicit limit above its 256 default");
+foreach(var pair in new (string,string?)[]{("--vision","true"),("--vision-cpu","false"),("--vision-residency",null),
+ ("--vision-residency","gpu"),("--vision-residency","overlay"),("--vision-residency","cpu"),
+ ("--vision-max-merged","63"),("--vision-max-merged","16385"),("--media-cache-mib","-1"),
+ ("--media-cache-mib","17592186044416"),("--media-live-mib","0"),("--media-live-mib",null),("--media-preprocess-threads","65")})
+ Reject(()=>store.SaveProfile(WithOptions(pair)),"invalid Vision/media option rejected: "+pair.Item1+"="+(pair.Item2??"null"));
+foreach(var residency in new[]{"resident","overlay"})
+ Reject(()=>store.SaveProfile(WithOptions(("--vision-cpu",null),("--vision-residency",residency))),"CPU Vision rejects order-dependent conflicting residency "+residency);
+Reject(()=>store.SaveProfile(WithOptions(("--vision",null),("--vision-residency","cpu"),("--vision-offload","on"))),"Vision alias cannot silently override the selected residency");
+foreach(var pathOption in new[]{"--request-log-jsonl","--chat-template","--device-profile-path","--context-cost-presets","--disk-kv-path","--prefix-cache-file"})
+ foreach(var invalidPath in new string?[]{null,""})Reject(()=>store.SaveProfile(WithOptions((pathOption,invalidPath))),"path parameter requires a nonempty value: "+pathOption);
+foreach(var options in new (string,string?)[][]{
+ [("--stats-port","18081")],[("--stats-port","65536")],[("--stats-port",null)],[("--api-key",null)],[("--api-key","line\nbreak")]})
+ Reject(()=>store.SaveProfile(WithOptions(options)),"invalid telemetry listener or authentication option rejected");
+store.SaveProfile(WithOptions(("--stats-port",store.Settings.WebPort.ToString())));
+Reject(()=>store.BuildLaunchSpec(profile.Id),"dedicated statistics listener cannot occupy the management website port");
+store.SaveProfile(WithOptions(("--stats-port","0"),("--api-key","")));
+Check(ArgumentValue(store.BuildLaunchSpec(profile.Id),"--api-key")==""&&ArgumentValue(store.BuildLaunchSpec(profile.Id),"--stats-port")=="0","empty API key and zero stats port preserve explicitly disabled behavior");
 store.SaveProfile(profile);
 Reject(()=>store.SaveProfile(profile with {Id="../escape"}),"profile path traversal rejected");
 foreach(var pair in new[]{("--max-context","0"),("--kv-capacity","8192"),("--default-max-tokens","163841"),("--port","65536"),("--max-context", "2147483648")}) {
@@ -159,6 +250,27 @@ var paths=ManagerPaths.Select(packageSeedRoot,localRoot);
 Check(!paths.IsPortable&&paths.DataRoot.StartsWith(Path.Combine(localRoot,"NInferManager"))&&paths.InstallationId==ManagerPaths.Select(packageSeedRoot.ToUpperInvariant()+Path.DirectorySeparatorChar,localRoot).InstallationId,"LocalAppData is preferred and package identity normalizes case and trailing separators");
 var perUser=new ConfigurationStore(paths);
 Check(perUser.Settings is {Language:"en",AutoStartModel:false}&&perUser.Profiles.Single().Name=="Packaged settings"&&File.ReadAllText(Path.Combine(paths.ConfigRoot,"chat_template.jinja"))=="packaged-template"&&Directory.GetFiles(Path.Combine(paths.ConfigRoot,"history")).Length==2,"first launch seeds existing package preferences, profile, history and resources into user data");
+File.WriteAllText(Path.Combine(paths.ConfigRoot,"context-costs.json"),"{}");
+var customPaths=WithOptions(("--cuda-memory-policy","strict"),("--context-cost-presets","config/context-costs.json"),
+ ("--device-profile-path","config/new-calibration.json"),("--prefix-cache-file","cache/prefix.bin"),
+ ("--request-log-jsonl","logs/custom/server.jsonl"),("--request-log-max-mib","64"),("--request-log-keep","3"));
+perUser.SaveProfile(customPaths);
+var customLaunch=perUser.BuildLaunchSpec(profile.Id);
+Check(ArgumentValue(customLaunch,"--context-cost-presets")==Path.Combine(paths.ConfigRoot,"context-costs.json")&&
+ ArgumentValue(customLaunch,"--device-profile-path")==Path.Combine(paths.ConfigRoot,"new-calibration.json")&&
+ ArgumentValue(customLaunch,"--prefix-cache-file")==Path.Combine(paths.DataRoot,"cache","prefix.bin"),
+ "context presets use user config, new device profiles need not exist and mutable prefix cache resolves under user data");
+Check(customLaunch.RequestLogPath==Path.Combine(paths.LogsRoot,"custom","server.jsonl")&&
+ ArgumentValue(customLaunch,"--request-log-jsonl")==customLaunch.RequestLogPath&&Directory.Exists(Path.GetDirectoryName(customLaunch.RequestLogPath))&&
+ ArgumentValue(customLaunch,"--request-log-max-mib")=="64"&&ArgumentValue(customLaunch,"--request-log-keep")=="3",
+ "custom relative request log and rotation values launch unchanged while telemetry follows the same writable absolute path");
+var customLog=Path.Combine(scratch,"external-log","request.jsonl");
+perUser.SaveProfile(WithOptions(("--disk-kv-path","cache/disk-kv"),("--request-log-jsonl",customLog)));
+customLaunch=perUser.BuildLaunchSpec(profile.Id);
+Check(customLaunch.RequestLogPath==customLog&&ArgumentValue(customLaunch,"--request-log-jsonl")==customLog&&
+ ArgumentValue(customLaunch,"--disk-kv-path")==Path.Combine(paths.DataRoot,"cache","disk-kv"),
+ "absolute custom log is preserved and relative disk KV directory uses the writable user data root");
+perUser.SaveProfile(profile with {Name="Packaged settings"});
 var userProfile=perUser.Profiles.Single() with {Name="User edits",Parameters=new(perUser.Profiles.Single().Parameters)};
 userProfile.Parameters["--cuda-memory-policy"]="strict";
 userProfile.Parameters["--prefix-cache-file"]="context-cache.bin";
@@ -348,6 +460,8 @@ await using(var app=builder.Build()) {
  using(var response=await client.PostAsync("/api/start/xxs-160k",null)) Check(response.StatusCode==System.Net.HttpStatusCode.Conflict,"synchronous start rejection is returned to caller");
  await app.StopAsync();
 }
+ThroughputWindowCheck.Run(Check);
+await EngineTelemetryCheck.RunAsync(Check);
 Console.WriteLine($"ALL {checks} CHECKS PASSED");
 Console.WriteLine("Fixtures: "+scratch);
 
