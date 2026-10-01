@@ -92,6 +92,7 @@ internal static class Program
             if (!authorized)
             {
                 context.Response.StatusCode = 401;
+                context.Response.ContentType = "text/plain; charset=utf-8";
                 await context.Response.WriteAsync("请从 NInfer 托盘菜单打开管理页面。");
                 return;
             }
