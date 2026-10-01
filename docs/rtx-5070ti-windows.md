@@ -73,7 +73,10 @@ Windows 的“启动应用”可以另外禁用此项，管理器尊重该禁用
 文件反复覆盖修改。
 
 只有默认数据目录无法创建或无法写入时，才回落到程序目录保存数据。配置 JSON 损坏
-会直接报错并保留，不会借此切换目录或悄悄恢复默认值。
+会报错并保留，不会借此切换目录或悄悄恢复默认值。单个启动配置读取失败时会跳过该文件，
+管理器仍正常打开；网页持续显示文件完整路径和错误。修正对应 JSON 后重启管理器即可
+重新读取，原文件不会被覆盖，其他有效配置仍可使用。如果没有可用配置，可在“模型与配置”
+中新建配置，或修复原文件。
 
 ```text
 程序目录 / PackageRoot，例如 qwen27b/ 或 Program Files 下的安装目录
@@ -544,11 +547,11 @@ cudart，但这里随同工具包运行库一起携带，以覆盖依赖需求�
 Redist 目录复制，相关安装要求见
 [Microsoft VC Redistributable 说明](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist?view=msvc-170)。
 
-**仓库默认 profile 和运行目录 profile 的外层格式不同。** 仓库
-`apps/windows-manager/config/profiles/*.json` 是内嵌种子，顶层直接是 `id`、
-`modelPath` 等；磁盘生效文件需要 `schemaVersion / savedAt / profile` 外层。
-因此下面为它们生成封装，不能直接递归复制整个源码 config 目录当作运行配置。
-另一种有效做法是不提供包内 config，让管理器首次启动完全从内嵌种子初始化。
+**仓库种子和生效 profile 统一使用扁平 JSON 格式。** 每个
+`config/profiles/*.json` 的顶层直接包含 `id`、`name`、`modelPath`、`enginePath`、
+`parameters` 和 `environment`，按下方命令直接复制即可。不支持
+`schemaVersion / savedAt / profile` 外层封装。也可不提供包内 config，让管理器首次
+启动完全从内嵌默认资源初始化。
 
 ```powershell
 if (Test-Path -LiteralPath $packageRoot) {
@@ -580,16 +583,8 @@ Get-ChildItem -LiteralPath $crtRoot -File -Filter '*.dll' | Copy-Item -Destinati
 
 $seedRoot = Join-Path $ninferRepo 'apps\windows-manager\config'
 Get-ChildItem -LiteralPath $seedRoot -File | Copy-Item -Destination (Join-Path $packageRoot 'config')
-foreach ($file in Get-ChildItem -LiteralPath (Join-Path $seedRoot 'profiles') -File -Filter '*.json') {
-  $profile = Get-Content -LiteralPath $file.FullName -Raw | ConvertFrom-Json
-  $document = [ordered]@{
-    schemaVersion = 1
-    savedAt = [DateTimeOffset]::UtcNow.ToString('O')
-    profile = $profile
-  }
-  $target = Join-Path $packageRoot "config\profiles\$($file.Name)"
-  [IO.File]::WriteAllText($target, ($document | ConvertTo-Json -Depth 32), [Text.UTF8Encoding]::new($false))
-}
+Get-ChildItem -LiteralPath (Join-Path $seedRoot 'profiles') -File -Filter '*.json' |
+  Copy-Item -Destination (Join-Path $packageRoot 'config\profiles')
 
 foreach ($name in @('rtx-5070ti-windows.md', 'rtx-5070ti-windows.en.md', 'rtx-5070ti-windows-downloads.md')) {
   Copy-Item -LiteralPath (Join-Path $ninferRepo "docs\$name") -Destination (Join-Path $packageRoot 'docs')

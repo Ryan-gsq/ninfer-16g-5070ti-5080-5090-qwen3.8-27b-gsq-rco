@@ -94,7 +94,11 @@ without repeatedly overwriting it from the package.
 
 Only failure to create or write the preferred data directory triggers a fallback
 to the program directory. Invalid configuration JSON is reported and preserved;
-it does not silently cause a directory switch or reset to defaults.
+it does not silently cause a directory switch or reset to defaults. An unreadable
+individual launch profile is skipped while the manager opens normally. The web
+page shows its full path and error until you correct the JSON file and restart
+the manager; the original file is kept and other valid profiles remain usable.
+If no profiles load, create a new one under Models & profiles or repair the files.
 
 ```text
 Program directory / PackageRoot, such as qwen27b/ or an installation under Program Files
@@ -626,13 +630,11 @@ the toolkit runtime for dependent libraries. The VC files come from the installe
 MSVC Redist directory; see the
 [Microsoft VC Redistributable requirements](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist?view=msvc-170).
 
-**Source seed profiles and on-disk runtime profiles use different outer formats.**
-The embedded seeds at `apps/windows-manager/config/profiles/*.json` have `id`,
-`modelPath` and other fields directly at the top level. Disk profiles require a
-`schemaVersion / savedAt / profile` wrapper. The script creates that wrapper;
-do not recursively copy the whole source config directory as active configuration.
-Alternatively, omit package config completely and let first launch initialize
-everything from embedded defaults.
+**Source seeds and active profiles use the same flat JSON format.**
+Each `config/profiles/*.json` file contains `id`, `name`, `modelPath`, `enginePath`,
+`parameters` and `environment` directly at the top level. Copy the source profiles
+as shown below. A `schemaVersion / savedAt / profile` wrapper is not supported.
+Alternatively, omit package config and let first launch initialize from embedded defaults.
 
 ```powershell
 if (Test-Path -LiteralPath $packageRoot) {
@@ -664,16 +666,8 @@ Get-ChildItem -LiteralPath $crtRoot -File -Filter '*.dll' | Copy-Item -Destinati
 
 $seedRoot = Join-Path $ninferRepo 'apps\windows-manager\config'
 Get-ChildItem -LiteralPath $seedRoot -File | Copy-Item -Destination (Join-Path $packageRoot 'config')
-foreach ($file in Get-ChildItem -LiteralPath (Join-Path $seedRoot 'profiles') -File -Filter '*.json') {
-  $profile = Get-Content -LiteralPath $file.FullName -Raw | ConvertFrom-Json
-  $document = [ordered]@{
-    schemaVersion = 1
-    savedAt = [DateTimeOffset]::UtcNow.ToString('O')
-    profile = $profile
-  }
-  $target = Join-Path $packageRoot "config\profiles\$($file.Name)"
-  [IO.File]::WriteAllText($target, ($document | ConvertTo-Json -Depth 32), [Text.UTF8Encoding]::new($false))
-}
+Get-ChildItem -LiteralPath (Join-Path $seedRoot 'profiles') -File -Filter '*.json' |
+  Copy-Item -Destination (Join-Path $packageRoot 'config\profiles')
 
 foreach ($name in @('rtx-5070ti-windows.md', 'rtx-5070ti-windows.en.md', 'rtx-5070ti-windows-downloads.md')) {
   Copy-Item -LiteralPath (Join-Path $ninferRepo "docs\$name") -Destination (Join-Path $packageRoot 'docs')

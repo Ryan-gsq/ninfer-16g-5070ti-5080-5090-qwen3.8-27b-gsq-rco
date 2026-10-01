@@ -4,7 +4,9 @@ using System.Text.RegularExpressions;
 
 namespace NInfer.Manager;
 
-/// <summary>Versioned on-disk configuration. A failed read never becomes an empty replacement.</summary>
+public sealed record ProfileLoadError(string FilePath, string Message);
+
+/// <summary>On-disk configuration. A failed read never becomes an empty replacement.</summary>
 public sealed class ConfigurationStore
 {
     public static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web) { WriteIndented = true };
@@ -12,10 +14,12 @@ public sealed class ConfigurationStore
     private readonly string configRoot;
     private ManagerSettings settings;
     private readonly Dictionary<string, LaunchProfile> profiles = new(StringComparer.Ordinal);
+    private readonly List<ProfileLoadError> profileErrors = new();
     public string PackageRoot { get; }
     public string DataRoot { get; }
     public ManagerSettings Settings { get { lock (gate) return Clone(settings); } }
     public IReadOnlyList<LaunchProfile> Profiles { get { lock (gate) return profiles.Values.OrderBy(p => p.Name, StringComparer.OrdinalIgnoreCase).Select(Clone).ToArray(); } }
+    public IReadOnlyList<ProfileLoadError> ProfileErrors { get { lock (gate) return profileErrors.ToArray(); } }
 
     public ConfigurationStore(ManagerPaths paths, string? seedRoot = null)
     {
@@ -23,6 +27,7 @@ public sealed class ConfigurationStore
         DataRoot = paths.DataRoot;
         configRoot = paths.ConfigRoot;
         ImportPackageConfiguration();
+        var hasConfiguration = Directory.Exists(configRoot) && Directory.EnumerateFiles(configRoot, "*", SearchOption.AllDirectories).Any();
         Directory.CreateDirectory(Path.Combine(configRoot, "profiles"));
         Directory.CreateDirectory(Path.Combine(configRoot, "history"));
         var settingsPath = Path.Combine(configRoot, "settings.json");
@@ -30,20 +35,29 @@ public sealed class ConfigurationStore
         ValidateSettings(settings);
         foreach (var path in Directory.EnumerateFiles(Path.Combine(configRoot, "profiles"), "*.json"))
         {
-            var profile = ReadProfile(path);
-            if (!string.Equals(Path.GetFileNameWithoutExtension(path), profile.Id, StringComparison.Ordinal))
-                throw new InvalidDataException($"Profile filename does not match its ID: {path}");
-            ValidateProfile(profile);
-            if (!profiles.TryAdd(profile.Id, profile)) throw new InvalidDataException($"Duplicate profile ID: {profile.Id}");
+            try
+            {
+                var profile = Read<LaunchProfile>(path);
+                if (!string.Equals(Path.GetFileNameWithoutExtension(path), profile.Id, StringComparison.Ordinal))
+                    throw new InvalidDataException($"Profile filename does not match its ID: {path}");
+                ValidateProfile(profile);
+                if (!profiles.TryAdd(profile.Id, profile)) throw new InvalidDataException($"Duplicate profile ID: {profile.Id}");
+            }
+            catch (Exception ex) when (ex is InvalidDataException or JsonException or IOException or UnauthorizedAccessException or ArgumentException)
+            {
+                profileErrors.Add(new ProfileLoadError(path, ex.Message));
+            }
         }
         // Import defaults once. Deleting a profile later must not silently resurrect it.
         var initialized = Path.Combine(configRoot, "initialized.json");
         if (!File.Exists(initialized))
         {
-            var incoming = SeedProfiles(seedRoot).Select(path => ReadSeed<LaunchProfile>(path, seedRoot)).ToArray();
-            foreach (var profile in incoming) ValidateProfile(profile);
-            foreach (var profile in incoming)
-                if (!profiles.ContainsKey(profile.Id)) { WriteProfile(profile); profiles.Add(profile.Id, profile); }
+            if (!hasConfiguration)
+            {
+                var incoming = SeedProfiles(seedRoot).Select(path => ReadSeed<LaunchProfile>(path, seedRoot)).ToArray();
+                foreach (var profile in incoming) ValidateProfile(profile);
+                foreach (var profile in incoming) { WriteProfile(profile); profiles.Add(profile.Id, profile); }
+            }
             AtomicWrite(initialized, new { schemaVersion = 1, createdAt = DateTimeOffset.UtcNow });
         }
         foreach (var file in new[] { "chat_template.jinja", "chat_template.LICENSE", "device-profiles.json" })
@@ -97,11 +111,16 @@ public sealed class ConfigurationStore
         lock (gate)
         {
             var owned = Clone(profile);
+            var existingPath = Directory.EnumerateFiles(Path.Combine(configRoot, "profiles"), "*.json")
+                .FirstOrDefault(path => string.Equals(Path.GetFileNameWithoutExtension(path), owned.Id, StringComparison.OrdinalIgnoreCase));
+            if (existingPath is not null && !string.Equals(Path.GetFileNameWithoutExtension(existingPath), owned.Id, StringComparison.Ordinal))
+                throw new ArgumentException("Profile ID must match the existing filename exactly.");
             if (owned.Parameters.TryGetValue("--cuda-memory-policy", out var policy))
                 owned.Parameters["--cuda-memory-policy"] = CanonicalMemoryPolicy(policy);
             Archive(ProfilePath(owned.Id), "profile-" + owned.Id);
             WriteProfile(owned);
             profiles[owned.Id] = owned;
+            profileErrors.RemoveAll(error => string.Equals(error.FilePath, ProfilePath(owned.Id), StringComparison.OrdinalIgnoreCase));
         }
     }
 
@@ -193,21 +212,12 @@ public sealed class ConfigurationStore
             ? Path.GetFullPath(Path.Combine(DataRoot, relative)) : ResolvePath(path);
     }
     private string ProfilePath(string id) => Path.Combine(configRoot, "profiles", id + ".json");
-    private void WriteProfile(LaunchProfile profile) => AtomicWrite(ProfilePath(profile.Id), new ProfileDocument(1, DateTimeOffset.UtcNow, profile));
-    private sealed record ProfileDocument(int SchemaVersion, DateTimeOffset SavedAt, LaunchProfile Profile);
+    private void WriteProfile(LaunchProfile profile) => AtomicWrite(ProfilePath(profile.Id), profile);
     private static T Clone<T>(T value) => JsonSerializer.Deserialize<T>(JsonSerializer.Serialize(value, Json), Json)!;
     private static T Read<T>(string path)
     {
         try { return JsonSerializer.Deserialize<T>(File.ReadAllText(path), Json) ?? throw new JsonException("Empty JSON value."); }
         catch (Exception ex) when (ex is JsonException or IOException) { throw new InvalidDataException($"Cannot read configuration {path}; it was preserved. {ex.Message}", ex); }
-    }
-    private static LaunchProfile ReadProfile(string path)
-    {
-        using var document = JsonDocument.Parse(File.ReadAllText(path));
-        if (!document.RootElement.TryGetProperty("schemaVersion", out var schema) || schema.GetInt32() != 1)
-            throw new InvalidDataException($"Unsupported profile schema: {path}");
-        return document.RootElement.GetProperty("profile").Deserialize<LaunchProfile>(Json)
-            ?? throw new InvalidDataException($"Empty profile: {path}");
     }
     private void Archive(string source, string prefix)
     {

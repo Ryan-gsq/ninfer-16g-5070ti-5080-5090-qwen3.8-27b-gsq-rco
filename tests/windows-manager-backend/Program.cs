@@ -34,6 +34,47 @@ File.WriteAllText(Path.Combine(defaults,"settings.json"), JsonSerializer.Seriali
 File.WriteAllText(Path.Combine(defaults,"chat_template.jinja"), "fixture-template");
 File.WriteAllText(Path.Combine(defaults,"chat_template.LICENSE"), "fixture-template-license");
 File.WriteAllText(Path.Combine(defaults,"device-profiles.json"), "{}");
+var cleanPackage = Path.Combine(scratch,"flat-package");
+var shippedConfig = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory,"../../../../../apps/windows-manager/config"));
+foreach(var source in Directory.EnumerateFiles(shippedConfig,"*",SearchOption.AllDirectories)) {
+ var destination=Path.Combine(cleanPackage,"config",Path.GetRelativePath(shippedConfig,source));
+ Directory.CreateDirectory(Path.GetDirectoryName(destination)!);File.Copy(source,destination);
+}
+var cleanPaths=ManagerPaths.Select(cleanPackage,Path.Combine(scratch,"flat-local"));
+var cleanStore=new ConfigurationStore(cleanPaths);
+Check(cleanStore.Profiles.Count==Directory.GetFiles(Path.Combine(shippedConfig,"profiles"),"*.json").Length,"first launch imports the shipped flat package profiles into LocalAppData");
+var editedFlat=cleanStore.Profiles[0] with {Name="Custom flat profile",Environment=new() { ["CUSTOM_ENV"]="kept" }};
+cleanStore.SaveProfile(editedFlat);
+using(var flatDocument=JsonDocument.Parse(File.ReadAllText(Path.Combine(cleanPaths.ConfigRoot,"profiles",editedFlat.Id+".json"))))
+ Check(flatDocument.RootElement.GetProperty("id").GetString()==editedFlat.Id&&!flatDocument.RootElement.TryGetProperty("profile",out _),"saved profiles use the same flat format as package seeds");
+Check(JsonSerializer.Serialize(new ConfigurationStore(cleanPaths).Profiles.Single(p=>p.Id==editedFlat.Id),ConfigurationStore.Json)==JsonSerializer.Serialize(editedFlat,ConfigurationStore.Json),"flat profile save and reload preserve parameters and environment");
+var portableFlat=new ConfigurationStore(ManagerPaths.Select(cleanPackage,""));
+Check(portableFlat.Profiles.Count==cleanStore.Profiles.Count,"portable configuration loads existing shipped flat profiles");
+var damagedPackage=Path.Combine(scratch,"damaged-package");
+var damagedProfiles=Path.Combine(damagedPackage,"config","profiles");
+Directory.CreateDirectory(damagedProfiles);
+var brokenDefaultPath=Path.Combine(damagedProfiles,"xxs-160k.json");
+File.WriteAllText(brokenDefaultPath,"BROKEN PROFILE JSON");
+File.WriteAllText(Path.Combine(damagedPackage,"config","settings.json"),JsonSerializer.Serialize(new ManagerSettings(),ConfigurationStore.Json));
+File.WriteAllText(Path.Combine(damagedProfiles,"healthy.json"),JsonSerializer.Serialize(profile with {Id="healthy"},ConfigurationStore.Json));
+File.WriteAllText(Path.Combine(damagedProfiles,"invalid.json"),JsonSerializer.Serialize(profile with {Id="invalid",ModelPath=""},ConfigurationStore.Json));
+File.WriteAllText(Path.Combine(damagedProfiles,"mismatch.json"),JsonSerializer.Serialize(profile with {Id="different-id"},ConfigurationStore.Json));
+var damagedBytes=Directory.GetFiles(damagedProfiles).ToDictionary(path=>path,File.ReadAllBytes);
+var damagedPaths=ManagerPaths.Select(damagedPackage,"");
+var damagedStore=new ConfigurationStore(damagedPaths);
+Check(damagedStore.Profiles is {Count:1}&&damagedStore.Profiles[0].Id=="healthy"&&damagedStore.ProfileErrors.Count==3&&damagedStore.ProfileErrors.All(error=>File.Exists(error.FilePath)&&!string.IsNullOrWhiteSpace(error.Message)),"malformed JSON, invalid values and mismatched profile IDs are isolated with actionable file errors");
+Check(damagedBytes.All(pair=>File.ReadAllBytes(pair.Key).SequenceEqual(pair.Value))&&Directory.GetFiles(damagedProfiles).Length==4&&damagedStore.Settings.DefaultProfileId=="xxs-160k","broken default and missing package profiles are preserved without seed replacement or default reassignment");
+Reject(()=>damagedStore.SaveProfile(profile with {ModelPath=""}),"failed profile repair is rejected");
+Check(damagedStore.ProfileErrors.Count==3&&File.ReadAllText(brokenDefaultPath)=="BROKEN PROFILE JSON","failed repair preserves the profile error and file");
+Reject(()=>damagedStore.SaveProfile(profile with {Id="XXS-160K"}),"an incoming ID with different casing cannot overwrite a broken profile file");
+Check(damagedStore.ProfileErrors.Count==3&&File.ReadAllText(brokenDefaultPath)=="BROKEN PROFILE JSON","filename mismatch leaves the broken profile intact");
+damagedStore.SaveProfile(profile);
+Check(damagedStore.ProfileErrors.Count==2&&damagedStore.ProfileErrors.All(error=>error.FilePath!=brokenDefaultPath)&&Directory.GetFiles(Path.Combine(damagedPaths.ConfigRoot,"history")).Any(path=>File.ReadAllText(path)=="BROKEN PROFILE JSON"),"successful profile repair clears only its error and archives original contents");
+Check(new ConfigurationStore(damagedPaths).Profiles.Count==2&&new ConfigurationStore(damagedPaths).ProfileErrors.Count==2,"repaired flat profile reloads while other profile errors remain isolated");
+File.Delete(brokenDefaultPath);
+File.Delete(Path.Combine(damagedPaths.ConfigRoot,"initialized.json"));
+var missingDefault=new ConfigurationStore(damagedPaths);
+Check(!File.Exists(brokenDefaultPath)&&missingDefault.Profiles.All(p=>p.Id!="xxs-160k")&&missingDefault.Settings.DefaultProfileId=="xxs-160k","an existing configuration without an initialization marker does not resurrect a missing default profile");
 var store = new ConfigurationStore(ManagerPaths.Select(scratch, ""),defaults);
 Check(store.Settings.StartWithWindows && store.Profiles.Count==1 && store.Profiles[0].Parameters["--max-context"]=="163840","default settings and XXS 160K import");
 Check(File.ReadAllText(Path.Combine(scratch,"config","chat_template.jinja"))=="fixture-template","missing template copied");

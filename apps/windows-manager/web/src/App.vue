@@ -8,10 +8,12 @@ import { advancedGroups } from './advancedParameterHelp'
 const groups = [...basicGroups, ...advancedGroups]
 
 type Profile = { id:string; name:string; modelPath:string; enginePath:string; parameters:Record<string,string|null>; environment:Record<string,string|null> }
+type ProfileLoadError = { filePath:string; message:string }
 type Page = 'monitor' | 'models' | 'settings'
 const clone = <T,>(value:T):T => JSON.parse(JSON.stringify(value))
 const page = ref<Page>(location.pathname.startsWith('/models') ? 'models' : location.pathname.startsWith('/settings') ? 'settings' : 'monitor')
 const data = ref<any>({ engine:{state:'Stopped'}, profiles:[], models:[], settings:{modelDirectories:[],language:'zh'}, recentRequests:[] })
+const profileErrors = computed<ProfileLoadError[]>(() => data.value.profileErrors || [])
 const language = ref<Language>('zh'), languageBusy = ref(false)
 const t = (zh:string,en:string) => language.value === 'zh' ? zh : en
 const local = (value:Bilingual) => value[language.value]
@@ -103,8 +105,9 @@ async function poll() {
     const next=await api('/state'); data.value=next; connected.value=true; connectionError.value=''
     if(!languageBusy.value && version === languageVersion && ['zh','en'].includes(next.settings?.language))language.value=next.settings.language
     if(page.value === 'settings' && !settingsEdit.value)resetSettings()
-    if(!launchProfileId.value && next.profiles?.length)launchProfileId.value=next.settings.defaultProfileId || next.profiles[0].id
-    if(!edit.value && next.profiles?.length)choose(next.settings.defaultProfileId || next.profiles[0].id,false)
+    const defaultId=next.profiles.find((p:Profile) => p.id === next.settings.defaultProfileId)?.id || next.profiles[0]?.id || ''
+    if(!next.profiles.some((p:Profile) => p.id === launchProfileId.value))launchProfileId.value=defaultId
+    if(!edit.value && defaultId)choose(defaultId,false)
   } catch(ex) {
     connected.value=false
     if(exiting.value){error.value='';connectionError.value='';notice.value=words('管理器连接已关闭。重新双击 NInferManager.exe 可启动。','The manager has closed. Open NInferManager.exe to start it again.');clearInterval(timer)}
@@ -234,6 +237,12 @@ onUnmounted(() => clearInterval(timer))
    <header><div><div class="eyebrow">{{t('你的本地推理工作台','YOUR LOCAL INFERENCE WORKSPACE')}}</div><h1>{{page==='monitor'?t('运行监控','Monitor'):page==='models'?t('模型与启动配置','Models & launch profiles'):t('偏好设置','Preferences')}}</h1></div><div class="header-actions"><div class="language-switch" role="group" :aria-label="t('界面语言','Interface language')"><button :class="{selected:language==='zh'}" :aria-pressed="language==='zh'" :disabled="languageBusy||!connected" @click="changeLanguage('zh')">中文</button><button :class="{selected:language==='en'}" :aria-pressed="language==='en'" :disabled="languageBusy||!connected" @click="changeLanguage('en')">English</button></div><span class="status" :class="engine.state.toLowerCase()"><span class="dot"></span>{{stateName}}</span></div></header>
    <div v-if="displayedError" class="alert error" role="alert"><span>{{displayedError}}</span><button :aria-label="t('关闭提示','Dismiss message')" @click="error='';connectionError=''">×</button></div>
    <div v-if="notice" class="alert success" role="status"><span>{{local(notice)}}</span><button :aria-label="t('关闭提示','Dismiss message')" @click="notice=null">×</button></div>
+   <section v-if="profileErrors.length" class="profile-errors" role="alert" aria-labelledby="profile-errors-title">
+    <h3 id="profile-errors-title">{{t('部分启动配置无法读取','Some launch profiles could not be loaded')}}</h3>
+    <p>{{t('以下文件已保留并跳过。请根据错误修正对应的 JSON 文件，然后重启管理器。其他有效配置仍可正常使用。','The files below were preserved and skipped. Correct each JSON file using the error details, then restart the manager. Other valid profiles remain available.')}}</p>
+    <ul><li v-for="issue in profileErrors" :key="issue.filePath"><code>{{issue.filePath}}</code><p>{{issue.message}}</p></li></ul>
+   </section>
+   <div v-if="connected&&!data.profiles.length" class="alert error" role="status"><span>{{t('当前没有可用的启动配置。请修复配置文件后重启管理器，或在“模型与配置”中新建并保存配置。','No launch profiles are available. Repair the profile files and restart the manager, or create and save a profile in Models & profiles.')}}</span></div>
    <section class="running-card">
     <div><div class="eyebrow">{{t('当前引擎','CURRENT ENGINE')}}</div><h2>{{engine.profileName||t('等待启动模型','Ready to start a model')}}</h2><p v-if="engine.state==='Running'">PID {{engine.pid}} · {{n(Number(runningParam('--max-context'))/1024)}}K {{t('上下文','context')}} · {{runningParam('--kv-dtype')}}</p><p v-else-if="engine.state==='Starting'">{{t('正在载入权重并检查显存驻留，请稍候。','Loading weights and checking GPU residency. Please wait.')}}</p><p v-else>{{t('选择已保存的配置，即可启动本地 API。','Choose a saved profile to start the local API.')}}</p></div>
     <div class="actions"><select v-if="!active" v-model="launchProfileId" :aria-label="t('选择启动配置','Choose a launch profile')"><option v-for="p in data.profiles" :key="p.id" :value="p.id">{{p.name}}</option><option v-if="!data.profiles.length" value="">{{t('暂无配置','No profiles')}}</option></select><button v-if="!active" class="primary" :disabled="busy||!connected||!launchProfileId" @click="action(()=>api('/start/'+launchProfileId,'POST'))">{{t('启动模型','Start model')}}</button><button v-else class="danger-outline" :disabled="busy||!connected||engine.state==='Stopping'" @click="action(()=>api('/stop','POST'))">{{engine.state==='Stopping'?t('正在停止…','Stopping…'):t('停止服务','Stop service')}}</button></div>
@@ -292,7 +301,7 @@ onUnmounted(() => clearInterval(timer))
     <section class="panel settings" v-if="settingsEdit"><h3>{{t('自动启动','Automatic startup')}}</h3>
      <label class="setting-row"><div><strong>{{t('随 Windows 登录启动','Start at Windows sign-in')}}</strong><p>{{t('登录后只显示托盘，不弹出控制台或浏览器。','Starts in the tray without opening a console or browser.')}}</p></div><input type="checkbox" v-model="settingsEdit.startWithWindows"></label>
      <label class="setting-row"><div><strong>{{t('自动加载默认模型','Automatically load the default model')}}</strong><p>{{t('管理器启动后载入下方指定配置。','Loads the selected profile when the manager starts.')}}</p></div><input type="checkbox" v-model="settingsEdit.autoStartModel"></label>
-     <label>{{t('默认启动配置','Default startup profile')}}<select v-model="settingsEdit.defaultProfileId"><option v-for="p in data.profiles" :key="p.id" :value="p.id">{{p.name}}</option></select></label>
+     <label>{{t('默认启动配置','Default startup profile')}}<select v-model="settingsEdit.defaultProfileId" :disabled="!data.profiles.length"><option v-if="!data.profiles.some((p:Profile)=>p.id===settingsEdit.defaultProfileId)" :value="settingsEdit.defaultProfileId" disabled>{{data.profiles.length?t('请选择可用配置','Choose an available profile'):t('暂无可用配置','No profiles available')}}</option><option v-for="p in data.profiles" :key="p.id" :value="p.id">{{p.name}}</option></select></label>
      <h3>{{t('模型扫描目录','Model scan directories')}}</h3><p class="hint">{{t('每行一个目录；相对路径以模型包根目录为起点。','One directory per line. Relative paths start at the package root.')}}</p><label for="model-directories" class="sr-only">{{t('模型扫描目录','Model scan directories')}}</label><textarea id="model-directories" v-model="directories" rows="5"></textarea>
      <h3>{{t('本地管理端口','Management web port')}}</h3><div class="field"><div class="field-label"><label for="web-port">{{t('端口 · 重启管理器后生效','Port · applies after restarting the manager')}}</label><HelpTip :title="t('本地管理端口','Management web port')" :text="t('管理页面使用的端口，范围 1024–65535，必须与模型 API 端口不同。只改变管理网页地址；保存后重启管理器才生效，当前网页不会立即迁移。','The management web port, from 1024 to 65535. It must differ from the model API port. This changes only the management address. Restart the manager after saving; this page does not move immediately.')" :language="language" /></div><input id="web-port" type="number" v-model.number="settingsEdit.webPort" min="1024" max="65535"></div>
      <div class="save-bar"><button @click="resetSettings">{{t('还原未保存修改','Discard unsaved changes')}}</button><button class="primary" :disabled="busy||!connected||languageBusy" @click="saveSettings">{{busy?t('正在保存…','Saving…'):t('保存设置','Save settings')}}</button></div>

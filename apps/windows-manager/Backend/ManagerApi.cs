@@ -37,7 +37,7 @@ public static class ManagerApi
         {
             var snapshot = engine.Snapshot;
             var metrics = await telemetry.ReadAsync(snapshot, context.RequestAborted);
-            return Results.Json(new { engine = snapshot, settings = store.Settings, profiles = store.Profiles,
+            return Results.Json(new { engine = snapshot, settings = store.Settings, profiles = store.Profiles, profileErrors = store.ProfileErrors,
                 models = catalog.Models, stats = metrics.Stats, statsError = metrics.Error, gpu = metrics.Gpu, monitor = metrics.Monitor,
                 recentRequests = metrics.RecentRequests, logTail = metrics.LogTail, sampledAt = metrics.SampledAt });
         });
