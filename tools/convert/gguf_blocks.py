@@ -95,7 +95,7 @@ def _layer_tensors(prefix: str) -> dict[str, tuple[tuple[int, ...], str]]:
 
 
 def expected_tensors(mtp: bool) -> dict[str, tuple[tuple[int, ...], str]]:
-    """Row-major shape and kind ("blocks" = any stored ggml block type) of every tensor."""
+    """Row-major shape and kind ("blocks" or pipe-separated direct types) of every tensor."""
 
     out = {
         "token_embd.weight": ((VOCABULARY, HIDDEN), "blocks"),
@@ -112,8 +112,8 @@ def expected_tensors(mtp: bool) -> dict[str, tuple[tuple[int, ...], str]]:
             p + "attn_qkv.weight": ((GDN_CHANNELS, HIDDEN), "blocks"),
             p + "attn_gate.weight": ((GDN_VALUE_DIM, HIDDEN), "blocks"),
             p + "ssm_out.weight": ((HIDDEN, GDN_VALUE_DIM), "blocks"),
-            p + "ssm_alpha.weight": ((GDN_VALUE_HEADS, HIDDEN), "BF16"),
-            p + "ssm_beta.weight": ((GDN_VALUE_HEADS, HIDDEN), "BF16"),
+            p + "ssm_alpha.weight": ((GDN_VALUE_HEADS, HIDDEN), "BF16|F32"),
+            p + "ssm_beta.weight": ((GDN_VALUE_HEADS, HIDDEN), "BF16|F32"),
             p + "ssm_a": ((GDN_VALUE_HEADS,), "F32"),
             p + "ssm_dt.bias": ((GDN_VALUE_HEADS,), "F32"),
             p + "ssm_conv1d.weight": ((GDN_CHANNELS, GDN_TAPS), "F32"),
@@ -158,7 +158,7 @@ def validate(gguf: GGUFFile) -> None:
         info = gguf.tensors[name]
         stored = info.type_id in GGUF_FORMATS_BY_TYPE
         if info.shape != shape or (kind == "blocks") != stored or (
-            kind != "blocks" and info.type_name != kind
+            kind != "blocks" and info.type_name not in kind.split("|")
         ):
             raise ValueError(f"{gguf.path}: {name} is {info.type_name} {info.shape}")
     end = max(info.offset + info.nbytes for info in gguf.tensors.values())
@@ -297,6 +297,13 @@ def text_sources(
             gguf, g + "ssm_out.weight", (HIDDEN, GDN_VALUE_DIM), rows()
         )
         for role, tensor in (("a_projection", "ssm_alpha.weight"), ("b_projection", "ssm_beta.weight")):
+            if gguf.info(g + tensor).type_name == "F32":
+                # Some exporters retain these small controls in F32. Convert their numeric
+                # values to the existing BF16 operand after restoring grouped head order.
+                direct[n + role] = _direct(
+                    untile(gguf.read_direct(g + tensor), 1), torch.bfloat16, g + tensor
+                )
+                continue
             words = untile(gguf.read_bf16_words(g + tensor), 1)
             direct[n + role] = array_source(
                 torch.from_numpy(np.ascontiguousarray(words.view(np.int16))).view(

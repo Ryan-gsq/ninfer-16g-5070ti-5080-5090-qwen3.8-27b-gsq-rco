@@ -7,7 +7,7 @@ import torch
 from tools.artifact.formats import GGUF_FORMATS, GGUF_FORMATS_BY_TYPE
 from tools.artifact.layouts import encoded_size, gguf_blocks_geometry
 from tools.convert import gguf_blocks
-from tools.convert.sources.gguf import GGUFFile, write_gguf
+from tools.convert.sources.gguf import GGUFFile, TYPE_IDS, TensorInfo, write_gguf
 
 TYPE_Q8_0 = 8
 
@@ -86,3 +86,43 @@ def test_output_projection_columns_read_the_grouped_value_heads():
     for tiled_head in (0, 1, 15, 16, 31, 47):
         key_head, repeat = tiled_head % 16, tiled_head // 16
         assert columns[tiled_head * 128 + 5] == (key_head * 3 + repeat) * 128 + 5
+
+
+@pytest.mark.parametrize("control_type", ["F32", "BF16", "F16"])
+def test_gdn_controls_import_float_values_in_grouped_head_order(tmp_path, monkeypatch, control_type):
+    # Keep the real 48-head GDN ordering while shrinking unrelated fixture matrices.
+    for key, value in {"LAYERS": 1, "HIDDEN": 32, "INTERMEDIATE": 32, "VOCABULARY": 32}.items():
+        monkeypatch.setattr(gguf_blocks, key, value)
+    tensors = []
+    # Halfway values exercise round-to-nearest-even at the BF16 operand boundary.
+    sample = np.array([1.00390625, 1.01171875, -1.00390625, -1.01171875], dtype="<f4")
+    controls = np.full((48, 32), sample[0], dtype="<f4")
+    controls[:, :4] = sample
+    controls[:, 4] = np.arange(48)
+    for name, (shape, kind) in gguf_blocks.expected_tensors(False).items():
+        if name.endswith(("ssm_alpha.weight", "ssm_beta.weight")):
+            type_id = TYPE_IDS[control_type]
+            if control_type == "BF16":
+                raw = torch.from_numpy(controls).to(torch.bfloat16).view(torch.int16).numpy().tobytes()
+            else:
+                raw = controls.astype("<f4" if control_type == "F32" else "<f2").tobytes()
+        else:
+            type_id = TYPE_Q8_0 if kind == "blocks" else TYPE_IDS[kind]
+            raw = bytes(TensorInfo(name, shape, type_id, 0).nbytes)
+            if name.endswith("ssm_a"):
+                raw = np.full(shape, -1, dtype="<f4").tobytes()
+        tensors.append((name, shape, type_id, raw))
+    path = tmp_path / "gdn.gguf"
+    write_gguf(path, {**gguf_blocks.EXPECTED_HEADER, "qwen35.block_count": 1}, tensors)
+    with GGUFFile(path) as gguf:
+        if control_type == "F16":
+            with pytest.raises(ValueError, match="ssm_alpha.weight"):
+                gguf_blocks.validate(gguf)
+            return
+        gguf_blocks.validate(gguf)
+        _, direct = gguf_blocks.text_sources(gguf, mtp=False)
+        for role in ("a_projection", "b_projection"):
+            values = direct[f"text/layers/0/gdn/{role}"].rows(0, 48)
+            assert values.dtype == torch.bfloat16
+            assert values[0, :4].tolist() == [1.0, 1.015625, -1.0, -1.015625]
+            assert values[:6, 4].tolist() == [0, 16, 32, 1, 17, 33]
