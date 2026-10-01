@@ -24,7 +24,11 @@ public sealed record ManagerSettings
 public sealed record LaunchSpec(string ProfileId, string ProfileName, string Executable,
     string WorkingDirectory, IReadOnlyList<string> Arguments,
     IReadOnlyDictionary<string, string?> Environment, string ApiBase, string ModelId,
-    string StdoutPath, string StderrPath, string RequestLogPath);
+    string StdoutPath, string StderrPath, string RequestLogPath)
+{
+    // The published LAN address must never route the manager's own health/metrics requests.
+    public string LocalApiBase => new UriBuilder(ApiBase) { Host = "127.0.0.1" }.Uri.AbsoluteUri;
+}
 
 public sealed record EngineSnapshot(string State, string? ProfileId = null,
     string? ProfileName = null, int? Pid = null, string? ApiBase = null,

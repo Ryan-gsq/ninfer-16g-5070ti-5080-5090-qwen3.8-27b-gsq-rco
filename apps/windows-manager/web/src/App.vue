@@ -18,7 +18,7 @@ const language = ref<Language>('zh'), languageBusy = ref(false)
 const t = (zh:string,en:string) => language.value === 'zh' ? zh : en
 const local = (value:Bilingual) => value[language.value]
 const error = ref(''), connectionError = ref(''), notice = ref<Bilingual|null>(null), connected = ref(false), busy = ref(false), exiting = ref(false)
-const displayedError = computed(() => error.value || (connectionError.value ? t('无法连接管理器，请从托盘重新打开页面。','Cannot connect to the manager. Reopen this page from the tray.')+' '+connectionError.value : ''))
+const displayedError = computed(() => error.value || (connectionError.value ? t('无法连接管理器，请确认管理器已启动后刷新页面。','Cannot connect to the manager. Ensure it is running, then refresh this page.')+' '+connectionError.value : ''))
 const launchProfileId = ref(''), edit = ref<Profile|null>(null), dirty = ref(false), advanced = ref(false), advancedOptions = ref(false)
 const jsonText = ref(''), envText = ref(''), settingsEdit = ref<any>(null), directories = ref('')
 const engine = computed(() => connected.value ? (data.value.engine || {state:'Stopped'}) : {...data.value.engine,state:exiting.value ? 'Stopped' : 'Offline'})
@@ -94,7 +94,7 @@ watch(language,value => { document.documentElement.lang = value === 'zh' ? 'zh-C
 function runningParam(key:string) { const args=engine.value.launch?.arguments || []; const i=args.indexOf(key); return i >= 0 ? args[i+1] : data.value.profiles.find((p:Profile) => p.id === engine.value.profileId)?.parameters[key] }
 function nav(next:Page) { page.value=next; window.history.replaceState({},'',next === 'monitor' ? '/' : '/'+next); if(next === 'settings' && !settingsEdit.value)resetSettings() }
 async function api(path:string,method='GET',body?:unknown) {
-  const response = await fetch('/api'+path,{method,headers:{'Content-Type':'application/json','X-NInfer-Manager':'1'},body:body === undefined ? undefined : JSON.stringify(body)})
+  const response = await fetch('/api'+path,{method,headers:{'Content-Type':'application/json'},body:body === undefined ? undefined : JSON.stringify(body)})
   const text=await response.text(); let payload:any; try{payload=JSON.parse(text)}catch{payload=text}
   if(!response.ok)throw new Error(typeof payload === 'string' ? payload : payload.error || payload.message || `HTTP ${response.status}`)
   return payload

@@ -86,10 +86,16 @@ var spec = store.BuildLaunchSpec("xxs-160k");
 Check(spec.Executable==Path.Combine(scratch,"engine","ninfer-serve.exe") && spec.Arguments.Contains(Path.Combine(scratch,"config","chat_template.jinja")) && spec.Arguments.Contains(Path.Combine(scratch,"config","device-profiles.json")),"launch resolves engine and config resources from the package root");
 Check(spec.Arguments.Contains("A \"quoted\" model") && spec.Arguments.Contains("--preserve-thinking") && spec.ApiBase=="http://127.0.0.1:18081/v1","token array preserves quoted model ID and flag");
 Check(spec.RequestLogPath.StartsWith(Path.Combine(scratch,"logs")) && spec.Arguments.Contains(spec.RequestLogPath),"owned unique request log");
+var lanProfile = profile with { Parameters = new(profile.Parameters) { ["--host"] = "0.0.0.0" } };
+store.SaveProfile(lanProfile);
+Check(new ConfigurationStore(ManagerPaths.Select(scratch, ""), defaults).Profiles.Single(p => p.Id == profile.Id).Parameters["--host"] == "0.0.0.0", "LAN listener saves and reloads without rewriting wildcard binding");
+Reject(() => store.SaveProfile(profile with { Parameters = new(profile.Parameters) { ["--host"] = "localhost" } }), "only explicit IPv4 local and wildcard bindings are offered");
+store.SaveProfile(profile);
 var clone = store.Profiles[0]; clone.Parameters["--max-context"]="1";
 Check(store.Profiles[0].Parameters["--max-context"]=="163840","returned profiles cannot mutate stored configuration");
+var historyBeforeRename = Directory.GetFiles(Path.Combine(scratch,"config","history")).Length;
 store.SaveProfile(profile with { Name="Updated" });
-Check(Directory.GetFiles(Path.Combine(scratch,"config","history")).Length==1 && new ConfigurationStore(ManagerPaths.Select(scratch, ""),defaults).Profiles[0].Name=="Updated","atomic save + history + reload");
+Check(Directory.GetFiles(Path.Combine(scratch,"config","history")).Length==historyBeforeRename+1 && new ConfigurationStore(ManagerPaths.Select(scratch, ""),defaults).Profiles[0].Name=="Updated","atomic save + history + reload");
 foreach(var policy in new[] { "default", "mixed", "strict", "strict-64-128", "strict-0-1", "strict-96-256", "strict-17592186044415-16384" })
 {
  var candidate=profile with {Parameters=new(profile.Parameters)};
@@ -262,7 +268,8 @@ store.DeleteProfile("secondary");
 Check(new ConfigurationStore(ManagerPaths.Select(scratch, ""),defaults).Profiles.Count==1,"deleted profile remains deleted across restart");
 var embeddedRoot=Path.Combine(scratch,"embedded-package");
 var embedded=new ConfigurationStore(ManagerPaths.Select(embeddedRoot, ""));
-Check(embedded.Profiles.Count==2&&!embedded.Settings.StartWithWindows&&embedded.Profiles.Single(p=>p.Id=="xxs-160k").Parameters["--max-context"]=="163840"&&embedded.Profiles.Single(p=>p.Id=="s-128k").Parameters["--max-context"]=="131072","embedded resources initialize the complete package configuration without an external seed directory or implicit startup registration");
+var packagedProfileCount = typeof(ConfigurationStore).Assembly.GetManifestResourceNames().Count(name => name.StartsWith("NInfer.Manager.Config/profiles/", StringComparison.Ordinal) && name.EndsWith(".json", StringComparison.Ordinal));
+Check(embedded.Profiles.Count==packagedProfileCount&&!embedded.Settings.StartWithWindows&&embedded.Profiles.Single(p=>p.Id=="xxs-160k").Parameters["--max-context"]=="163840"&&embedded.Profiles.Single(p=>p.Id=="s-128k").Parameters["--max-context"]=="131072","embedded resources initialize the complete package configuration without an external seed directory or implicit startup registration");
 Check(embedded.Profiles.All(p=>p.EnginePath=="engine/ninfer-serve.exe"&&p.Parameters["--chat-template"]=="config/chat_template.jinja"&&p.Parameters["--device-profile-path"]=="config/device-profiles.json")&&File.Exists(Path.Combine(embeddedRoot,"config","chat_template.LICENSE")),"embedded launch profiles and template license use the package layout");
 embedded.SaveSettings(embedded.Settings with {Language="en",AutoStartModel=false});
 embedded.SaveProfile(embedded.Profiles.Single(p=>p.Id=="xxs-160k") with {Name="Saved profile"});
@@ -270,7 +277,7 @@ embedded.DeleteProfile("s-128k");
 File.WriteAllText(Path.Combine(embeddedRoot,"config","chat_template.jinja"),"saved-template");
 File.WriteAllText(Path.Combine(embeddedRoot,"config","device-profiles.json"),"{\"saved\":true}");
 var embeddedReloaded=new ConfigurationStore(ManagerPaths.Select(embeddedRoot, ""));
-Check(embeddedReloaded.Settings is {Language:"en",AutoStartModel:false}&&embeddedReloaded.Profiles is {Count:1}&&embeddedReloaded.Profiles[0].Name=="Saved profile"&&File.ReadAllText(Path.Combine(embeddedRoot,"config","chat_template.jinja"))=="saved-template"&&File.ReadAllText(Path.Combine(embeddedRoot,"config","device-profiles.json"))=="{\"saved\":true}","restarting preserves saved preferences, profile edits, deleted seed profiles and customized resources");
+Check(embeddedReloaded.Settings is {Language:"en",AutoStartModel:false}&&embeddedReloaded.Profiles.Count==packagedProfileCount-1&&embeddedReloaded.Profiles.All(p=>p.Id!="s-128k")&&embeddedReloaded.Profiles.Single(p=>p.Id=="xxs-160k").Name=="Saved profile"&&File.ReadAllText(Path.Combine(embeddedRoot,"config","chat_template.jinja"))=="saved-template"&&File.ReadAllText(Path.Combine(embeddedRoot,"config","device-profiles.json"))=="{\"saved\":true}","restarting preserves saved preferences, profile edits, deleted seed profiles and customized resources");
 File.Delete(Path.Combine(embeddedRoot,"config","chat_template.LICENSE"));
 _=new ConfigurationStore(ManagerPaths.Select(embeddedRoot, ""));
 Check(File.ReadAllText(Path.Combine(embeddedRoot,"config","chat_template.LICENSE")).Contains("Apache License"),"missing template license can be restored from the executable");
@@ -501,6 +508,7 @@ await using(var app=builder.Build()) {
  using(var response=await client.PostAsync("/api/start/xxs-160k",null)) Check(response.StatusCode==System.Net.HttpStatusCode.Conflict,"synchronous start rejection is returned to caller");
  await app.StopAsync();
 }
+EngineNetworkCheck.Run(Check);
 ThroughputWindowCheck.Run(Check);
 await EngineTelemetryCheck.RunAsync(Check);
 Console.WriteLine($"ALL {checks} CHECKS PASSED");

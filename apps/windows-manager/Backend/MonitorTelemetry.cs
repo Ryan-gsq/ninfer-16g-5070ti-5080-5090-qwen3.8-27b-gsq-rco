@@ -65,7 +65,7 @@ internal sealed class TelemetryReader : IDisposable
             session.ReadRequests();
             JsonElement? stats = null;
             string? error = null;
-            if (engine.State == "Running" && Uri.TryCreate(engine.ApiBase, UriKind.Absolute, out var api))
+            if (engine.State == "Running" && Uri.TryCreate(engine.Launch?.LocalApiBase, UriKind.Absolute, out var api))
             {
                 try
                 {

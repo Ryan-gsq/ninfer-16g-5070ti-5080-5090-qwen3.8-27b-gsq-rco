@@ -198,7 +198,7 @@ public sealed class ConfigurationStore
             arguments.Add(value);
         }
         return new LaunchSpec(profile.Id, profile.Name, executable, PackageRoot, arguments,
-            new Dictionary<string, string?>(profile.Environment), $"http://{(host == "localhost" ? "127.0.0.1" : host)}:{port}/v1", modelId,
+            new Dictionary<string, string?>(profile.Environment), EngineNetwork.ApiBase(host, port), modelId,
             Path.Combine(logs, label + ".stdout.log"), Path.Combine(logs, label + ".stderr.log"), requests);
     }
 
@@ -289,7 +289,7 @@ public sealed class ConfigurationStore
         foreach (var option in new[] { "--device-snapshot-slots", "--cache-taps-per-request", "--cache-tap-ladder", "--cache-tap-min-gap", "--prefix-cache-file" })
             if (!hybrid && p.ContainsKey(option)) throw new ArgumentException($"{option} requires --use-alt-prefix-caching with default/mixed, or --cuda-memory-policy strict.");
         if (p.ContainsKey("--device-snapshot-slots")) Integer(p, "--device-snapshot-slots", 1, 64, 1);
-        if (p.TryGetValue("--host", out var host) && host is not "127.0.0.1" and not "localhost") throw new ArgumentException("The manager supports a local engine host (127.0.0.1 or localhost).");
+        if (p.TryGetValue("--host", out var host) && host is not "127.0.0.1" and not "0.0.0.0") throw new ArgumentException("Use 127.0.0.1 for local access or 0.0.0.0 for LAN access.");
         var port = Integer(p, "--port", 1, 65535, 18081);
         var statsPort = Integer(p, "--stats-port", 0, 65535, 0);
         if (statsPort == port) throw new ArgumentException("--stats-port must differ from --port; 0 disables the separate statistics listener.");

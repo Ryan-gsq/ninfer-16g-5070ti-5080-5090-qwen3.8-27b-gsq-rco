@@ -1,5 +1,4 @@
 using System.Diagnostics;
-using System.Security.Cryptography;
 using System.Text.Json;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Hosting;
@@ -63,7 +62,6 @@ internal static class Program
         var root = paths.PackageRoot;
         var store = new ConfigurationStore(paths);
         var controller = new EngineController(paths.DataRoot);
-        var token = Convert.ToHexString(RandomNumberGenerator.GetBytes(32));
         var port = store.Settings.WebPort;
         var origin = $"http://127.0.0.1:{port}";
         var builder = WebApplication.CreateSlimBuilder(new WebApplicationOptions
@@ -76,37 +74,12 @@ internal static class Program
         var web = builder.Build();
         web.Use(async (context, next) =>
         {
-            var host = context.Request.Host;
-            if ((host.Host != "127.0.0.1" && host.Host != "localhost") || host.Port != port)
-            { context.Response.StatusCode = 403; return; }
-            if (context.Request.Query["launchToken"] == token)
-            {
-                context.Response.Cookies.Append("ninfer_manager", token, new CookieOptions
-                { HttpOnly = true, SameSite = SameSiteMode.Strict, Path = "/", IsEssential = true });
-                context.Response.Headers.CacheControl = "no-store";
-                context.Response.Redirect(context.Request.Path.Value ?? "/");
-                return;
-            }
-            bool authorized = context.Request.Cookies["ninfer_manager"] == token ||
-                context.Request.Headers.Authorization == "Bearer " + token;
-            if (!authorized)
-            {
-                context.Response.StatusCode = 401;
-                context.Response.ContentType = "text/plain; charset=utf-8";
-                await context.Response.WriteAsync("请从 NInfer 托盘菜单打开管理页面。");
-                return;
-            }
-            var requestOrigin = context.Request.Headers.Origin.ToString();
-            if (requestOrigin.Length > 0 && requestOrigin != origin && requestOrigin != $"http://localhost:{port}")
-            { context.Response.StatusCode = 403; return; }
-            if (context.Request.Method is not ("GET" or "HEAD") && context.Request.Headers["X-NInfer-Manager"] != "1")
-            { context.Response.StatusCode = 403; return; }
             context.Response.Headers.CacheControl = "no-store";
             context.Response.Headers.XContentTypeOptions = "nosniff";
             context.Response.Headers["Content-Security-Policy"] = "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'";
             await next(context);
         });
-        using var tray = new TrayContext(store, controller, origin, token);
+        using var tray = new TrayContext(store, controller, origin);
         ManagerApi.Map(web, store, controller, tray.RequestExit, () =>
         {
             StartupRegistration.SetEnabled(Environment.ProcessPath!, root, store.Settings.StartWithWindows);
@@ -119,7 +92,7 @@ internal static class Program
         {
             web.StartAsync().GetAwaiter().GetResult();
             File.WriteAllText(sessionPath, JsonSerializer.Serialize(new
-            { pid = Environment.ProcessId, token, baseUrl = origin, browserUrl = origin + "/?launchToken=" + token,
+            { pid = Environment.ProcessId, baseUrl = origin, browserUrl = origin + "/",
                 packageRoot = paths.PackageRoot, dataRoot = paths.DataRoot }, Json));
             bool skipAuto = args.Contains("--no-autostart");
             if (!skipAuto)

@@ -32,8 +32,11 @@ settings and the evidence behind those defaults.
 | Mint background and dark-green N | Gray; tooltip text distinguishes loading, stopping and errors |
 
 The management site defaults to `http://127.0.0.1:8090`, and the inference
-API base to `http://127.0.0.1:18081/v1`. Opening the site from the tray establishes
-the local management session. Both profiles expose
+API base to `http://127.0.0.1:18081/v1`. Management requires no authentication: open, bookmark or refresh its URL directly, including after a restart. The management website still listens only on this computer.
+
+Select `127.0.0.1` (local only) or `0.0.0.0` (LAN) in the model API host field. For LAN mode, the manager detects an available LAN IPv4 address and displays `http://LAN-IP:port/v1` in the website and tray. Health checks and monitoring still connect through loopback. Other devices use the displayed address, not `0.0.0.0`; Windows Firewall must allow the port.
+
+Both profiles expose
 **`swift-1.5-qwen3.8-27b`** to clients, with only one loaded at a time.
 Start is disabled while loading, running or stopping.
 

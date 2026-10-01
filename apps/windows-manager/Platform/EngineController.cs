@@ -30,7 +30,7 @@ public sealed class EngineController : IEngineController
             ObjectDisposedException.ThrowIf(disposed, this);
             if (session is not null) throw new InvalidOperationException("A model is already running, starting, or stopping.");
             cancellationToken.ThrowIfCancellationRequested();
-            var api = new Uri(spec.ApiBase, UriKind.Absolute);
+            var api = new Uri(spec.LocalApiBase, UriKind.Absolute);
             if (api.Scheme is not "http" and not "https" || !api.IsLoopback)
                 throw new ArgumentException("The managed engine API must use a local HTTP address.");
             if (NativeProcess.ListeningProcessIds(api.Port).Count != 0)

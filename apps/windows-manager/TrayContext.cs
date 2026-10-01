@@ -4,7 +4,7 @@ internal sealed class TrayContext : ApplicationContext
 {
     private readonly ConfigurationStore store;
     private readonly IEngineController engine;
-    private readonly string origin, token;
+    private readonly string origin;
     private readonly Control dispatcher = new();
     private readonly NotifyIcon icon;
     private readonly BrandingIcons artwork = new();
@@ -13,9 +13,9 @@ internal sealed class TrayContext : ApplicationContext
     private bool exiting;
     private string lastKey = "";
 
-    public TrayContext(ConfigurationStore store, IEngineController engine, string origin, string token)
+    public TrayContext(ConfigurationStore store, IEngineController engine, string origin)
     {
-        this.store = store; this.engine = engine; this.origin = origin; this.token = token;
+        this.store = store; this.engine = engine; this.origin = origin;
         _ = dispatcher.Handle;
         icon = new NotifyIcon { Icon = artwork.Stopped, Text = "NInfer", ContextMenuStrip = menu, Visible = true };
         icon.DoubleClick += (_, _) => OpenPage("/");
@@ -25,7 +25,7 @@ internal sealed class TrayContext : ApplicationContext
         Microsoft.Win32.SystemEvents.SessionEnding += SessionEnding;
     }
 
-    public void OpenPage(string path) => Program.OpenBrowser(origin + path + "?launchToken=" + token);
+    public void OpenPage(string path) => Program.OpenBrowser(origin + path);
     public void RefreshSoon() { if (!dispatcher.IsDisposed) dispatcher.BeginInvoke(() => { lastKey = ""; RefreshMenu(); }); }
     public void RequestExit() { if (!dispatcher.IsDisposed) dispatcher.BeginInvoke(async () => await ExitAsync()); }
     public void StartDefault() => dispatcher.BeginInvoke(async () => await StartProfile(store.Settings.DefaultProfileId));

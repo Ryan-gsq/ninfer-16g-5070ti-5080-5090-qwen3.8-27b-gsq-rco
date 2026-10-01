@@ -72,8 +72,8 @@ async Task WaitState(EngineController engine, string state)
     Check(engine.Snapshot.State == state, "state " + state);
 }
 await using var engine = new EngineController(dataRoot);
-await engine.StartAsync(Spec("ready"));
-Check(engine.Snapshot.State == "Running", "readiness");
+await engine.StartAsync(Spec("ready") with { ApiBase = "http://192.0.2.10:19981/v1" });
+Check(engine.Snapshot.State == "Running" && engine.Snapshot.ApiBase == "http://192.0.2.10:19981/v1", "readiness uses loopback while publishing the LAN API address");
 var firstPid = engine.Snapshot.Pid!.Value;
 try { await engine.StartAsync(Spec("duplicate")); throw new Exception("Duplicate accepted"); }
 catch (InvalidOperationException) { Check(engine.Snapshot.Pid == firstPid, "duplicate start rejected without disturbing engine"); }

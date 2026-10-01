@@ -26,13 +26,13 @@ internal static class EngineTelemetryCheck
         var endpoint = new Uri(app.Urls.Single());
         var launch = new LaunchSpec("fixture", "Fixture", "unused.exe", ".",
             ["model.ninfer", "--api-key", "fixture-monitor-key", "--stats-port", endpoint.Port.ToString()],
-            new Dictionary<string, string?>(), "http://127.0.0.1:1/v1", "fixture", "", "", "");
+            new Dictionary<string, string?>(), "http://192.0.2.10:1/v1", "fixture", "", "", "");
         var engine = new EngineSnapshot("Running", "fixture", ApiBase: launch.ApiBase, Launch: launch);
         using var sampler = new TelemetryReader();
         await sampler.SampleAsync(engine);
         var sample = await sampler.ReadAsync(engine, CancellationToken.None);
         check(sample.Error is null && sample.Stats is JsonElement stats && stats.GetProperty("fixture").GetInt32() == 42,
-            "monitor reads authenticated stats from the separate stats port");
+            "monitor reads authenticated stats over loopback when display API is a LAN address");
         check(authorization == "Bearer fixture-monitor-key", "monitor sends the running engine API key");
 
         var ordinary = engine with { ApiBase = endpoint + "v1", Launch = launch with { Arguments = ["model.ninfer", "--stats-port", "0"] } };
