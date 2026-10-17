@@ -6,12 +6,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <initializer_list>
-#include <memory>
 #include <vector>
 
 namespace ninfer {
-
-namespace core { class ResidentMemorySession; }
 
 struct DeviceSpan {
     void* data        = nullptr;
@@ -43,7 +40,6 @@ public:
 
 private:
     void require_range(std::size_t byte_offset, std::size_t count, const char* operation) const;
-    std::shared_ptr<core::ResidentMemorySession> resident_session_;
 };
 
 namespace core {
@@ -137,7 +133,6 @@ private:
     // arena while a borrowed rank is active frees storage this arena does not own and leaks the
     // rank-0 allocation it does.
     void* owned_base_ = nullptr;
-    std::shared_ptr<core::ResidentMemorySession> resident_session_;
 
     // Empty until a second rank is attached, so the single-device path carries no extra state and
     // no extra work.
@@ -161,7 +156,9 @@ public:
 private:
     void* data_       = nullptr;
     std::size_t size_ = 0;
-    std::shared_ptr<core::ResidentMemorySession> resident_session_;
+    // LOCAL PROTOTYPE (KVMem-style ring): true when `data_` came from std::malloc instead of
+    // cudaHostAlloc, so the destructor and the move operations release it the right way.
+    bool pageable_ = false;
 };
 
 using WorkspaceArena = DeviceArena;

@@ -28,4 +28,16 @@ void text_qk_norm_rope(const Tensor& positions, const RopeConfig& rope,
                        const Tensor& query, const Tensor& key, Tensor& normalized_query,
                        Tensor& normalized_key, const ops::RopeYarn& yarn, cudaStream_t stream);
 
+// LOCAL (KVMem content scoring, 2026-10-02): tell the norm/rope stage which full-attention layer and
+// which chunk width the NEXT text_qk_norm_rope call belongs to, and hand it the harvest round for the
+// chunk in progress. Inside that call, between the RMS-norm of K and the in-place RoPE, the pre-RoPE
+// key and query are copied into the harvest (the only place in the engine where those exist as
+// materialised tensors), which is what the mean-K index is built from.
+//
+// `harvest` is an opaque pointer on purpose: this header is included by several translation units and
+// must not drag the KVMem headers into them. Null = feature off, and then every added line is a no-op,
+// so the OFF arm stays bit-identical (raw_k_shadow_harvest_for() returns null when the switch is off).
+void text_set_kvmem_hook(std::int32_t layer_index, std::int32_t chunk_tokens,
+                         void* harvest) noexcept;
+
 } // namespace ninfer::models::qwen3_5::execution

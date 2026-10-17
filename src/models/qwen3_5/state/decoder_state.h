@@ -69,6 +69,7 @@ public:
     PagedKVCache(std::span<const DeviceSpan> backings, const PagedKVCacheLayout& layout);
     // Every plane and table on rank 0.
     PagedKVCache(DeviceSpan backing, const PagedKVCacheLayout& layout);
+    ~PagedKVCache();
 
     PagedKVCache(const PagedKVCache&)            = delete;
     PagedKVCache& operator=(const PagedKVCache&) = delete;
@@ -94,6 +95,13 @@ public:
     [[nodiscard]] PagedKVBatchLayerView batch_layer_view(std::uint32_t layer) const;
     // The rank holding this layer's KV planes, which is also the rank whose block table it reads.
     [[nodiscard]] std::size_t layer_rank(std::uint32_t layer) const;
+    // LOCAL PROTOTYPE (KVMem-style ring): per-request retrieval mask over 64-token KV pages, carried
+    // into every layer view the attention ops consume. nullptr (the default) selects every page,
+    // which reproduces the original dense behaviour bit-for-bit. The retrieval policy installs it
+    // once per request; the device bitmap must outlive the attention calls that read it.
+    void install_selection(std::span<const std::uint32_t> words);
+
+    void clear_selection() noexcept { selected_blocks_ = nullptr; }
 
 private:
     friend class PagedKVCacheView;
@@ -107,6 +115,9 @@ private:
     std::int32_t kv_heads_     = 0;
     std::int32_t head_dim_     = 0;
     KvCacheStorage storage_    = KvCacheStorage::BFloat16;
+    const std::uint32_t* selected_blocks_ = nullptr;
+    std::uint32_t* selection_device_      = nullptr;
+    std::size_t selection_words_          = 0;
 };
 
 struct DecoderStateLayout {

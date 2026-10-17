@@ -121,6 +121,36 @@ option(NINFER_PTXAS_VERBOSE "Print each kernel's registers and local-memory spil
 if(NINFER_PTXAS_VERBOSE)
   add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:-Xptxas=-v>)
 endif()
+# Guard the device half of nvcc's optimization state.
+#
+# nvcc's -O<n> / --optimize explicitly targets *host* code ("Specify optimization level for host
+# code", nvcc --help), and the -O values delivered via CMAKE_CUDA_FLAGS_<CONFIG> are wrapped in
+# -Xcompiler= anyway, so they never reach the device side. Measured on this machine (nvcc 13.4,
+# sm_120a, a 64-accumulator unrolled kernel): baseline / -O2 / -O3 all produced 80 registers, i.e.
+# -O<n> is a no-op for device code.
+#
+# What actually controls device optimization is -G / -dopt: "-G ... If --dopt is not specified, then
+# turns off all optimizations" and "-dopt ... When -G is not specified, -dopt=on is implicit". The
+# same measurement shows -G collapses that kernel from 80 to 22 registers, and -- importantly --
+# -O3 cannot undo it in any order: -G then -O3, -O3 then -G, and -O3 -G -O3 all stayed at 22.
+# Only -G -dopt=on returned to 80. So -dopt=on, not -O3, is the real counter to an accidental -G.
+#
+# The failure mode matters for this engine: -G pushes registers to local memory, and decode here is
+# memory-bound (see project notes), so a stray -G would silently wreck throughput while still
+# producing correct output -- exactly the kind of change that escapes review. Emitting -dopt=on is a
+# deliberate, visible marker that the device half is meant to be optimized; it is a no-op when no -G
+# is present (nvcc already implies it) and restores device optimization if someone ever adds -G.
+# Set NINFER_CUDA_DEVICE_OPT to empty to leave nvcc's own defaults untouched.
+set(NINFER_CUDA_DEVICE_OPT "-dopt=on" CACHE STRING
+    "Device-side nvcc optimization guard (-dopt=on; it is the only thing that undoes a stray -G); empty leaves nvcc's defaults")
+if(NOT NINFER_CUDA_DEVICE_OPT STREQUAL "")
+  add_compile_options($<$<COMPILE_LANGUAGE:CUDA>:${NINFER_CUDA_DEVICE_OPT}>)
+endif()
+# -lineinfo embeds per-instruction source line mappings in the cubin so Nsight can attribute
+# samples to source. It costs cubin size (and thus module load / I-cache pressure) without
+# affecting ptxas instruction selection. Keep it ON by default so profiling keeps working, but
+# allow a "clean" build for throughput A/B experiments (measure, do not assume it matters).
+option(NINFER_CUDA_LINEINFO "Embed device source line info for profilers (-lineinfo)" ON)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

@@ -11,6 +11,12 @@
 #include "models/qwen3_5/execution/visual_scatter.h"
 #include "models/qwen3_5/execution/vision.h"
 #include "models/qwen3_5/program/vision_control.h"
+// LOCAL (KVMem content scoring, 2026-10-02): index append + selection lifecycle, plus the page size
+// the pipeline works in (house rule: never hard-code 64 at a call site).
+#include "core/paged_kv_cache.h"
+#include "ops/kvmem/kvmem_score.h"
+#include "ops/kvmem/mean_k_index.h"
+#include "ops/kvmem/raw_k_harvest.h"
 #include "ninfer/ops/argmax.h"
 #include "ninfer/ops/attn_input_proj.h"
 #include "ninfer/ops/causal_conv1d_silu.h"
@@ -927,6 +933,18 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
     const Tensor& rope_positions =
         active_rope_positions_ != nullptr ? *active_rope_positions_ : io_.rope_pos;
     Tensor rope_for_op = active_sequence_batch_ != 0 ? rope_positions.view({T}) : rope_positions;
+    // LOCAL (KVMem content scoring, 2026-10-02): arm the pre-RoPE harvest for THIS layer before the
+    // norm/rope stage runs; it captures the normalised key and query in the two-line window before
+    // ops::rope overwrites them in place (attention.cpp). Null harvest = feature off => no-op.
+    //
+    // ONLY THE PREFILL PHASE: the harvest round is opened around a prefill chunk and its staging slots
+    // are sized by that chunk's width. The verify/MTP pass calls this same stage with its own token
+    // count (draft tokens), and an unguarded hook there harvested a 1-token key into a 4-token slot --
+    // the component throws on that mismatch by design, and the engine turned it into a worker crash
+    // (HTTP 500 on turn 2, measured 2026-10-02). Pass nullptr for every other phase so the static hook
+    // state can never leak into a pass it does not describe.
+    execution::text_set_kvmem_hook(fidx, T, ph == Phase::Prefill ? kvmem_harvest_ : nullptr);
+    kvmem_round_width_ = T;   // what the round really scored, for the tail-side oracle log
     text_qk_norm_rope(rope_for_op, *config_.rope_parameters, *config_.attention,
                       config_.rms_norm_eps, p.query_norm, p.key_norm, q, k, qn, kn, rope_yarn_,
                       s);
@@ -982,12 +1000,13 @@ void TextContext::attn_mix(const BlockParameters& w, Tensor& x, int fidx, Phase 
     }
     const bool wide = wide_residual_verification(ph, active_sequence_batch_, T, T);
     Tensor gated    = a.view({dimension(config_.attention->query_width()), T});
+    const GlpSteering glp = glp_steering();  // writer-level: remove this layer's direction
     if (rotated_output) {
         ops::sigmoid_mul_hadamard(gate, a, p.output.hadamard_signs, gated, s);
-        project_add(gated, p.output, x, work_, s, InputBasis::Rotated, wide);
+        project_add(gated, p.output, x, work_, s, InputBasis::Rotated, wide, glp);
         return;
     }
-    project_add(gated, p.output, x, work_, s, InputBasis::Primal, wide);
+    project_add(gated, p.output, x, work_, s, InputBasis::Primal, wide, glp);
 }
 
 void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase ph) {
@@ -1126,15 +1145,16 @@ void TextContext::gdn_mix(const BlockParameters& w, Tensor& x, int gidx, Phase p
                     .view({dimension(config_.gdn->linear_value_head_dim),
                            dimension(config_.gdn->linear_num_value_heads), T});
     Tensor normalized = on.view({dimension(config_.gdn->value_width()), T});
+    const GlpSteering glp = glp_steering();  // writer-level: remove this layer's direction
     if (rotated(p.output.hadamard_signs)) {
         ops::gated_rmsnorm_hadamard(o, p.norm, z, config_.rms_norm_eps, p.output.hadamard_signs,
                                     normalized, s);
-        project_add(normalized, p.output, x, work_, s, InputBasis::Rotated);
+        project_add(normalized, p.output, x, work_, s, InputBasis::Rotated, false, glp);
         return;
     }
     ops::gated_rmsnorm(o, p.norm, z, config_.rms_norm_eps, on, s);
     project_add(normalized, p.output, x, work_, s, InputBasis::Primal,
-                wide_residual_verification(ph, active_sequence_batch_, T, T));
+                wide_residual_verification(ph, active_sequence_batch_, T, T), glp);
 }
 
 ops::SparseMoeHints TextContext::next_projection_hints(int layer) const {
@@ -1146,17 +1166,29 @@ ops::SparseMoeHints TextContext::next_projection_hints(int layer) const {
 void TextContext::mlp_tail(const BlockParameters& weights, Tensor& x, Phase phase,
                            const ops::SparseMoeHints& hints) {
     Tensor h = workspace::post_mixer_hidden(work_, config_, x.ne[1]);
+    const GlpSteering glp = glp_steering();  // writer-level: remove this layer's direction
     if (const Tensor* signs = ffn_input_signs(weights.ffn)) {
         ops::rmsnorm_hadamard(x, weights.post_attention_norm, config_.rms_norm_eps, true, *signs, h,
                               ctx_.stream);
         ffn(h, weights.ffn, x, hints, work_, ctx_.stream, false, phase == Phase::Verify,
-            InputBasis::Rotated);
+            InputBasis::Rotated, false, glp);
         return;
     }
     ops::rmsnorm(x, weights.post_attention_norm, config_.rms_norm_eps, true, h, ctx_.stream);
     ffn(h, weights.ffn, x, hints, work_, ctx_.stream, false, phase == Phase::Verify,
         InputBasis::Primal,
-        wide_residual_verification(phase, active_sequence_batch_, x.ne[1], x.ne[1]));
+        wide_residual_verification(phase, active_sequence_batch_, x.ne[1], x.ne[1]), glp);
+}
+
+GlpSteering TextContext::glp_steering() const {
+    if (glp_state_ == nullptr || !glp_state_->enabled() || active_layer_ < 0) {
+        return GlpSteering{};
+    }
+    GlpSteering glp;
+    glp.direction = glp_state_->direction(active_layer_);
+    glp.alpha     = &glp_state_->alpha_tensor();
+    glp.active    = glp.direction.data != nullptr;
+    return glp;
 }
 
 TextContext::GdnShard TextContext::gdn_shard(std::uint32_t layer) const {
@@ -1195,6 +1227,7 @@ void TextContext::run_stage_layers(std::size_t stage, Tensor& x, Phase ph, Tap& 
         const auto& block  = parameters_.text.layers[layer];
         const bool full    = config_.layer_types[layer] == MixerKind::FullAttention;
         const auto compact = dimension(config_.compact_layer_indices[layer]);
+        active_layer_      = static_cast<std::int32_t>(layer);  // GLP steering index
         nvtx::ScopedRange layer_range(
             full ? (prefill ? nvtx::Name::PrefillLayerFull : nvtx::Name::VerifyLayerFull)
                  : (prefill ? nvtx::Name::PrefillLayerGdn : nvtx::Name::VerifyLayerGdn),
@@ -1751,6 +1784,84 @@ PrefillChunkResult TextContext::prefill_chunk(const qwen3_5::PreparedPromptData&
     const MultimodalPrefill multimodal{tokens, input.positions, &vision, begin, input.rope_delta};
     return prefill_impl(tokens.subspan(begin, nominal_length), nullptr, &multimodal, sink,
                         finalize_at_end);
+}
+
+// ---- LOCAL (KVMem content scoring, 2026-10-02) ------------------------------------------------
+// Round lifecycle for the mean-K content index. Mirrors the donor engine
+// (fusion: targets/qwen3_6/impl/runtime/text_prefill_impl.h:118-124 opens the round before the chunk
+// and :183-199 appends it afterwards) with the geometry taken from this object, where it lives.
+//
+// WHY THE ROUND OPENS BEFORE THE CHUNK: the score must describe HISTORY. This chunk's own blocks are
+// not in the index yet (they are appended at the tail), so `blocks_written()` read here IS the history
+// size -- the same reasoning the donor states at text_prefill_impl.h:126-130.
+//
+// WHY NOTHING HAPPENS WHEN THE SWITCH IS OFF: raw_k_shadow_harvest_for() returns null unless
+// NINFER_TERNARY_KVMEM is set, and every line below is then skipped. No allocation, no copy, no index
+// read: the OFF arm is the engine as it was.
+void TextContext::kvmem_round_begin() {
+    kvmem_harvest_     = nullptr;
+    kvmem_round_width_ = 0;
+    // LOCAL (KVMem query span, D-12, 2026-10-02): this chunk's ABSOLUTE token origin. The card is always
+    // configured with the chunk base (program/prefill.cpp passes state.text_kv_base to
+    // configure_text_card), so the absolute query span -- the last user turn, captured by the frontend
+    // -- can be intersected with THIS chunk inside the scorer. Set unconditionally and before the
+    // arming path: it is the intersection that needs it, and -1 (unknown) is what makes the scorer fall
+    // back to its tail rule.
+    ops::detail::kvmem_score_set_chunk_origin(static_cast<std::int32_t>(text_kv_base_));
+    if (batch_text_kv_ == nullptr) { return; }
+    const std::int32_t layers =
+        static_cast<std::int32_t>(batch_text_kv_->layers());   // full-attention layers only
+    const std::int32_t kv_heads =
+        static_cast<std::int32_t>(dimension(config_.attention->num_key_value_heads));
+    const std::int32_t head_dim = static_cast<std::int32_t>(dimension(config_.attention->head_dim));
+    const std::int32_t capacity_blocks = static_cast<std::int32_t>(
+        batch_text_kv_->max_context() / static_cast<std::uint32_t>(kPagedKVPageSize));
+    ops::RawKShadowHarvest* harvest =
+        ops::raw_k_shadow_harvest_for(prefill_chunk_, head_dim * kv_heads, layers);
+    if (harvest == nullptr) { return; }
+    harvest->begin_round();
+    harvest->set_round_origin(static_cast<std::int32_t>(text_kv_base_));
+    kvmem_harvest_ = harvest;
+    ops::MeanKIndex* index = ops::mean_k_index_for(layers, kv_heads, head_dim, capacity_blocks);
+    if (index == nullptr) { return; }
+    ops::detail::kvmem_score_begin(capacity_blocks, index->blocks_written(), index->tail_fill(),
+                                   static_cast<std::int32_t>(kPagedKVPageSize), layers,
+                                   static_cast<std::int32_t>(
+                                       dimension(config_.attention->num_attention_heads)),
+                                   kv_heads, head_dim, ctx_.stream);
+}
+
+// Tail of the chunk: the KV has been written, the raw K of this round is still in the harvest's
+// staging slots, so the index is fed from DEVICE memory on the same stream (no drain, no host round
+// trip -- the donor's text_prefill_impl.h:162-199 states the same reason). The first block of the
+// round is derived from the chunk base, never from a running counter: a counter drifts after a
+// re-prefill or a prefix reuse.
+void TextContext::kvmem_round_end() {
+    if (kvmem_harvest_ == nullptr) { return; }
+    auto* harvest = static_cast<ops::RawKShadowHarvest*>(kvmem_harvest_);
+    kvmem_harvest_ = nullptr;   // the hook must not write into a finished round
+    const std::int32_t layers =
+        static_cast<std::int32_t>(batch_text_kv_->layers());
+    const std::int32_t kv_heads =
+        static_cast<std::int32_t>(dimension(config_.attention->num_key_value_heads));
+    const std::int32_t head_dim = static_cast<std::int32_t>(dimension(config_.attention->head_dim));
+    const std::int32_t capacity_blocks = static_cast<std::int32_t>(
+        batch_text_kv_->max_context() / static_cast<std::uint32_t>(kPagedKVPageSize));
+    ops::MeanKIndex* index = ops::mean_k_index_for(layers, kv_heads, head_dim, capacity_blocks);
+    if (index != nullptr) {
+        const std::int32_t round_first_block =
+            static_cast<std::int32_t>(text_kv_base_ / static_cast<std::uint32_t>(kPagedKVPageSize));
+        index->append_round(*harvest, round_first_block, ctx_.stream);
+        // B08: hand this round's per-layer coverage to the scorer, so "layer 0 is in the index" shows
+        // up as a reading on the SELECT line instead of being something to assume.
+        ops::detail::kvmem_score_set_harvest_layers(harvest->layers_harvested(), harvest->layers());
+    }
+    // D2H + sync + selection, at the chunk tail and outside any capture (the glue's own contract).
+    ops::detail::kvmem_score_finish("text_prefill_chunk", kvmem_round_width_, ctx_.stream);
+    // Clear the process-wide hook state as well: this card is done with the round, and the static in
+    // attention.cpp must not describe a round that no longer exists (a later pass would otherwise see
+    // a stale armed width -- the mismatch that crashed the worker on turn 2, 2026-10-02).
+    execution::text_set_kvmem_hook(-1, 0, nullptr);
 }
 
 } // namespace ninfer::models::qwen3_5::execution

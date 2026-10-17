@@ -12,6 +12,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -195,6 +196,39 @@ private:
                  CacheParticipation cache_participation, DeadlinePolicy deadline_policy) const;
     [[nodiscard]] std::shared_ptr<RequestLifetime>
     acquire_request_lifetime(DeadlinePolicy deadline_policy) const;
+
+    // OVER-POOL WARNING. A prompt whose KV footprint exceeds the resident Device pool is the
+    // configuration under which a long prompt's MIDDLE was measured (5 independent reporters) to go
+    // missing with no error line, HTTP 200 and a plausible wrong answer. The root cause is NOT
+    // localized, so this makes NO claim about what goes wrong -- it removes the SILENCE, so no one
+    // can read a wrong answer as a good one.
+    //
+    // NOT once-only (changed 2026-10-02). The first version warned once per distinct
+    // (prompt, pool) page pair and then went quiet, so an operator who joined late -- or who simply
+    // scrolled past the first line -- had NO signal while every later over-pool request kept being
+    // answered wrong. Measured 2026-10-02: 3 consecutive over-pool requests produced exactly 1
+    // warning line. The acceptance criterion for this fix is that all 3 are visible, and the number
+    // of requests skipped in between is reported so the count is never lost either.
+    //
+    // Its state lives in the .cpp on purpose: adding a member here changes sizeof(GenerationService),
+    // which invalidates every translation unit that sees the class (9 of them) and turns a one-file
+    // change into a full rebuild. Measured 2026-10-02 -- that is exactly what happened.
+    void warn_on_prompt_over_pool(std::uint32_t prompt_tokens) const;
+
+    // Cached on FIRST USE, not at construction. Measured 2026-10-01: reading the pool from the
+    // GenerationService constructor kills the process silently right after "engine ready" --
+    // Engine::memory_summary() reaches the CoreState, and the core's `instance_.program` does not
+    // exist until the worker has started (the frozen binary, which never reads it that early, is
+    // servable on the same command line). By the time a request has been prepared the core is up,
+    // which is also the only moment the value is needed.
+    struct PoolSnapshot {
+        std::uint64_t pool_pages  = 0;  // resolved Device pool page groups
+        std::uint32_t pool_tokens = 0;  // resolved page-aligned KV capacity in tokens
+        std::uint32_t page_tokens = 0;  // tokens per page (pool_tokens / pool_pages)
+    };
+    [[nodiscard]] PoolSnapshot pool_snapshot() const;
+    mutable std::once_flag pool_once_;
+    mutable PoolSnapshot pool_snapshot_;
 
     ServeOptions options_;
     std::unique_ptr<ninfer::Engine> engine_;

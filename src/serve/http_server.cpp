@@ -264,6 +264,21 @@ HttpServer::HttpServer(ServeOptions options, std::shared_ptr<spdlog::logger> log
     server_.set_tcp_nodelay(true);
     server_.set_socket_options(configure_http_server_socket);
     server_.set_payload_max_length(options_.max_request_bytes);
+    // LOCAL (2026-10-02, long-request connection drops): cpp-httplib's defaults are 5 s for the
+    // keep-alive idle window and for the per-socket read/write timeouts
+    // (third_party/cpp-httplib/httplib.h:26 / :46 / :54). 5 s is far too aggressive for the shapes
+    // this server actually serves:
+    //   * a pooled client that spends seconds assembling a 90k-token prompt between calls comes back
+    //     to a socket we already closed; its transport error reads as "the server closed the
+    //     connection", and nothing appears in OUR log (observed 2026-10-02 on a 95k cold prefill);
+    //   * a large prompt body (hundreds of KB) uploaded by a slow client can exceed a 5 s read gap.
+    // Both bounds are safe here because keep-alive workers are capped separately
+    // (kKeepAliveWorkerHeadroom above) and by CPPHTTPLIB_KEEPALIVE_MAX_COUNT.
+    constexpr time_t kKeepAliveIdleSeconds       = 120;
+    constexpr time_t kRequestSocketTimeoutSecond = 300;
+    server_.set_keep_alive_timeout(kKeepAliveIdleSeconds);
+    server_.set_read_timeout(kRequestSocketTimeoutSecond);
+    server_.set_write_timeout(kRequestSocketTimeoutSecond);
     register_routes();
     if (options_.stats_port != 0) { register_stats_routes(); }
 }
@@ -394,6 +409,24 @@ httplib::Server::HandlerResponse HttpServer::pre_route(const httplib::Request& r
         // Weight load plus warmup measured ~10s on the 27B and longer on the 35B. Two seconds
         // is a polite poll interval rather than a promise about when readiness arrives.
         res.set_header("Retry-After", "2");
+        if (req.path.rfind("/v1/messages", 0) == 0) {
+            write_anthropic_error(res, error, new_anthropic_request_id());
+        } else {
+            write_openai_error(res, error);
+        }
+        return httplib::Server::HandlerResponse::Handled;
+    }
+    // A worker that already failed -- or a context cache wedged by three refusals in a row -- leaves
+    // the Engine unable to serve for the rest of the process's life. Answering 503 here turns the old
+    // shape ("/v1/models still 200, then every request 500s") into something a healthcheck can act
+    // on. /health keeps its own handler so probes still get {"status":"unavailable"}.
+    if (req.path != "/health" && service_ != nullptr && !service_->is_available()) {
+        ApiError error;
+        error.status  = 503;
+        error.type    = "engine_unavailable";
+        error.code    = "engine_unavailable";
+        error.message = "The engine worker is no longer available. Restart the process.";
+        res.set_header("Retry-After", "5");
         if (req.path.rfind("/v1/messages", 0) == 0) {
             write_anthropic_error(res, error, new_anthropic_request_id());
         } else {

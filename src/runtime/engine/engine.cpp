@@ -84,23 +84,6 @@ std::string context_capacity_error(std::size_t prompt_tokens, std::uint32_t max_
            " tokens, exceeding Engine max_context " + std::to_string(max_context);
 }
 
-CudaResidencySummary residency_summary(const runtime::ModelInstance& instance) {
-    if (!instance.residency) { return {}; }
-    // stats() reads the session's cached snapshot. HTTP threads never enter CUDA or PDH.
-    const auto stats = instance.residency->stats();
-    return {.enabled = true,
-            .verified = stats.verified,
-            .cuda_free_bytes = stats.cuda_free_bytes,
-            .cuda_total_bytes = stats.cuda_total_bytes,
-            .dedicated_bytes = stats.dedicated_bytes,
-            .shared_bytes = stats.shared_bytes,
-            .shared_baseline_bytes = stats.shared_baseline_bytes,
-            .device_allocated_bytes = stats.device_allocated_bytes,
-            .host_pool_bytes = stats.host_pool_bytes,
-            .host_used_bytes = stats.host_used_bytes,
-            .verified_reserve_bytes = stats.verified_reserve_bytes};
-}
-
 } // namespace
 
 class PreparedPrompt::Impl {
@@ -211,7 +194,14 @@ public:
         : options(runtime::normalize_engine_options(std::move(engine_options))),
           device(initialize_device(options)) {
         nvtx::ScopedRange load_range(nvtx::Name::EngineLoad, nvtx::Category::Runtime);
+        // Step markers: the startup phase line only prints when a phase COMPLETES, so a failure
+        // inside a phase used to be invisible (a null-engine access violation was the first sign).
+        // These four lines make the failing step nameable from the console log alone.
+        runtime::publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                                    "engine init | device ready, constructing model instance");
         auto constructed  = runtime::construct_model(options, device);
+        runtime::publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                                    "engine init | model instance ready");
         // construct_model returns the resolved options for this instance. Anything the model had
         // to derive (the single host RAM budget's Host split and long-anchor count) is only known
         // after planning, so the Engine adopts the resolved copy here — before the core that
@@ -223,22 +213,57 @@ public:
         model_metadata    = std::move(constructed.model_metadata);
         sampling_defaults = active->frontend.sampling_defaults();
         StartupPhaseScope finalize_phase(options.startup_observer, StartupPhase::EngineFinalize);
+        const char* core_kind = "generation";
         if (options.purpose == EnginePurpose::CausalScoring) {
-            core = std::make_unique<ScoringCore>(*active, device);
+            core_kind = "causal-scoring";
         } else if (options.context_cache.enabled &&
                    options.context_cache.mode == ContextCacheMode::Hybrid) {
-            core = std::make_unique<HybridGenerationCore>(*active, device, options,
-                                                          std::move(constructed.context_cost));
-        } else {
-            core = std::make_unique<GenerationCore>(*active, device, options,
-                                                    std::move(constructed.context_cost));
+            core_kind = "hybrid-generation";
         }
+        runtime::publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                                    "engine init | constructing core (%s)", core_kind);
+        // Graceful degradation: the host-backed / ring-capable cores are an OPTIONAL capability. On a
+        // machine where building them fails (driver/device dependent, and it is not always possible to
+        // reproduce locally), the engine used to take the whole process down -- either silently or, if
+        // the construction left the object half-built, as a bare access violation later. Fall back to
+        // the plain generation core and keep serving, with the reason printed.
+        try {
+            if (options.purpose == EnginePurpose::CausalScoring) {
+                core = std::make_unique<ScoringCore>(*active, device);
+            } else if (options.context_cache.enabled &&
+                       options.context_cache.mode == ContextCacheMode::Hybrid) {
+                core = std::make_unique<HybridGenerationCore>(*active, device, options,
+                                                              std::move(constructed.context_cost));
+            } else {
+                core = std::make_unique<GenerationCore>(*active, device, options,
+                                                        std::move(constructed.context_cost));
+            }
+        } catch (const std::exception& error) {
+            if (options.purpose == EnginePurpose::CausalScoring) { throw; }
+            runtime::publish_diagnostic(
+                options.diagnostic_observer, DiagnosticLevel::Warning,
+                "engine init | core (%s) construction FAILED: %s -- falling back to the plain "
+                "generation core (no host-backed reuse, no KVMem ring). Requests longer than the "
+                "device pool will be refused; raise --kv-capacity to cover them.",
+                core_kind, error.what());
+            try {
+                core = std::make_unique<GenerationCore>(*active, device, options,
+                                                        std::move(constructed.context_cost));
+                core_kind = "generation (fallback)";
+            } catch (const std::exception& fallback_error) {
+                runtime::publish_diagnostic(
+                    options.diagnostic_observer, DiagnosticLevel::Error,
+                    "engine init | fallback core ALSO failed: %s", fallback_error.what());
+                throw;
+            }
+        }
+        runtime::publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                                    "engine init | core ready (%s)", core_kind);
         finalize_phase.complete();
     }
 
     ~Impl() noexcept {
         device.bind_to_current_thread_noexcept();
-        core::ResidentMemoryBinding resident_binding(active ? active->residency : nullptr);
         const bool persists = persists_prefix_cache();
         if (persists) {
             runtime::publish_diagnostic(
@@ -251,7 +276,6 @@ public:
             device.synchronize();
         } catch (...) {}
         if (persists) { report_prefix_cache_save(); }
-        active.reset();
     }
 
     [[nodiscard]] bool persists_prefix_cache() const noexcept {
@@ -488,7 +512,7 @@ ModelMetadata Engine::model_metadata() const {
 
 MemorySummary Engine::memory_summary() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    MemorySummary summary = std::visit(
+    return std::visit(
         [](const auto& core) -> MemorySummary {
             using CoreState = std::remove_cvref_t<decltype(core)>;
             if constexpr (std::is_same_v<CoreState, std::monostate>) {
@@ -498,8 +522,6 @@ MemorySummary Engine::memory_summary() const {
             }
         },
         impl_->core);
-    summary.cuda_residency = residency_summary(*impl_->active);
-    return summary;
 }
 
 MediaCacheSummary Engine::media_cache_summary() const {
@@ -509,7 +531,7 @@ MediaCacheSummary Engine::media_cache_summary() const {
 
 RuntimeStats Engine::runtime_stats() const {
     if (impl_ == nullptr) { throw std::logic_error("Engine is moved from"); }
-    RuntimeStats summary = std::visit(
+    return std::visit(
         [](const auto& core) -> RuntimeStats {
             using CoreState = std::remove_cvref_t<decltype(core)>;
             if constexpr (std::is_same_v<CoreState, std::monostate>) {
@@ -519,8 +541,6 @@ RuntimeStats Engine::runtime_stats() const {
             }
         },
         impl_->core);
-    summary.cuda_residency = residency_summary(*impl_->active);
-    return summary;
 }
 
 bool Engine::is_available() const {

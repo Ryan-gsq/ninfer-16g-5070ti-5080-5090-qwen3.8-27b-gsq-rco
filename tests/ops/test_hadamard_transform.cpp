@@ -17,6 +17,18 @@ using namespace ninfer::test;
 
 namespace {
 
+// GCC/Clang expose __builtin_popcount; MSVC does not. The reference model below only needs the
+// parity of the popcount, so an explicit shift loop keeps one source for every toolchain and avoids
+// any <intrin.h>/MSVC-intrinsic dependency in a portable test.
+int popcount_parity(std::uint32_t value) {
+    int parity = 0;
+    while (value != 0U) {
+        parity ^= static_cast<int>(value & 1U);
+        value >>= 1U;
+    }
+    return parity;
+}
+
 constexpr int kBlock = 1024;
 
 // The transform is orthonormal, so FP32 butterflies add ~1e-6 relative error and the BF16 output
@@ -42,7 +54,8 @@ std::vector<double> hadamard_oracle(const std::vector<float>& input,
                     const double sign_before =
                         inverse ? 1.0 : static_cast<double>(signs[block * kBlock + j]);
                     const double value = static_cast<double>(input[base + j]) * sign_before;
-                    sum += (__builtin_popcount(static_cast<unsigned>(i & j)) & 1) ? -value : value;
+                    sum += (popcount_parity(static_cast<std::uint32_t>(i & j)) & 1) ? -value
+                                                                                   : value;
                 }
                 const double sign_after =
                     inverse ? static_cast<double>(signs[block * kBlock + i]) : 1.0;

@@ -37,7 +37,10 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         const std::int32_t* valid_columns, const std::int32_t* table_rows,
         std::int32_t table_stride, std::int32_t full_width, std::int32_t column_begin,
         std::int32_t logical_capacity, float attention_scale, float* partial_acc, float* partial_m,
-        float* partial_l) {
+        float* partial_l,
+        // LOCAL FIX (ring mask on the k8v4 route, 2026-10-02): the fp8/nvfp4 kernels were the only
+        // ones taking the retrieval bitmap; without it a demoted page is read from a recycled slot.
+        const std::uint32_t* selected_blocks) {
     constexpr int Wc                   = WarpsPerCta;
     constexpr int RowCount             = TokenTile * Geometry::GroupSize;
     constexpr int RowTiles             = (RowCount + 15) / 16;
@@ -396,6 +399,16 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             causal_small_t_tc_row_to_qt<Geometry>(row1, TokenTile, kv_head, q_head1, token1);
             const int qabs0 = row0 < RowCount ? positions[token0] : -1;
             const int qabs1 = row1 < RowCount ? positions[token1] : -1;
+            // LOCAL FIX (ring mask on the k8v4 route, 2026-10-02): same lambda as the fp8 decode
+            // route (small_t_fp8.cuh:409-415). Per-key masking, deliberately NOT the whole-tile skip:
+            // KeyBlock=32 means every 64-token page spans two tiles, so a tile skip is never
+            // page-aligned, and the fp8 tile-skip also needs its `alpha_s = 1.0` else-branch, which
+            // this kernel does not have (alpha_s is written under `if (warp < RowTiles)`).
+            const auto block_selected = [&](int key) {
+                if (selected_blocks == nullptr) { return true; }
+                const int page = key >> kPagedKVPageShift;
+                return ((selected_blocks[page >> 5] >> (page & 31)) & 1U) != 0U;
+            };
             float bm0       = -CUDART_INF_F;
             float bm1       = -CUDART_INF_F;
 #pragma unroll
@@ -404,19 +417,23 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                 const int key0 = k0 + col0;
                 const int key1 = key0 + 1;
                 score[nt][0] =
-                    row0 < RowCount && key0 >= split_start && key0 < split_end && key0 <= qabs0
+                    row0 < RowCount && key0 >= split_start && key0 < split_end && key0 <= qabs0 &&
+                            block_selected(key0)
                         ? score[nt][0] * attention_scale
                         : -CUDART_INF_F;
                 score[nt][1] =
-                    row0 < RowCount && key1 >= split_start && key1 < split_end && key1 <= qabs0
+                    row0 < RowCount && key1 >= split_start && key1 < split_end && key1 <= qabs0 &&
+                            block_selected(key1)
                         ? score[nt][1] * attention_scale
                         : -CUDART_INF_F;
                 score[nt][2] =
-                    row1 < RowCount && key0 >= split_start && key0 < split_end && key0 <= qabs1
+                    row1 < RowCount && key0 >= split_start && key0 < split_end && key0 <= qabs1 &&
+                            block_selected(key0)
                         ? score[nt][2] * attention_scale
                         : -CUDART_INF_F;
                 score[nt][3] =
-                    row1 < RowCount && key1 >= split_start && key1 < split_end && key1 <= qabs1
+                    row1 < RowCount && key1 >= split_start && key1 < split_end && key1 <= qabs1 &&
+                            block_selected(key1)
                         ? score[nt][3] * attention_scale
                         : -CUDART_INF_F;
                 bm0 = fmaxf(bm0, fmaxf(score[nt][0], score[nt][1]));

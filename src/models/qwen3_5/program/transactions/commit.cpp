@@ -16,6 +16,7 @@
 #include <stdexcept>
 #include <utility>
 #include <variant>
+#include <cstdio>
 
 namespace ninfer::models::qwen3_5::detail {
 
@@ -122,7 +123,25 @@ StartResult ProgramImpl::start_request(MaterializationTransaction& transaction) 
         detail::PhysicalResources actual         = owner_exclusive_resources(sequence);
         actual.device.active_lanes               = 1;
         const detail::PhysicalResources expected = active;
-        if (actual != expected) {
+        // LOCAL FIX (ring device footprint): in ring mode the Device KV is a resident
+        // window capped at the pool, so a demoted page makes the actual footprint smaller
+        // than the planned cap while the Host replica grows. Exact equality holds for the
+        // lane/state dims; the KV dims are bounded above by the plan and below by zero.
+        const bool ring_active =
+            text_kv_pages != nullptr && text_kv_addresses != nullptr &&
+            text_kv_pages->physical_pool().usable_pages() != 0 &&
+            text_kv_pages->physical_pool().usable_pages() <
+                text_kv_addresses->logical_page_capacity();
+        const bool kv_within =
+            actual.device.main_kv_pages <= expected.device.main_kv_pages &&
+            actual.device.backend_kv_pages <= expected.device.backend_kv_pages;
+        const bool match = ring_active
+                               ? (actual.device.active_lanes == expected.device.active_lanes &&
+                                  actual.device.state_slots == expected.device.state_slots &&
+                                  actual.host.state_slots == expected.host.state_slots &&
+                                  kv_within)
+                               : (actual == expected);
+        if (!match) {
             throw std::logic_error("materialized sequence does not match its active entitlement");
         }
         if (details.reuse != ReusePath::Root) {
@@ -730,6 +749,16 @@ bool ProgramImpl::salvage_continuation(SequenceState& state, RequestControl& req
         // materialization, so only a caught-up backend can be published.
         if (speculative_backend == SpeculativeBackend::DFlash &&
             state.dflash_context_frontier < frontier) {
+            return false;
+        }
+        // The same rule for MTP, which the Prefilling branch was missing: publishing a half-finished
+        // prefill as a continuation endpoint makes the next request plan a reuse it cannot
+        // materialize, and every retry re-plans the same way, so the session answers 500 forever
+        // (`published MTP checkpoint is not materializable`). Taken verbatim from the upstream fix,
+        // iamwavecut/ninfer-all PR #4 (merged 2026-10-03, commit 064ca424) -- the Active/Finishable
+        // branch below has carried this guard all along.
+        if (speculative_backend == SpeculativeBackend::Mtp &&
+            (!state.tail_hidden_valid || state.mtp_kv_valid + 1 < frontier)) {
             return false;
         }
     } else if (lifecycle == Lifecycle::Active || lifecycle == Lifecycle::Finishable) {

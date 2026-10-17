@@ -7,9 +7,9 @@
 #include "core/host_kv_clamp.h"
 #include "core/startup.h"
 #include "core/device.h"
-#include "core/resident_memory.h"
 #include <cuda_runtime.h>
 #include "ninfer/ops/target_logprobs.h"
+#include "ops/kvmem/kvmem_score.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -24,6 +24,8 @@
 #include <type_traits>
 #include <utility>
 #include <vector>
+#include <cstdlib>
+#include <cstdio>
 
 namespace ninfer::models::qwen3_5::detail {
 
@@ -189,14 +191,6 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
       context_transfer_timers_{CudaEventTimer(device_in, device_in.transfer_stream),
                                CudaEventTimer(device_in, device_in.transfer_stream),
                                CudaEventTimer(device_in, device_in.transfer_stream)} {
-    // The Program destructor does not run if its constructor throws. Synchronize before members
-    // unwind, so queued initialization/Graph work cannot retain pointers to freed arena backing.
-    struct StartupSyncGuard {
-        DeviceContext& device;
-        ~StartupSyncGuard() noexcept {
-            try { device.synchronize(); } catch (...) {}
-        }
-    } startup_sync{device};
     if (&parameters != plan.parameters || parameters.model.options() != plan.features) {
         throw std::invalid_argument("Program parameters do not match the frozen sequence plan");
     }
@@ -400,9 +394,17 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         // no plan accounts for (module loads, graph instantiation, launch-local backing); halving
         // what remains is the conservative split, so the cache never takes more than it leaves.
         std::size_t free_device = 0, total_device = 0;
+        // LOCAL PROTOTYPE (KVMem-style ring): pageable host memory is charged to system RAM only, so
+        // the WDDM-driven clamp does not apply to it. With pageable off this is exactly the original
+        // path - the clamp call is not removed, only guarded.
+        const char* pageable_env = std::getenv("NINFER_HOST_PAGEABLE");
+        const bool pageable =
+            pageable_env != nullptr && pageable_env[0] != '\0' && pageable_env[0] != '0';
         if (cudaMemGetInfo(&free_device, &total_device) == cudaSuccess) {
-            reserved_bytes =
-                clamp_host_kv_reservation_bytes(reserved_bytes, free_device, minimum_stride);
+            if (!pageable) {
+                reserved_bytes =
+                    clamp_host_kv_reservation_bytes(reserved_bytes, free_device, minimum_stride);
+            }
         }
 #endif
         StartupPhaseScope host_kv_phase(
@@ -427,6 +429,15 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
             // Nothing was pinned. Prefix reuse still works from device pages; only the host-side
             // spill is gone. `host_kv_arena` stays null, which every user of it already handles.
             reserved_bytes = 0;
+            if (ring_requested()) {
+                // LOCAL PROTOTYPE (KVMem-style ring): the ring's demotion target is this arena.
+                // Clamped to zero (Windows WDDM charges pinned host memory against VRAM), the ring
+                // has nowhere to demote to and will stay dense - say so instead of silently
+                // "working".
+                std::fprintf(stderr,
+                             "[ring] host_kv_arena is null (pinned host KV reservation clamped to "
+                             "zero). The ring has no demotion target and will run dense.\n");
+            }
         }
         host_kv_phase.complete(
             static_cast<std::uint64_t>(reserved_bytes),
@@ -541,26 +552,11 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     }
     if (use_cuda_graph) {
         StartupPhaseScope graph_phase(startup_observer, StartupPhase::CudaGraphPrepare);
-        const auto residency = core::current_resident_memory();
-        std::size_t dedicated_before = 0;
-        if (residency) {
-            residency->check("before Graph preparation");
-            dedicated_before = residency->stats().dedicated_bytes;
-        }
         const std::size_t free_before = device.free_bytes();
         prepare_graphs();
         device.synchronize();
         const std::size_t free_after = device.free_bytes();
         graph_measured_bytes         = free_before > free_after ? free_before - free_after : 0;
-        if (residency) {
-            // WDDM clamps CUDA free at zero once the process is over budget. Use
-            // the process's observed dedicated delta so Graph usage does not
-            // falsely become zero precisely when capacity is being stretched.
-            residency->check("after Graph preparation");
-            const auto dedicated_after = residency->stats().dedicated_bytes;
-            graph_measured_bytes = dedicated_after > dedicated_before
-                ? dedicated_after - dedicated_before : 0;
-        }
         graph_phase.complete();
     }
     work.reset();
@@ -645,6 +641,10 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
         if (text_kv_addresses->bound_row(*address) != 0) {
             throw std::logic_error("causal score did not bind the unique Main KV row");
         }
+        // B01 (Class B: needs Device pages but never made room): the causal-scoring lane mapped its
+        // predictor pages straight into the pool. Make room first, and fail this request readably if
+        // the pool cannot be drained.
+        ensure_ring_room(*text_kv_addresses, *text_kv_pages, *address, predictor_count, {});
         text_kv_addresses->ensure_mapped_to_tokens(*address, predictor_count, compute_streams);
 
         const std::int32_t state_slot = state_store->physical_slot(*state);
@@ -683,7 +683,8 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
             execution::PrefillContext schedule_state{
                 {device, parameters, work, state_images->linear(0), nullptr, io, prefill_hidden,
                  prefill_chunk, proposal_head, stage_runtime.get(), rope_yarn, fast_prefill_kernel,
-                 mtp_attention_window},
+                 mtp_attention_window,
+                 &parameters.text.glp},
                 decoder->text_kv.execution_view(text_kv_addresses->execution_row(*address)),
                 {},
                 decoder->text_kv,
@@ -697,6 +698,10 @@ std::vector<float> ProgramImpl::causal_score(PreparedPromptData&& prompt,
                 0,
                 nullptr};
             mark_workspace_usage(workspace_plan.text_prefill);
+            // LOCAL (KVMem query span, D-12, 2026-10-02): same publish as the ordinary prefill driver
+            // (program/prefill.cpp) -- every prefill path that owns a prompt publishes that prompt's
+            // span, so a span can never be stale from another request. See ops/kvmem/kvmem_score.h.
+            ops::detail::kvmem_score_set_query_span(prompt.query_span_begin, prompt.query_span_end);
             const execution::PrefillChunkResult result = execution::prefill_text_chunk(
                 schedule_state, std::span<const TokenId>(prompt.token_ids), nominal, std::nullopt,
                 false);

@@ -10,6 +10,7 @@
 #include "ninfer/ops/scalar.h"
 #include "ninfer/ops/scatter.h"
 #include "ninfer/ops/speculative_round.h"
+#include "ops/kvmem/kvmem_score.h"
 
 #include <algorithm>
 #include <array>
@@ -21,6 +22,7 @@
 #include <span>
 #include <stdexcept>
 #include <utility>
+#include <cstdio>
 
 namespace ninfer::models::qwen3_5::execution {
 namespace {
@@ -52,6 +54,7 @@ void configure_text_card(TextContext& card, const ExecutionCore& execution,
     card.set_gdn_state_action(GdnStateAction::UpdateInPlace, nullptr);
     card.set_mtp_proposal_extent(mtp_proposal_extent);
     card.set_fast_prefill_kernel(execution.fast_prefill_kernel);
+    card.set_glp_state(execution.glp_state);
     if (execution.proposal_head == ProposalHead::Full) {
         card.set_proposal_head(nullptr, nullptr, 0);
         return;
@@ -79,13 +82,22 @@ PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const Tok
     card.set_prefill_split_frontier(split_frontier ? static_cast<std::int64_t>(*split_frontier)
                                                    : -1);
     card.set_layer_ready(state.layer_ready);
+    // LOCAL (KVMem content scoring, 2026-10-02): open the harvest + scoring round BEFORE the chunk, so
+    // the index it scores against is history (this chunk is appended at the tail). No-op when the
+    // switch is off. The D2H in the tail half is only legal here -- outside any capture.
+    card.kvmem_round_begin();
     const std::span<const int> prompt(ids.data(), ids.size());
     if (state.dflash != nullptr) {
         DFlashFeatureSink sink = make_dflash_prefill_sink(state);
-        return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, finalize_at_end,
-                                  sink);
+        PrefillChunkResult result =
+            card.prefill_chunk(prompt, state.text_kv_base, nominal_length, finalize_at_end, sink);
+        card.kvmem_round_end();
+        return result;
     }
-    return card.prefill_chunk(prompt, state.text_kv_base, nominal_length, finalize_at_end);
+    PrefillChunkResult result =
+        card.prefill_chunk(prompt, state.text_kv_base, nominal_length, finalize_at_end);
+    card.kvmem_round_end();
+    return result;
 }
 
 PrefillChunkResult prefill_multimodal_chunk(PrefillContext& state, const PreparedPromptData& prompt,
@@ -664,7 +676,22 @@ void ProgramImpl::start_sequence(std::uint32_t lane, SequenceState& sequence,
                            prompt_tokens + (initial_mtp_extent == 0 ? 0U : initial_mtp_extent - 1U))
             : speculative_backend == SpeculativeBackend::DFlash ? prompt_tokens
                                                                 : 0U;
-        ensure_sequence_kv_mapped(sequence, prompt_tokens, backend_materialized);
+        // LOCAL PROTOTYPE (KVMem-style ring): map only the first prefill chunk here. The remaining
+        // chunks are mapped inside the prefill loop below, so the ring can recycle the oldest
+        // resident pages when the device pool is smaller than the context. When the pool covers the
+        // context this reduces to exactly the previous single up-front mapping.
+        const std::uint32_t initial_map = std::min(prompt_tokens, prefill_chunk);
+        // ADAPTATION (backend gate; master first-run 2026-09-30): K's up-front call passes
+        // `backend_tokens = initial_map` unconditionally. With no speculative backend (no --spec)
+        // the sequence has NO backend address at all (the plan's backend entitlement is 0, so
+        // materialization never creates one) and the entry's own guard then throws
+        // "backend KV materialization requested without an allocation" on the first chunked prompt.
+        // K's prefill-loop call already gates the same argument with `backend_kv_cache() != nullptr`,
+        // so this only applies K's own idiom to the up-front call.
+        ensure_sequence_kv_mapped(sequence, initial_map,
+                                  backend_kv_cache() != nullptr
+                                      ? (initial_map < prompt_tokens ? initial_map : backend_materialized)
+                                      : 0U);
         request.grammar                  = request_plan.grammar;
         request.first_token_top_logprobs = request_plan.first_token_top_logprobs;
         install_sampling(sequence, request, request_plan.sampling);
@@ -1089,7 +1116,8 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             {device, parameters, work, state_images->linear(0),
              replay_records ? &*replay_records : nullptr, io, prefill_hidden, prefill_chunk,
              proposal_head, stage_runtime.get(), rope_yarn, fast_prefill_kernel,
-             mtp_attention_window},
+             mtp_attention_window,
+             &parameters.text.glp},
             text_kv_view(sequence),
             mtp_kv_view(sequence),
             decoder->text_kv,
@@ -1119,6 +1147,15 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                 staged.cursor >= staged.prompt_tokens) {
                 throw std::logic_error("staged MTP bridge is outside the reusable suffix");
             }
+            // LOCAL FIX (mtp-bridge mapping): the bridge writes its draft KV at
+            // position base-1 and then publishes mtp_kv_valid = base. On a reused
+            // prefix the backend mapping is inherited from the source checkpoint,
+            // whose backend frontier is base-1: exactly base-1 tokens. When base-1
+            // is a page boundary (base % 64 == 1) the bridge token lands one page
+            // past the mapped range and the commit throws "KV committed frontier is
+            // invalid" (observed at 94465 and 117761, both %64==1). Extend the
+            // mapping to the bridge frontier BEFORE the bridge writes.
+            ensure_sequence_kv_mapped(sequence, staged.base, staged.base);
             mark_workspace_usage(workspace_plan.mtp_prefill);
             const Tensor& previous_hidden = sequence.tail_hidden;
             const execution::MtpBridgeInput bridge{
@@ -1157,6 +1194,15 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             std::uint32_t final_chunk_tokens = 0;
             bool finalized                   = false;
             while (remaining != 0) {
+                // LOCAL (KVMem query span, D-12, 2026-10-02): publish THIS prompt's absolute query span
+                // -- the last user turn, captured in token space by the frontend. The scorer intersects
+                // it with the chunk that contains it and skips the chunks that do not
+                // (ops/kvmem/kvmem_score.h). Published per chunk from the same prompt the chunk comes
+                // from; -1 (no user turn) deliberately OVERWRITES any previous value, because a stale
+                // span from another request would score the wrong tokens -- the exact failure class this
+                // whole instrument exists to remove.
+                ops::detail::kvmem_score_set_query_span(staged.prompt.query_span_begin,
+                                                        staged.prompt.query_span_end);
                 schedule_state.text_kv_base           = staged.cursor;
                 selectors                             = state_selectors(sequence);
                 schedule_state.state_source_slot      = selectors.source;
@@ -1193,6 +1239,14 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                 }
                 if (hybrid_split && (!split_frontier || *hybrid_split < *split_frontier)) {
                     split_frontier = *hybrid_split;
+                }
+                // LOCAL PROTOTYPE (KVMem-style ring): extend the KV mapping to the end of this
+                // chunk before it is written, so the ring recycles pages the mask has already
+                // excluded. No-op when the pool covers the context.
+                {
+                    const std::uint32_t chunk_end = staged.cursor + remaining;
+                    ensure_sequence_kv_mapped(sequence, chunk_end,
+                                              backend_kv_cache() != nullptr ? chunk_end : 0U);
                 }
                 execution::PrefillChunkResult result;
                 timing.pause();
@@ -1290,6 +1344,11 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
                 if (staged.mtp_bridge != MtpBridgeMode::AfterExactHit) {
                     throw std::logic_error("zero-suffix MTP reuse has no exact-hit bridge");
                 }
+                // LOCAL FIX (mtp-bridge mapping): same page-boundary skew as the
+                // BeforeSuffix bridge -- the bridge publishes mtp_kv_valid =
+                // prompt_tokens while the inherited backend mapping stops at
+                // prompt_tokens-1. Extend it first when the frontier is page+1.
+                ensure_sequence_kv_mapped(sequence, staged.prompt_tokens, staged.prompt_tokens);
                 mark_workspace_usage(workspace_plan.mtp_prefill);
                 const auto bridge_rope =
                     prompt_rope_position(staged.prompt, staged.prompt_tokens - 1);
@@ -1393,3 +1452,23 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
 
 
 } // namespace ninfer::models::qwen3_5::detail
+
+namespace ninfer::models::qwen3_5 {
+
+// LOCAL (KVMem query span, D-12, 2026-10-02): the definition behind the declaration in
+// frontend/prepared_prompt.h. It lives here because this TU already includes ops/kvmem/kvmem_score.h
+// (the frontend must not grow a CUDA/ops include just to reach the scorer).
+void kvmem_publish_query_span(std::int32_t begin, std::int32_t end) noexcept {
+    ops::detail::kvmem_score_set_query_span(begin, end);
+}
+
+// LOCAL (ActKV Sec. 8.1 semantic protection, 2026-10-16): the definition behind the declaration in
+// frontend/prepared_prompt.h. Same placement rationale as kvmem_publish_query_span above.
+void kvmem_publish_protect_spans(std::int32_t instruction_begin, std::int32_t instruction_end,
+                                 std::int32_t task_begin, std::int32_t task_end,
+                                 std::int32_t total_tokens) noexcept {
+    ops::detail::kvmem_publish_protect_spans(instruction_begin, instruction_end, task_begin,
+                                            task_end, total_tokens);
+}
+
+} // namespace ninfer::models::qwen3_5

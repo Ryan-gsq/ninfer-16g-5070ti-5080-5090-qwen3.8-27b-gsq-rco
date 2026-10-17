@@ -12,6 +12,7 @@
 #include <stdexcept>
 #include <utility>
 #include <vector>
+#include <cstdio>
 
 namespace ninfer::models::qwen3_5::detail {
 
@@ -342,6 +343,75 @@ std::optional<AdmissionCandidate> ProgramImpl::inspect_admission(
             throw std::logic_error("admission shared-prefix source is stale");
         }
         shared_state = &shared_prefix_states[ContractAccess::index(*shared_source)];
+    }
+    // LOCAL PROTOTYPE (KVMem-style ring): a reuse source with pages demoted to the Host cannot be
+    // adopted wholesale -- restoring every Host page at activation would need the whole logical
+    // context on the Device, which is exactly what the pool cannot hold. Decline the reuse so the
+    // planner falls back to a fresh root; the ring rebuilds the resident set during prefill.
+    // Sources that are fully Device-resident keep the normal fast reuse path.
+    // LOCAL FIX (scoped-reuse-decline): the prototype scanned the WHOLE source bundle, so any
+    // demoted tail vetoed every checkpoint from that source -- including anchors fully inside
+    // the resident region. Only the adopted checkpoint's own range matters (the tail beyond it
+    // is recomputed after reuse_base); demoted pages inside the range ride the existing H2D
+    // restore machinery, which fails loudly on unrestorable replicas instead of corrupting.
+    // The remaining static gate is capacity: a frontier the pool cannot hold at all still
+    // declines.
+    if (text_kv_addresses != nullptr && text_kv_pages != nullptr &&
+        (source_state != nullptr || shared_state != nullptr) && checkpoint.has_value()) {
+        const std::uint32_t need = kv_pages_for_frontier(checkpoint->frontier);
+        const std::uint32_t usable = text_kv_pages->physical_pool().usable_pages();
+        if (need > usable) {
+            // GATE (NINFER_KV_REUSE_HOSTBACKED): unset or "0" returns here exactly as before this
+            // change. With the gate on, a checkpoint whose range the pool cannot hold is still
+            // adoptable when every page the pool cannot keep is RECOVERABLE - Host-resident with a
+            // CURRENT Host replica - because the existing H2D path
+            // (`ProgramImpl::restore_kv_pages_from_host`, driven by the five-beat body) brings those
+            // back on demand. A page with no current replica anywhere keeps the decline and is named
+            // by its page numbers, so a bank-miss still names its gate. Release-side safety does not
+            // change: `HostKVStore::can_release_page_replica` (host_kv_store.h:278-283) already
+            // refuses to drop the Host replica of a page whose Device replica is gone while an address
+            // still references it.
+            if (!reuse_hostbacked_enabled()) { return std::nullopt; }
+            const SequenceKVBundle* source_kv =
+                source_state != nullptr
+                    ? (source_state->kv ? &*source_state->kv : nullptr)
+                    : (shared_state->kv ? &*shared_state->kv : nullptr);
+            if (source_kv == nullptr || !text_kv_addresses->valid(source_kv->text)) {
+                return std::nullopt;
+            }
+            const std::uint32_t mapped = text_kv_addresses->mapped_pages(source_kv->text);
+            const std::uint32_t limit  = need < mapped ? need : mapped;
+            std::uint32_t host_backed         = 0;
+            std::uint32_t unrecoverable       = 0;
+            std::uint32_t first_unrecoverable = 0;
+            std::uint32_t last_unrecoverable  = 0;
+            for (std::uint32_t page = 0; page < limit; ++page) {
+                const LogicalKVPageHandle logical =
+                    text_kv_addresses->logical_page(source_kv->text, page);
+                if (!text_kv_pages->valid(logical) || text_kv_pages->device_resident(logical)) {
+                    continue;
+                }
+                if (text_kv_pages->host_resident(logical) &&
+                    text_kv_pages->host_replica_current(logical)) {
+                    ++host_backed;
+                    continue;
+                }
+                if (unrecoverable == 0) { first_unrecoverable = page; }
+                last_unrecoverable = page;
+                ++unrecoverable;
+            }
+            if (unrecoverable != 0) {
+                std::fprintf(stderr,
+                             "[ninfer] adopt declined (host-backed gate): frontier=%u need=%u "
+                             "usable=%u host_backed=%u unrecoverable=%u first=%u last=%u\n",
+                             checkpoint->frontier, need, usable, host_backed, unrecoverable,
+                             first_unrecoverable, last_unrecoverable);
+                return std::nullopt;
+            }
+            std::fprintf(stderr,
+                         "[ninfer] adopt host-backed: frontier=%u need=%u usable=%u host_backed=%u\n",
+                         checkpoint->frontier, need, usable, host_backed);
+        }
     }
 
     std::optional<AdmissionCandidate> plan = inspect_lane(
@@ -2599,15 +2669,41 @@ bool ProgramImpl::isolated_request_feasible(const RequestBasePlan& base) const n
     const detail::PhysicalResources capacity = admission_capacity();
     const auto fits                          = [](detail::PhysicalResources value,
                          detail::PhysicalResources limit) noexcept {
-        return value.device.active_lanes <= limit.device.active_lanes &&
-               value.device.state_slots <= limit.device.state_slots &&
-               value.device.main_kv_pages <= limit.device.main_kv_pages &&
-               value.device.backend_kv_pages <= limit.device.backend_kv_pages &&
-               value.host.state_slots <= limit.host.state_slots &&
-               value.host.kv_bytes <= limit.host.kv_bytes;
+        // LOCAL PROTOTYPE (KVMem-style ring): Main KV is a LOGICAL address space that the
+        // allocator recycles through a smaller physical pool. A single request may therefore
+        // legitimately carry a logical page entitlement larger than the pool; the ring keeps
+        // the resident set within the pool. Clamp the logical demand to the pool for admission.
+        if (ring_requested() && value.device.main_kv_pages > limit.device.main_kv_pages) {
+            value.device.main_kv_pages = limit.device.main_kv_pages;
+        }
+        if (ring_requested() && value.device.backend_kv_pages > limit.device.backend_kv_pages) {
+            value.device.backend_kv_pages = limit.device.backend_kv_pages;
+        }
+        const bool ok =
+            value.device.active_lanes <= limit.device.active_lanes &&
+            value.device.state_slots <= limit.device.state_slots &&
+            value.device.main_kv_pages <= limit.device.main_kv_pages &&
+            value.device.backend_kv_pages <= limit.device.backend_kv_pages &&
+            value.host.state_slots <= limit.host.state_slots &&
+            value.host.kv_bytes <= limit.host.kv_bytes;
+        return ok;
     };
-    return fits(base.impl_->root_demand.physical_peak_additional, capacity) &&
-           fits(base.impl_->root_demand.final_added, capacity);
+    // LOCAL PROTOTYPE (KVMem-style ring): the Device KV pool is managed by the ring, so a request's
+    // logical page entitlement must not be compared against it. Clamping it to the pool does not
+    // work: the check is `used + added <= capacity`, so clamping `added` to `capacity` forces
+    // `used == 0` and rejects every request once the pool holds anything. Zero the dimension.
+    const bool ring = ring_requested() && text_kv_pages != nullptr && text_kv_addresses != nullptr &&
+                      text_kv_pages->physical_pool().usable_pages() <
+                          text_kv_addresses->logical_page_capacity();
+    detail::PhysicalResources peak  = base.impl_->root_demand.physical_peak_additional;
+    detail::PhysicalResources final = base.impl_->root_demand.final_added;
+    if (ring) {
+        peak.device.main_kv_pages     = 0;
+        peak.device.backend_kv_pages  = 0;
+        final.device.main_kv_pages    = 0;
+        final.device.backend_kv_pages = 0;
+    }
+    return fits(peak, capacity) && fits(final, capacity);
 }
 
 bool ProgramImpl::persistent_backfill_safe(
@@ -2637,6 +2733,10 @@ bool ProgramImpl::persistent_backfill_safe(
     const detail::PhysicalResources capacity = admission_capacity();
     const auto fits                          = [](detail::PhysicalResources value,
                          detail::PhysicalResources limit) noexcept {
+        // LOCAL PROTOTYPE (KVMem-style ring): see isolated_request_feasible.
+        if (ring_requested() && value.device.main_kv_pages > limit.device.main_kv_pages) {
+            value.device.main_kv_pages = limit.device.main_kv_pages;
+        }
         return value.device.active_lanes <= limit.device.active_lanes &&
                value.device.state_slots <= limit.device.state_slots &&
                value.device.main_kv_pages <= limit.device.main_kv_pages &&
@@ -2645,8 +2745,19 @@ bool ProgramImpl::persistent_backfill_safe(
                value.host.kv_bytes <= limit.host.kv_bytes;
     };
     const detail::PhysicalDemand& head = blocked_head.impl_->root_demand;
-    return fits(checked_resource_sum(borrowers, head.physical_peak_additional), capacity) &&
-           fits(checked_resource_sum(borrowers, head.final_added), capacity);
+    // LOCAL PROTOTYPE (KVMem-style ring): see isolated_request_feasible.
+    const bool ring = ring_requested() && text_kv_pages != nullptr && text_kv_addresses != nullptr &&
+                      text_kv_pages->physical_pool().usable_pages() <
+                          text_kv_addresses->logical_page_capacity();
+    detail::PhysicalResources peak  = checked_resource_sum(borrowers, head.physical_peak_additional);
+    detail::PhysicalResources final = checked_resource_sum(borrowers, head.final_added);
+    if (ring) {
+        peak.device.main_kv_pages     = 0;
+        peak.device.backend_kv_pages  = 0;
+        final.device.main_kv_pages    = 0;
+        final.device.backend_kv_pages = 0;
+    }
+    return fits(peak, capacity) && fits(final, capacity);
 }
 
 qwen3_5::PhysicalUsageSnapshot ProgramImpl::physical_usage() const noexcept {

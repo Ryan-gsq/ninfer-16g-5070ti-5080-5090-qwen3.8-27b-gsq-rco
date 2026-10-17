@@ -98,7 +98,25 @@ void dispatch_linear(const Tensor& x, const Weight& w, Tensor& out, LinearPolicy
         detail::q8_dispatch(x, w, out, policy, stream);
         return;
     case QType::T2_G128_FP16:
+        // NOTE: no PTQ1 switch here. This arm is PQ2's, unchanged, and the switch below is about
+        // PTQ1_0 only -- gating PQ2 on it would disable PQ2's int8 prefill whenever the switch is
+        // unset, which is its default. (I did exactly that once, with a blanket replace.)
         if (workspace != nullptr && detail::t2_a8_admits(policy) &&
+            detail::t2_a8_supported(w, x.ne[1])) {
+            detail::t2_a8_linear(x, w, out, *workspace, stream);
+            return;
+        }
+        detail::t2_dispatch(x, w, out, policy, stream);
+        return;
+    case QType::PTQ1_G128_FP16:
+        // PTQ1_0 now has an int8 route, and it is the SAME tile GEMM the T2 arm above uses, with a
+        // PTQ1 schedule and a direct base-3 -> int8 decode (no 2-bit relabelling anywhere, which is
+        // what the I line measured the repack costing on this rung). t2_a8_supported is the gate: it
+        // admits PTQ1 only on the Prefill verdict, because that route's small-T kernel reads 2-bit
+        // fields out of the code plane and would mis-decode PTQ1's five-trits-per-byte silently
+        // rather than fail. Its T <= 64 band therefore still goes to t2_dispatch, which owns
+        // t2_small_t_v2_ptq1 and the reference rung.
+        if (workspace != nullptr && detail::t2_ptq1_fast() && detail::t2_a8_admits(policy) &&
             detail::t2_a8_supported(w, x.ne[1])) {
             detail::t2_a8_linear(x, w, out, *workspace, stream);
             return;
@@ -157,6 +175,15 @@ std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_row
         (void)detail::select_t2_launch(output_rows, input_rows, min_tokens, policy);
         (void)detail::select_t2_launch(output_rows, input_rows, max_tokens, policy);
         return detail::t2_a8_workspace_bytes(output_rows, input_rows, policy, max_tokens);
+    case QType::PTQ1_G128_FP16:
+        // PTQ1_0's prefill band rides the int8 tile GEMM, so the arena must cover the int8 activation
+        // planes even though the T <= 64 band needs nothing at all. Returning 0 here would leave the
+        // arena too small the moment a prefill routes through t2_a8 -- and the failure would be a
+        // capture-time allocation, not a clear error. t2_a8_workspace_bytes is qtype-agnostic (the
+        // planes are the same shape either way), so this is the T2 arm's number.
+        (void)detail::select_t2_launch(output_rows, input_rows, min_tokens, policy);
+        (void)detail::select_t2_launch(output_rows, input_rows, max_tokens, policy);
+        return detail::t2_a8_workspace_bytes(output_rows, input_rows, policy, max_tokens);
     case QType::BF16:
         (void)detail::select_bf16_launch(output_rows, input_rows, min_tokens, policy);
         (void)detail::select_bf16_launch(output_rows, input_rows, max_tokens, policy);
@@ -187,3 +214,4 @@ void linear(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) 
 }
 
 } // namespace ninfer::ops
+

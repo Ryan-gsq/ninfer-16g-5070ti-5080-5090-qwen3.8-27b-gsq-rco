@@ -60,7 +60,14 @@ void causal_attention_prompt_k8v4_attention_dispatch(const Tensor& q, const Tens
 void causal_attention_prompt_k8v4_attention_launch(const Tensor& q, const Tensor& positions,
                                                    float scale, const PagedKVLayerView& cache,
                                                    Tensor& out, cudaStream_t stream) {
-    const PagedKVDirectMetadata metadata{static_cast<const std::int32_t*>(cache.block_table.data)};
+    // LOCAL FIX (ring mask on the k8v4 route, 2026-10-02): the k8v4 kernels never read the
+    // selection bitmap, so a page the ring demoted to host was still read through the block table --
+    // and because the freed Device slot is handed to the next new page, the demoted position was
+    // attended with ANOTHER page's K/V. Same expression as the fp8 route (prompt_fp8.cu:83-84):
+    // the per-request bitmap the ring installed, else the env prototype mask, else nullptr = dense.
+    const PagedKVDirectMetadata metadata{
+        static_cast<const std::int32_t*>(cache.block_table.data),
+        cache.selected_blocks != nullptr ? cache.selected_blocks : proto_selected_blocks()};
     causal_attention_prompt_k8v4_attention_dispatch(q, positions, scale, cache, metadata, out,
                                                     stream);
 }
@@ -78,6 +85,9 @@ void causal_attention_prompt_k8v4_launch(const Tensor& q, const Tensor& k, const
                 Masked ? static_cast<const std::int32_t*>(valid_columns.data) : nullptr,
             .table_rows   = static_cast<const std::int32_t*>(table_rows.data),
             .table_stride = cache.block_tables.ne[0],
+            // LOCAL FIX (ring mask on the k8v4 route, 2026-10-02): see the direct-route comment above.
+            .selected_blocks =
+                cache.selected_blocks != nullptr ? cache.selected_blocks : proto_selected_blocks(),
         };
         causal_attention_prompt_k8v4_attention_dispatch(q, positions, scale, cache, metadata, out,
                                                         stream);

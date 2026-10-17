@@ -211,6 +211,10 @@ std::string usage_text(const char* argv0) {
            "  --mtp-experts-q4              Qwen3.6-35B-A3B: store the MTP layer's routed\n"
            "                                experts in the text layers' formats\n"
            "  --gdn-state-fp16              keep the GDN recurrent state in FP16\n"
+           "  --glp-vector FILE             GLP direction stack (.glpbin); with --glp-alpha,\n"
+           "                                removes the per-layer direction from each writer\n"
+           "                                output before it enters the residual stream\n"
+           "  --glp-alpha F                 GLP projection strength, 0..4 (default 0: off)\n"
            "  --mlp-a8-decode               integer-activation MLP gate_up at decode and\n"
            "                                verify widths\n"
            "  --no-prefill-a8               return full prefill tiles to their A16 routes,\n"
@@ -391,6 +395,10 @@ Options parse_options(int argc, char** argv) {
             options.mtp_experts_q4 = true;
         } else if (arg == "--gdn-state-fp16") {
             options.gdn_state_fp16 = true;
+        } else if (arg == "--glp-vector") {
+            options.glp_vector = value(arg);
+        } else if (arg == "--glp-alpha") {
+            options.glp_alpha = parse_float(value(arg), "glp-alpha", 0.0F, 4.0F);
         } else if (arg == "--rope-yarn") {
             options.rope_yarn = true;
         } else if (arg == "--rope-yarn-factor") {

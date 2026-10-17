@@ -45,6 +45,8 @@ struct ExecutionCore {
     ops::RopeYarn rope_yarn;
     bool fast_prefill_kernel = false;
     std::uint32_t mtp_attention_window = 0;
+    // Optional GLP steering state. Null leaves every writer on the stock fused path.
+    const GlpState* glp_state = nullptr;
 };
 
 struct PrefillContext {

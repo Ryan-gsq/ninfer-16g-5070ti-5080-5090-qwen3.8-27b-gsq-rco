@@ -104,6 +104,15 @@ struct CheckpointSummary {
     runtime::ReplicaResidency state_residency = runtime::ReplicaResidency::DeviceOnly;
     TargetKVRequirement required_kv;
     runtime::PrefillWork rebuild_work;
+    // LOCAL FIX (host-backed checkpoint): how much of `required_kv`'s range is backed only by its
+    // CURRENT Host replica because the ring demoted it (the demotion is lossless: a Device replica is
+    // only dropped while the Host copy is current). 0 = every page Device-resident, the pre-existing
+    // case; > 0 means a reuse of this checkpoint must bring `host_backed_bytes` back over H2D with the
+    // existing `ProgramImpl::restore_kv_pages_from_host` before the range is usable. Recorded only for
+    // now: the publish gate (capture.cpp) already accepts such a range, and the adoption/restore step
+    // that consumes these numbers is a separate, later change.
+    std::uint32_t host_backed_pages = 0;
+    std::uint64_t host_backed_bytes = 0;
 
     [[nodiscard]] friend bool operator==(const CheckpointSummary&,
                                          const CheckpointSummary&) noexcept = default;

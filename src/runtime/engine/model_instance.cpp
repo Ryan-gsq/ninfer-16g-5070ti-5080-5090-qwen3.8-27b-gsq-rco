@@ -569,6 +569,20 @@ ConstructedModel construct_model(const EngineOptions& requested, DeviceContext& 
     auto instance = std::make_unique<ModelInstance>(std::move(model), options);
     instance->residency = residency;
     if (residency) { residency->verify_working_set(false); }
+    // GLP runtime steering: load the per-layer refusal directions and set the projection strength
+    // before any graph captures, so both the direction stack and alpha are stable device buffers.
+    // An empty vector leaves the state disabled (every writer stays on the stock fused path).
+    if (!options.glp_vector.empty()) {
+        const std::int32_t layer_count =
+            static_cast<std::int32_t>(instance->parameters.text.layers.size());
+        const std::int32_t width =
+            static_cast<std::int32_t>(instance->model->config().text.hidden_size);
+        instance->parameters.text.glp.load_from_npz(options.glp_vector, layer_count, width);
+        instance->parameters.text.glp.set_alpha(options.glp_alpha, device.rank(0).stream);
+        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                           "GLP steering: %d layers x %d, alpha %.3f (%s)", layer_count, width,
+                           static_cast<double>(options.glp_alpha), options.glp_vector.string().c_str());
+    }
     frontend.complete();
     StartupPhaseScope planning(options.startup_observer, StartupPhase::TargetFinalize);
     const std::size_t overlay_window_bytes =

@@ -19,6 +19,7 @@
 
 #include "ops/common/memory.cuh"
 #include "ops/common/mma.cuh"
+#include "ops/linear/t2/t2_ptq1_repack.cuh"
 #include "ops/linear/t2/t2_rowsplit_storage.cuh"
 
 #include <cuda_bf16.h>
@@ -26,11 +27,29 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
+#include <type_traits>
 
 namespace ninfer::ops::detail {
 
-template <int KWarps_, int TilesPerWarp_, int ColumnTiles_, int Stages_, int MinBlocks_>
+// kPtq1_ switches what the weight rows hold. false is the T2G128_F16S code plane: 32 two-bit code
+// bytes per 128-group, read straight into the A fragments. true is PTQ1_0: 24 base-3 bytes plus 2
+// tail bytes per group, which the staging REPACKS into the same 32 code bytes before any consumer
+// sees them -- so every line below the staging is the same code for both packings.
+//
+// Why repack rather than decode base-3 straight into the A fragment (which is what the I line's
+// equivalent kernel ended up doing): this kernel's A path derives all four fragment registers of a
+// k16 step from ONE 32-bit word, i.e. it requires sixteen codes of one group at ONE base-3 stage.
+// PTQ1_0's map does not give that -- weights 80..95 need stages 0 and 1, 96..111 stages 2 and 3, and
+// 112..127 stages 4 plus the qh tail's 0..3 -- so the word cannot be built without restructuring the
+// whole operand path. The I line paid that cost to save its own 2 KiB uint2 lut[256]; this A path
+// has no such table (two constant registers), so there is nothing here to save.
+//
+// The parameter defaults to false, so every existing instantiation -- and with it the entire T2
+// path -- is unchanged, byte for byte.
+template <int KWarps_, int TilesPerWarp_, int ColumnTiles_, int Stages_, int MinBlocks_,
+          bool kPtq1_ = false>
 struct T2SmallTv2Schedule {
+    static constexpr bool kPtq1              = kPtq1_;
     static constexpr int kWarps               = 8;
     static constexpr int kThreads             = kWarps * 32;
     static constexpr int kKWarps              = KWarps_;
@@ -49,6 +68,21 @@ struct T2SmallTv2Schedule {
     static constexpr int kStages    = Stages_;
     static constexpr int kMinBlocks = MinBlocks_;
 
+    // PTQ1_0 raw plane. The ARTIFACT keeps a row's slab as one contiguous run of 24-byte qs groups --
+    // which is 16-byte granular and therefore copies as cp.async -- with the 2-byte tails in the
+    // high plane, PLANE_ALIGNMENT away. So the two runs are staged separately and the repack stitches
+    // them; the qh run sits after the qs run inside the row, at kRawQhOffset.
+    static constexpr int kRawQhOffset     = kGroupsPerSlab * PTQ1RowSplitStorage::kCodeBytesPerGroup;
+    static constexpr int kRawQhBytes      = kGroupsPerSlab * PTQ1RowSplitStorage::kHighBytesPerGroup;
+    static constexpr int kRawRowStride    = (kRawQhOffset + kRawQhBytes + 15) / 16 * 16;
+    static constexpr int kRawChunksPerRow = kRawQhOffset / 16;
+    static_assert(!kPtq1 || (kRawQhOffset % 16) == 0,
+                  "the qs run must be whole 16-byte cp.async chunks");
+    static_assert(!kPtq1 || (kRawQhBytes == 4 || kRawQhBytes == 8),
+                  "the qh run is one cp.async of the slab's tail bytes");
+    static_assert(!kPtq1 || kCodeBytesPerRowSlab == kGroupsPerSlab * 32,
+                  "a repacked group must occupy exactly the 32 code bytes the A path reads");
+
     static_assert(kKWarps == 4 || kKWarps == 8, "T2 small-T v2 splits K over four or eight warps");
     static_assert(kTilesPerWarp == 1 || kTilesPerWarp == 2,
                   "T2 small-T v2 gives a warp one or two tiles");
@@ -57,7 +91,15 @@ struct T2SmallTv2Schedule {
     static_assert(kStages >= 1 && kStages <= 4, "T2 small-T v2 pipeline depth must fit cp_wait");
     static_assert(kMinBlocks >= 1, "T2 small-T v2 launch-bounds occupancy must be positive");
 
-    struct Stage {
+    // The raw planes only exist for the PTQ1 packing. Making them an empty base rather than a
+    // zero-length array keeps the T2 stage exactly the size and layout it has today (an empty base
+    // costs nothing), so nothing that depends on the T2 staging shifts by a byte.
+    struct Ptq1RawPlane {
+        __align__(16) std::uint8_t raw[kRows][kRawRowStride];
+    };
+    struct NoRawPlane {};
+
+    struct Stage : std::conditional_t<kPtq1, Ptq1RawPlane, NoRawPlane> {
         __align__(16) std::uint8_t codes[kRows][kCodeRowStride];
         __align__(16) std::uint8_t scales[kRows][kScaleBytesPerRowSlab];
     };
@@ -106,11 +148,13 @@ __device__ __forceinline__ void t2_v2_b_fragment(const uint4& xa, const uint4& x
     b1                      = __byte_perm(source.z, source.w, sel);
 }
 
+// `high` is the PTQ1_0 high plane and is null for the T2 packing, whose rows fit entirely in the
+// code plane.
 template <class Schedule>
 __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) void t2_small_t_v2_kernel(
     const __nv_bfloat16* __restrict__ x, const std::uint8_t* __restrict__ codes,
-    const std::uint8_t* __restrict__ scales, __nv_bfloat16* __restrict__ out, std::int32_t rows,
-    std::int32_t k, std::int32_t cols) {
+    const std::uint8_t* __restrict__ high, const std::uint8_t* __restrict__ scales,
+    __nv_bfloat16* __restrict__ out, std::int32_t rows, std::int32_t k, std::int32_t cols) {
     constexpr int kTpw    = Schedule::kTilesPerWarp;
     constexpr int kNt     = Schedule::kColumnTiles;
     constexpr int kKW     = Schedule::kKWarps;
@@ -130,8 +174,15 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) void t2_s
 
     const int groups_per_row = k / T2RowSplitStorage::kGroupK;
     const int slabs          = k / Schedule::kSlabK;
+    // A PTQ1_0 row is two runs with two strides: the 24-byte qs groups and the 2-byte qh tails, in
+    // different planes. A T2 row is one 32-byte-per-group run. (Which of the two is live is a
+    // compile-time property of the schedule, so this folds.)
     const std::int64_t code_row_bytes =
-        static_cast<std::int64_t>(groups_per_row) * T2RowSplitStorage::kCodeBytesPerGroup;
+        static_cast<std::int64_t>(groups_per_row) *
+        (Schedule::kPtq1 ? PTQ1RowSplitStorage::kCodeBytesPerGroup
+                         : T2RowSplitStorage::kCodeBytesPerGroup);
+    const std::int64_t high_row_bytes =
+        static_cast<std::int64_t>(groups_per_row) * PTQ1RowSplitStorage::kHighBytesPerGroup;
     const std::int64_t scale_row_bytes =
         static_cast<std::int64_t>(groups_per_row) * T2RowSplitStorage::kScaleBytesPerGroup;
     const int code_byte     = k_split * 16 + 4 * lid; // the lane's code word inside the row's slab
@@ -139,20 +190,49 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) void t2_s
     const int slice_k       = k_split * 64 + 16 * lid; // the lane's first k inside the slab
 
     const auto issue = [&](int stage_index, int slab) {
-        Stage& stage                   = shared.stages[stage_index];
-        constexpr int kChunksPerRow    = Schedule::kCodeBytesPerRowSlab / 16;
-        constexpr int kChunks          = Schedule::kRows * kChunksPerRow;
-        constexpr int kChunksPerThread = (kChunks + Schedule::kThreads - 1) / Schedule::kThreads;
+        Stage& stage = shared.stages[stage_index];
+        if constexpr (Schedule::kPtq1) {
+            // Stage the RAW PTQ1_0 bytes, not codes: the row's qs run as whole 16-byte cp.async
+            // chunks (which is exactly why the artifact keeps it contiguous) and its qh tail in one
+            // 4- or 8-byte chunk. Nothing is decoded on the way in -- the repack below runs in shared
+            // memory, after the bytes have landed.
+            constexpr int kChunksPerRow    = Schedule::kRawChunksPerRow;
+            constexpr int kChunks          = Schedule::kRows * kChunksPerRow;
+            constexpr int kChunksPerThread = (kChunks + Schedule::kThreads - 1) / Schedule::kThreads;
 #pragma unroll
-        for (int i = 0; i < kChunksPerThread; ++i) {
-            const int item = tid + i * Schedule::kThreads;
-            if (item < kChunks) {
-                const int r = item / kChunksPerRow;
-                const int c = item - r * kChunksPerRow;
-                cp_async<16, Cache::cg>(
-                    &stage.codes[r][c * 16],
-                    codes + static_cast<std::int64_t>(row0 + r) * code_row_bytes +
-                        static_cast<std::int64_t>(slab) * Schedule::kCodeBytesPerRowSlab + c * 16);
+            for (int i = 0; i < kChunksPerThread; ++i) {
+                const int item = tid + i * Schedule::kThreads;
+                if (item < kChunks) {
+                    const int r = item / kChunksPerRow;
+                    const int c = item - r * kChunksPerRow;
+                    cp_async<16, Cache::cg>(
+                        &stage.raw[r][c * 16],
+                        codes + static_cast<std::int64_t>(row0 + r) * code_row_bytes +
+                            static_cast<std::int64_t>(slab) * Schedule::kRawQhOffset + c * 16);
+                }
+            }
+            if (tid < Schedule::kRows) {
+                // ca, not cg: cp.async.cg is 16-byte only (see memory.cuh).
+                cp_async<Schedule::kRawQhBytes>(
+                    &stage.raw[tid][Schedule::kRawQhOffset],
+                    high + static_cast<std::int64_t>(row0 + tid) * high_row_bytes +
+                        static_cast<std::int64_t>(slab) * Schedule::kRawQhBytes);
+            }
+        } else {
+            constexpr int kChunksPerRow    = Schedule::kCodeBytesPerRowSlab / 16;
+            constexpr int kChunks          = Schedule::kRows * kChunksPerRow;
+            constexpr int kChunksPerThread = (kChunks + Schedule::kThreads - 1) / Schedule::kThreads;
+#pragma unroll
+            for (int i = 0; i < kChunksPerThread; ++i) {
+                const int item = tid + i * Schedule::kThreads;
+                if (item < kChunks) {
+                    const int r = item / kChunksPerRow;
+                    const int c = item - r * kChunksPerRow;
+                    cp_async<16, Cache::cg>(
+                        &stage.codes[r][c * 16],
+                        codes + static_cast<std::int64_t>(row0 + r) * code_row_bytes +
+                            static_cast<std::int64_t>(slab) * Schedule::kCodeBytesPerRowSlab + c * 16);
+                }
             }
         }
         if (tid < Schedule::kRows) {
@@ -179,6 +259,50 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocks) void t2_s
             cp_commit();
         }
         cp_wait<kStages - 1>();
+        __syncthreads();
+        if constexpr (Schedule::kPtq1) {
+            // Turn the staged raw bytes into the T2 code plane, in place, before anything reads it.
+            // No second buffer: the seven slots of a group own disjoint destination bytes, and the
+            // destination region is never staged into, so the pass is free to overwrite.
+            //
+            // Three divergence-free loops rather than one flat 7-way loop, because seven slots over
+            // 32 lanes puts lanes with different slots in one instruction and the slot branches then
+            // serialise. The I line wrote that split down and measured it; this keeps it.
+            //   slots 0..3: qs[4g..4g+4)      at stages 0..4 -> code bytes 4t+g
+            //   slots 4..5: qs[16+4p..20+4p)  at stages 0..4 -> code bytes 20+2t+p
+            //   slot 6    : the group's qh pair -> code bytes 30 and 31
+            //
+            // Every slot calls the adapter, so the repack arithmetic has exactly one home (and it is
+            // the home the rung gate covers: t2_ptq1_repack_slot_split vs t2_ptq1_repack_slot,
+            // 65,536/65,536 groups agree). This kernel only decides which thread owns which job.
+            Stage& staged = shared.stages[slab % kStages];
+            constexpr int kGroupCodeBytes = T2RowSplitStorage::kCodeBytesPerGroup;
+            constexpr int kGroupRawBytes  = PTQ1RowSplitStorage::kCodeBytesPerGroup;
+            constexpr int kGroupHighBytes = PTQ1RowSplitStorage::kHighBytesPerGroup;
+            constexpr int kUnits          = Schedule::kRows * Schedule::kGroupsPerSlab;
+            // A job is one (row, group) unit crossed with one slot; unit = job / kSlots, slot =
+            // job % kSlots, and the three loops differ only in how many slots they walk.
+            const auto run_slot = [&](int unit, int slot) {
+                const int r           = unit / Schedule::kGroupsPerSlab;
+                const int g           = unit - r * Schedule::kGroupsPerSlab;
+                std::uint8_t* dst     = &staged.codes[r][g * kGroupCodeBytes];
+                const std::uint8_t* qs = &staged.raw[r][g * kGroupRawBytes];
+                const std::uint8_t* qh = &staged.raw[r][Schedule::kRawQhOffset + g * kGroupHighBytes];
+                t2_ptq1_repack_slot_split(qs, qh, dst, slot);
+            };
+#pragma unroll
+            for (int job = tid; job < kUnits * 4; job += Schedule::kThreads) {
+                run_slot(job >> 2, job & 3);
+            }
+#pragma unroll
+            for (int job = tid; job < kUnits * 2; job += Schedule::kThreads) {
+                run_slot(job >> 1, 4 + (job & 1));
+            }
+#pragma unroll
+            for (int job = tid; job < kUnits; job += Schedule::kThreads) {
+                run_slot(job, 6);
+            }
+        }
         __syncthreads();
         const Stage& stage = shared.stages[slab % kStages];
 

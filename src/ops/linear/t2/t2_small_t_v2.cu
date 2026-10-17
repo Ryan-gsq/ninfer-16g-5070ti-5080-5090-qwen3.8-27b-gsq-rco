@@ -29,26 +29,30 @@ void launch(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) 
         throw std::invalid_argument("t2 small-T v2: unsupported shape");
     }
     const dim3 grid(static_cast<unsigned>(rows / Schedule::kRows), 1u, 1u);
+    // qhigh is the PTQ1_0 high plane and is null for every T2 weight, which is how the kernel knows
+    // it has nothing to stitch (see the kPtq1 branch of `issue`).
     t2_small_t_v2_kernel<Schedule><<<grid, Schedule::kThreads, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(x.data), static_cast<const std::uint8_t*>(w.qdata),
-        static_cast<const std::uint8_t*>(w.scales), static_cast<__nv_bfloat16*>(out.data), rows, k,
-        cols);
+        static_cast<const std::uint8_t*>(w.qhigh), static_cast<const std::uint8_t*>(w.scales),
+        static_cast<__nv_bfloat16*>(out.data), rows, k, cols);
     CUDA_CHECK(cudaGetLastError());
 }
 
-template <int ColumnTiles>
+// kPtq1 picks the weight packing, not the schedule: every row schedule runs both, and the only
+// difference is whether the staging repacks PTQ1_0 bytes into the code plane on the way in.
+template <int ColumnTiles, bool kPtq1>
 void launch_rows(V2Rows rows, const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
     switch (rows) {
     case V2Rows::R16:
-        return launch<T2SmallTv2Schedule<8, 1, ColumnTiles, 2, 6>>(x, w, out, stream);
+        return launch<T2SmallTv2Schedule<8, 1, ColumnTiles, 2, 6, kPtq1>>(x, w, out, stream);
     case V2Rows::R16Blocks4:
-        return launch<T2SmallTv2Schedule<8, 1, ColumnTiles, 2, 4>>(x, w, out, stream);
+        return launch<T2SmallTv2Schedule<8, 1, ColumnTiles, 2, 4, kPtq1>>(x, w, out, stream);
     case V2Rows::R32:
-        return launch<T2SmallTv2Schedule<4, 1, ColumnTiles, 2, 5>>(x, w, out, stream);
+        return launch<T2SmallTv2Schedule<4, 1, ColumnTiles, 2, 5, kPtq1>>(x, w, out, stream);
     case V2Rows::R32K8:
-        return launch<T2SmallTv2Schedule<8, 2, ColumnTiles, 2, 4>>(x, w, out, stream);
+        return launch<T2SmallTv2Schedule<8, 2, ColumnTiles, 2, 4, kPtq1>>(x, w, out, stream);
     case V2Rows::R64:
-        return launch<T2SmallTv2Schedule<4, 2, ColumnTiles, 2, 4>>(x, w, out, stream);
+        return launch<T2SmallTv2Schedule<4, 2, ColumnTiles, 2, 4, kPtq1>>(x, w, out, stream);
     }
     throw std::invalid_argument("t2 small-T v2: unknown row schedule");
 }
@@ -107,10 +111,28 @@ V2Rows rows_for(std::int32_t n, std::int32_t cols) {
 void launch_t2_small_t_v2(const Tensor& x, const Weight& w, Tensor& out, cudaStream_t stream) {
     const V2Rows rows = rows_for(out.ne[0], x.ne[1]);
     if (x.ne[1] <= 8) {
-        launch_rows<1>(rows, x, w, out, stream);
+        launch_rows<1, false>(rows, x, w, out, stream);
     } else {
-        launch_rows<2>(rows, x, w, out, stream);
+        launch_rows<2, false>(rows, x, w, out, stream);
     }
+}
+
+void launch_t2_small_t_v2_ptq1(const Tensor& x, const Weight& w, Tensor& out,
+                               cudaStream_t stream) {
+    const V2Rows rows = rows_for(out.ne[0], x.ne[1]);
+    if (x.ne[1] <= 8) {
+        launch_rows<1, true>(rows, x, w, out, stream);
+    } else {
+        launch_rows<2, true>(rows, x, w, out, stream);
+    }
+}
+
+std::int32_t t2_small_t_v2_max_columns() {
+    // kColumns is 8 * ColumnTiles for every row schedule, so the two-column instantiation is the
+    // widest and one assert pins the published number to it.
+    using Widest = T2SmallTv2Schedule<8, 1, 2, 2, 6>;
+    static_assert(Widest::kColumns == 16, "the published slice width must track the widest schedule");
+    return Widest::kColumns;
 }
 
 } // namespace ninfer::ops::detail

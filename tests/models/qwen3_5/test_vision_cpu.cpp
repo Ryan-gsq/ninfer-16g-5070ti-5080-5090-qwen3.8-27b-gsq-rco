@@ -1,3 +1,10 @@
+// MSVC defines M_PI (used by the GELU below) only when this is set BEFORE <cmath> is pulled in.
+// It must precede EVERY include in this file: <algorithm>/<atomic>/<bit> each reach <cmath>
+// through the library headers on a clean test build, which would otherwise freeze the flag too late.
+#ifndef _USE_MATH_DEFINES
+#define _USE_MATH_DEFINES
+#endif
+
 #include "models/qwen3_5/execution/vision_cpu.h"
 #include "models/qwen3_5/load/vision_cpu.h"
 #include "ops/quantized_weight.h"

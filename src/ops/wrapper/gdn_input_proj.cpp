@@ -259,16 +259,21 @@ void require_record_capacity_domain(std::int32_t batch_size, std::int32_t min_wi
 }
 
 void require_rowsplit(const Weight& weight, QType qtype, std::int32_t rows, const char* label) {
+    // Same rule as attn_input_proj: a ternary `qtype` names the FAMILY (T2 or PTQ1 are the same trits
+    // in two packings) and the required plane shape follows the member that actually arrived.
+    const bool ternary   = is_ternary(qtype);
     const bool no_high   = weight.qhigh == nullptr && weight.high_plane_bytes == 0;
+    const bool has_high  = weight.qhigh != nullptr && weight.high_plane_bytes != 0;
     const bool q4_planes = qtype != QType::Q4_G64_FP16 || no_high;
-    const bool t2_planes = qtype != QType::T2_G128_FP16 || no_high;
+    const bool ternary_planes =
+        !ternary || (weight.qtype == QType::T2_G128_FP16 ? no_high : has_high);
     const bool q5_planes =
         qtype != QType::Q5_G64_FP16 || (weight.qhigh != nullptr && weight.high_plane_bytes != 0);
-    const std::int32_t group = qtype == QType::T2_G128_FP16 ? 128 : 64;
-    if (weight.qtype != qtype || weight.layout != QuantLayout::RowSplit ||
-        weight.scale_dtype != DType::FP16 ||
+    const std::int32_t group = ternary ? 128 : 64;
+    if ((weight.qtype != qtype && !(ternary && is_ternary(weight.qtype))) ||
+        weight.layout != QuantLayout::RowSplit || weight.scale_dtype != DType::FP16 ||
         weight.group_size != static_cast<std::uint32_t>(group) || weight.group != group ||
-        !t2_planes || weight.ndim != 2 || weight.n != rows || weight.k != 5120 ||
+        !ternary_planes || weight.ndim != 2 || weight.n != rows || weight.k != 5120 ||
         weight.shape[0] != rows || weight.shape[1] != 5120 || weight.padded_shape[0] != rows ||
         weight.padded_shape[1] != 5120 || !q4_planes || !q5_planes ||
         !aligned_to(weight.qdata, 16) || !aligned_to(weight.scales, 4) ||
@@ -754,9 +759,24 @@ void require_split_profile(const Tensor& x, const Weight& qk_weight, const Weigh
 }
 
 bool t2_two_parent(const Weight& qk_weight, const Weight& value_z_weight) {
-    const bool qk = qk_weight.qtype == QType::T2_G128_FP16;
-    if (qk != (value_z_weight.qtype == QType::T2_G128_FP16)) {
-        throw std::invalid_argument("gdn_input_proj: the two parents must share the T2 format");
+    const bool qk = is_ternary(qk_weight.qtype);
+    const bool vz = is_ternary(value_z_weight.qtype);
+    // The I line's require_ternary_split_parents rule, verbatim in substance: BOTH parents ternary and
+    // the same format.
+    // B26 fix (2026-10-07): that rule is about the TERNARY pair only. Two NON-ternary parents of
+    // DIFFERENT formats are the documented split profile -- require_split_profile() just below demands
+    // qk=Q4_G64_FP16 and value/z=Q5_G64_FP16 -- so that combination must return false, not throw. Before
+    // this fix the predicate rejected the very shape the shape checks require, and every test that built
+    // it died on an uncaught std::invalid_argument (0xC0000409, no output). A mixed ternary /
+    // non-ternary pair, and two ternary parents of different formats, still throw: admitting them would
+    // run one packing's arithmetic over the other's bytes.
+    if (qk != vz) {
+        throw std::invalid_argument(
+            "gdn_input_proj: both ternary split parents must use the same format");
+    }
+    if (qk && qk_weight.qtype != value_z_weight.qtype) {
+        throw std::invalid_argument(
+            "gdn_input_proj: both ternary split parents must use the same format");
     }
     return qk;
 }
@@ -780,10 +800,15 @@ void t2_two_parent_project(const Tensor& x, const Weight& qk_weight, const Weigh
     require_rowsplit(qk_weight, QType::T2_G128_FP16, kQkRows, "qk weight");
     require_rowsplit(value_z_weight, QType::T2_G128_FP16, kValueRows + kZRows, "value/z weight");
     auto scope = workspace.scope();
-    if (detail::t2_a8_admits(policy) && detail::t2_a8_supported(qk_weight, cols) &&
+    if (detail::t2_a8_pair_enabled() && detail::t2_a8_admits(policy) &&
+        detail::t2_a8_supported(qk_weight, cols) &&
         detail::t2_a8_supported(value_z_weight, cols)) {
         // One quantisation of x; q/k and value land in qkv directly and z in its own plane.
-        const auto activations = detail::t2_a8_quantize(x, workspace, stream);
+        // ⚠️ The quantiser MUST be told the format the projections will use (落点表 §28.28): PTQ1_0's
+        // tile floor is below T2's, so at a width both bands accept a PTQ1 weight projects through the
+        // tile while a format-blind quantiser lays the same planes out for the small-T band.
+        const auto activations = detail::t2_a8_quantize(
+            x, workspace, stream, qk_weight.qtype == QType::PTQ1_G128_FP16);
         detail::t2_a8_project_split_pair(activations, {qk_weight, qkv, 0, kQkRows, qkv, 0},
                                          {value_z_weight, qkv, kQkRows, kValueRows, z, 0}, stream);
         return;
@@ -814,6 +839,25 @@ std::size_t t2_two_parent_projection_bytes(std::int32_t min_columns, std::int32_
         WorkspaceLayoutBuilder layout;
         if (!detail::t2_a8_admits(policy) ||
             !detail::t2_a8_layout_activations(layout, 5120, columns)) {
+            // a8 route not taken: the BF16 fallback planes are what the launch actually allocates.
+            (void)layout.alloc(DType::BF16, {4096, columns});
+            (void)layout.alloc(DType::BF16, {6144, columns});
+        } else {
+            // ⚠️ The a8 question above is a WIDTH question, but whether this MODEL takes that route is a
+            // FORMAT question: t2_a8_supported refuses PTQ1_0 below its own tile floor, so a PTQ1 model
+            // falls back to the two BF16 planes t2_two_parent_project allocates -- and a format-blind
+            // capacity call had reserved only the a8 planes. At T=1 the gap hid inside the arena's slack,
+            // at T>=65 the a8 route was taken anyway, and it surfaced exactly at the
+            // speculative-verify width (T=5: "text/layers/0 verify columns=5: bad allocation").
+            // Reserving the fallback planes as well is a superset at these row counts (the registered
+            // pair's 4096 + 6144 rows of BF16 per column against the int8 tile's 5120 bytes), so
+            // whichever route the launch takes is covered. The row counts are the registered GDN pair's
+            // (kQkRows/kValueRows are variant-local further down this file and not visible here).
+            // B29 fix (2026-10-07): these two lines used to run UNCONDITIONALLY, so on the branch above
+            // the very same two planes were allocated a second time and layout.peak_bytes() came out
+            // exactly 2x the true need -- measured `gdn_input_proj_conv_record`: query 122,880 vs
+            // execution peak 81,920 at T2/B1/T=2, and the gap was always 10240 channels x columns x 2
+            // bytes. They belong to the a8 branch only.
             (void)layout.alloc(DType::BF16, {4096, columns});
             (void)layout.alloc(DType::BF16, {6144, columns});
         }
@@ -869,10 +913,10 @@ std::size_t gdn_input_proj_split_workspace_capacity_bytes(
     if (min_tokens <= 0 || max_tokens < min_tokens) {
         throw std::invalid_argument("gdn_input_proj workspace: invalid token interval");
     }
-    if (qk_qtype == QType::T2_G128_FP16 || value_z_qtype == QType::T2_G128_FP16) {
+    if (is_ternary(qk_qtype) || is_ternary(value_z_qtype)) {
         if (qk_qtype != value_z_qtype || qk_rows != 4096 || value_z_rows != 12288 ||
             input_rows != 5120) {
-            throw std::invalid_argument("gdn_input_proj workspace: unregistered T2 pair");
+            throw std::invalid_argument("gdn_input_proj workspace: unregistered ternary pair");
         }
         return t2_two_parent_projection_bytes(min_tokens, max_tokens, policy);
     }
@@ -1034,7 +1078,7 @@ std::size_t gdn_input_proj_split_conv_snapshot_workspace_capacity_bytes(QType qk
 std::size_t gdn_input_proj_split_conv_snapshot_workspace_capacity_bytes(
     QType qk_qtype, QType value_z_qtype, LinearPolicy policy, std::int32_t batch_size,
     std::int32_t min_width, std::int32_t max_width) {
-    if (qk_qtype == QType::T2_G128_FP16 && value_z_qtype == QType::T2_G128_FP16) {
+    if (is_ternary(qk_qtype) && is_ternary(value_z_qtype)) {
         require_snapshot_capacity_domain(batch_size, min_width, max_width);
         const std::int32_t columns = std::max(batch_size, 1) * max_width;
         return composed_snapshot_capacity(
@@ -1060,7 +1104,7 @@ std::size_t gdn_input_proj_split_conv_record_workspace_capacity_bytes(QType qk_q
 std::size_t gdn_input_proj_split_conv_record_workspace_capacity_bytes(
     QType qk_qtype, QType value_z_qtype, LinearPolicy policy, std::int32_t batch_size,
     std::int32_t min_width, std::int32_t max_width) {
-    if (qk_qtype == QType::T2_G128_FP16 && value_z_qtype == QType::T2_G128_FP16) {
+    if (is_ternary(qk_qtype) && is_ternary(value_z_qtype)) {
         require_record_capacity_domain(batch_size, min_width, max_width);
         return t2_two_parent_projection_bytes(std::max(batch_size, 1) * min_width,
                                               std::max(batch_size, 1) * max_width, policy);

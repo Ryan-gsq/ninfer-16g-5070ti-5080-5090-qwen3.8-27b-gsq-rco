@@ -93,7 +93,10 @@ CONTIGUOUS_LE_V1 = Layout("contiguous_le_v1", 256, frozenset(("bf16", "fp32", "i
 ROW_SPLIT_K128_V1 = Layout(
     "row_split_k128_v1",
     256,
-    frozenset(("q4_g64_fp16", "q5_g64_fp16", "q6_g64_fp16", "q8_g32_fp16", "t2_g128_fp16")),
+    frozenset(
+        ("q4_g64_fp16", "q5_g64_fp16", "q6_g64_fp16", "q8_g32_fp16", "t2_g128_fp16",
+         "ptq1_g128_fp16")
+    ),
 )
 BLOCK_SCALE_K16_M128X4_V1 = Layout(
     "block_scale_k16_m128x4_v1",
@@ -179,13 +182,25 @@ def row_split_geometry(
     n, k = _shape(shape, rank=2)
     k_pad = align_up(k, K_ALIGNMENT)
     groups_per_row = k_pad // spec.group_size
-    # 2- and 8-bit codes pack whole; 4/5/6-bit codes keep a 4-bit base plane plus a high plane.
-    base_bytes_per_group = (
-        spec.group_size * spec.bits // 8 if spec.bits in (2, 8) else spec.group_size // 2
-    )
-    high_bytes_per_group = (
-        0 if spec.bits in (2, 4, 8) else spec.group_size * (spec.bits - 4) // 8
-    )
+    if spec.name == "ptq1_g128_fp16":
+        # PTQ1_0 is a third packing and fits NEITHER formula below: base-3 digits staged five per
+        # byte (24 bytes) plus a 2-byte tail, which is 1.75 bits per weight and so not expressible
+        # as `bits` at all. Named explicitly, exactly as the engine's row_split_format names it, so
+        # the container and the engine cannot end up describing the same artifact differently.
+        # A partial trailing group cannot be staged at all, so K must be whole 128-groups; T2 gets
+        # away with padding because its codes pack per byte, this one does not.
+        if k % spec.group_size:
+            raise ValueError("row_split_k128_v1 ptq1_g128_fp16 requires K to be whole 128-groups")
+        base_bytes_per_group = 24
+        high_bytes_per_group = 2
+    else:
+        # 2- and 8-bit codes pack whole; 4/5/6-bit codes keep a 4-bit base plane plus a high plane.
+        base_bytes_per_group = (
+            spec.group_size * spec.bits // 8 if spec.bits in (2, 8) else spec.group_size // 2
+        )
+        high_bytes_per_group = (
+            0 if spec.bits in (2, 4, 8) else spec.group_size * (spec.bits - 4) // 8
+        )
     base_row_bytes = groups_per_row * base_bytes_per_group
     high_row_bytes = groups_per_row * high_bytes_per_group
     scale_row_bytes = groups_per_row * 2

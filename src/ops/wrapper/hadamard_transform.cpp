@@ -4,6 +4,7 @@
 #include "ninfer/ops/rmsnorm.h"
 
 #include "ops/launcher/hadamard_transform.h"
+#include "ops/launcher/embed_gather.h" // embed_gather_ptq1_launch (the unrotated-gather half)
 
 #include <cmath>
 #include <cstdint>
@@ -239,14 +240,30 @@ void embedding_rotated(const Tensor& ids, const Weight& table, const Tensor& sig
     if (out.ne[0] != width || out.ne[1] != ids.ne[0] || out.ne[2] != 1 || out.ne[3] != 1) {
         throw std::invalid_argument("embedding_rotated: out must be [K, T] with K the sign width");
     }
-    if (table.qtype != QType::T2_G128_FP16 || table.layout != QuantLayout::RowSplit ||
+    // The ternary family. The plane expectation follows the member: T2 carries no high plane,
+    // PTQ1_0 carries two bytes per 128-group.
+    const bool ptq1 = table.qtype == QType::PTQ1_G128_FP16;
+    if (!is_ternary(table.qtype) || table.layout != QuantLayout::RowSplit ||
         table.qdata == nullptr || table.scales == nullptr || table.k != width || table.n <= 0 ||
-        table.scale_dtype != DType::FP16 || !aligned4(table.qdata)) {
+        table.scale_dtype != DType::FP16 || !aligned4(table.qdata) ||
+        (ptq1 ? table.qhigh == nullptr
+              : (table.qhigh != nullptr || table.high_plane_bytes != 0))) {
         throw std::invalid_argument(
-            "embedding_rotated: table must be a row-split t2_g128_fp16 [vocab, K] weight");
+            "embedding_rotated: table must be a row-split ternary [vocab, K] weight");
     }
     if (ids.ne[0] == 0) { return; }
-    detail::embedding_rotated_t2_launch(ids, table, signs, out, stream);
+    if (!ptq1) {
+        detail::embedding_rotated_t2_launch(ids, table, signs, out, stream);
+        return;
+    }
+    // PTQ1_0 has no fused rotated-gather kernel, and cannot share T2's: the T2 kernel decodes eight
+    // codes out of one 16-bit word, while a PTQ1_0 trit's position depends on which base-3 stage it
+    // belongs to (weights < 80 come out of qs[0..16), 80..119 out of qs[16..24), the rest out of the
+    // qh tail), so no such word exists for it. The I line solved this in two steps and master
+    // already owns the second one: gather into the primal layout, then the in-place inverse
+    // Hadamard -- which hadamard_transform.h documents as bit-for-bit what the fused routes produce.
+    detail::embed_gather_ptq1_launch(ids, table, out, stream);
+    detail::hadamard_transform_launch(out, signs, /*inverse=*/true, out, stream);
 }
 
 } // namespace ninfer::ops

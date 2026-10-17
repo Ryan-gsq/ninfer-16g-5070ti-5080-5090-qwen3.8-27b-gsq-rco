@@ -40,9 +40,35 @@ std::size_t rotated_dense_workspace_bytes(const DenseParameters& p, std::int32_t
     return layout.peak_bytes(1);
 }
 
+// GLP variant of the rotated Dense FFN sizing. It mirrors rotated_dense_ffn's steering path
+// exactly: the gate/up plane stays live while the silu activation and the materialised
+// down-projection output ({down.n, last}) are both resident, and the down projection uses
+// ops::linear (not the fused linear_add), so its private workspace is sized for the plain policy.
+// This peak is strictly larger than the stock rotated Dense peak; sizing with the stock value
+// would let the projected write overflow the arena.
+std::size_t rotated_dense_glp_workspace_bytes(const DenseParameters& p, std::int32_t first,
+                                              std::int32_t last, bool wide_verification) {
+    const auto& gu   = p.gate_up.weight;
+    const auto& down = p.down.weight;
+    WorkspaceLayoutBuilder layout;
+    (void)layout.alloc(DType::BF16, {gu.n, last}); // plane (live for the whole FFN)
+    {
+        auto scope = layout.scope();
+        (void)layout.alloc_bytes(
+            rotated_workspace_bytes(p.gate_up.hadamard_signs, gu.k, last,
+                                    ops::linear_workspace_capacity_bytes(
+                                        gu.qtype, gu.n, gu.k, p.gate_up.policy, first, last)));
+    }
+    (void)layout.alloc(DType::BF16, {gu.n / 2, last});                            // activation (live)
+    (void)layout.alloc(DType::BF16, {down.n, last});                              // projected (live)
+    (void)layout.alloc_bytes(ops::linear_workspace_capacity_bytes(                // down linear ws
+        down.qtype, down.n, down.k, p.down.policy, first, last));
+    return layout.peak_bytes(1);
+}
+
 void rotated_dense_ffn(const Tensor& hidden, const DenseParameters& p, Tensor& residual,
                        WorkspaceArena& workspace, cudaStream_t stream, InputBasis basis,
-                       bool wide_verification) {
+                       bool wide_verification, const GlpSteering& glp) {
     const auto columns      = hidden.ne[1];
     const auto& gu          = p.gate_up.weight;
     const auto intermediate = gu.n / 2;
@@ -59,6 +85,13 @@ void rotated_dense_ffn(const Tensor& hidden, const DenseParameters& p, Tensor& r
         ops::silu_mul(plane.slice(0, 0, intermediate), plane.slice(0, intermediate, intermediate),
                       activation, stream);
     }
+    if (glp.applies()) {
+        Tensor projected = workspace.alloc(DType::BF16, {p.down.weight.n, columns});
+        ops::linear(activation, p.down.weight, projected, p.down.policy, workspace, stream);
+        ops::glp_project(projected, glp.direction, *glp.alpha, stream);
+        ops::residual_add(projected, residual, stream);
+        return;
+    }
     ops::linear_add(activation, p.down.weight, residual,
                     residual_projection_policy(p.down, wide_verification), workspace, stream);
 }
@@ -66,13 +99,32 @@ void rotated_dense_ffn(const Tensor& hidden, const DenseParameters& p, Tensor& r
 } // namespace
 
 std::size_t ffn_workspace_bytes(const FfnParameters& parameters, std::int32_t first,
-                                std::int32_t last, bool mtp, bool verify, bool wide_verification) {
+                                std::int32_t last, bool mtp, bool verify, bool wide_verification,
+                                bool glp) {
     if (first <= 0 || last < first) { throw std::invalid_argument("FFN: invalid column interval"); }
     if (const auto* moe = std::get_if<ops::SparseMoeWeights>(&parameters)) {
         return ops::sparse_moe_workspace_capacity_bytes(moe->routed_gate_up.qtype,
                                                         moe->routed_down.qtype, first, last);
     }
     const auto& p = std::get<DenseParameters>(parameters);
+    // When the layer steers, the writer site materialises the down-projection output and calls
+    // ops::linear + glp_project + residual_add instead of a fused linear_add. The extra exposed
+    // {down.n, last} buffer coexists with the still-live gate/up plane and silu activation, so the
+    // arena must cover the true GLP peak -- not merely max(stock, projected-alone). Sizing it too
+    // small lets the projected write run past the reserved region and corrupts neighbouring state.
+    if (glp && rotated_dense(p)) {
+        return rotated_dense_glp_workspace_bytes(p, first, last, wide_verification);
+    }
+    if (glp) {
+        // Non-rotated dense: the GLP epilogue replaces the fused linear_add with linear +
+        // glp_project + residual_add, adding one {down.n, last} buffer that coexists with the
+        // gate/up plane. Take the stock peak and add the projected buffer on top.
+        WorkspaceLayoutBuilder layout;
+        (void)layout.alloc(DType::BF16, {p.down.weight.n, last});
+        (void)layout.alloc_bytes(
+            ffn_workspace_bytes(parameters, first, last, mtp, verify, wide_verification, false));
+        return layout.peak_bytes(1);
+    }
     if (rotated_dense(p)) {
         return rotated_dense_workspace_bytes(p, first, last, wide_verification);
     }
@@ -142,12 +194,13 @@ const Tensor* ffn_input_signs(const FfnParameters& parameters) {
 
 void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual,
          const ops::SparseMoeHints& hints, WorkspaceArena& workspace, cudaStream_t stream, bool mtp,
-         bool verify, InputBasis basis, bool wide_verification) {
+         bool verify, InputBasis basis, bool wide_verification, const GlpSteering& glp) {
     auto scope         = workspace.scope();
     const auto columns = hidden.ne[1];
     if (const auto* moe = std::get_if<ops::SparseMoeWeights>(&parameters)) {
-        const auto storage =
-            workspace.alloc_bytes(ffn_workspace_bytes(parameters, columns, columns));
+        const auto storage = workspace.alloc_bytes(
+            ffn_workspace_bytes(parameters, columns, columns, mtp, verify, wide_verification,
+                                glp.applies()));
         WorkspaceArena scratch(storage);
         ops::sparse_moe(hidden, *moe, ops::SparseMoeEpilogue::AddResidual, residual, hints, scratch,
                         stream);
@@ -155,7 +208,7 @@ void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual
     }
     const auto& p = std::get<DenseParameters>(parameters);
     if (rotated_dense(p)) {
-        rotated_dense_ffn(hidden, p, residual, workspace, stream, basis, wide_verification);
+        rotated_dense_ffn(hidden, p, residual, workspace, stream, basis, wide_verification, glp);
         return;
     }
     const auto& gu   = p.gate_up.weight;
@@ -170,6 +223,13 @@ void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual
             } else {
                 ops::linear_swiglu(hidden, gu, activation, p.gate_up.policy, workspace, stream);
             }
+        }
+        if (glp.applies()) {
+            Tensor projected = workspace.alloc(DType::BF16, {down.n, columns});
+            ops::linear(activation, down, projected, p.down.policy, workspace, stream);
+            ops::glp_project(projected, glp.direction, *glp.alpha, stream);
+            ops::residual_add(projected, residual, stream);
+            return;
         }
         ops::linear_add(activation, down, residual, p.down.policy, workspace, stream);
         return;
@@ -189,6 +249,13 @@ void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual
             ops::residual_add(delta, residual, stream);
             return;
         }
+        if (glp.applies()) {
+            Tensor projected = workspace.alloc(DType::BF16, {down.n, columns});
+            ops::linear(activation, down, projected, p.down.policy, workspace, stream);
+            ops::glp_project(projected, glp.direction, *glp.alpha, stream);
+            ops::residual_add(projected, residual, stream);
+            return;
+        }
         ops::linear_add(activation, down, residual, p.down.policy, workspace, stream);
         return;
     }
@@ -197,6 +264,13 @@ void ffn(const Tensor& hidden, const FfnParameters& parameters, Tensor& residual
         auto call = workspace.scope();
         ops::linear_swiglu(hidden, gu, activation,
                            verify ? p.verify_gate_up_policy : p.gate_up.policy, workspace, stream);
+    }
+    if (glp.applies()) {
+        Tensor projected = workspace.alloc(DType::BF16, {down.n, columns});
+        ops::linear(activation, down, projected, p.down.policy, workspace, stream);
+        ops::glp_project(projected, glp.direction, *glp.alpha, stream);
+        ops::residual_add(projected, residual, stream);
+        return;
     }
     ops::linear_add(activation, down, residual,
                     residual_projection_policy(p.down, wide_verification), workspace, stream);

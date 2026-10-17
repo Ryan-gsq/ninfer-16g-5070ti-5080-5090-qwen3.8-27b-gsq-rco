@@ -34,7 +34,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         const std::int32_t* valid_columns, const std::int32_t* table_rows,
         std::int32_t table_stride, std::int32_t full_width, std::int32_t column_begin,
         std::int32_t logical_capacity, float attention_scale, float* partial_acc, float* partial_m,
-        float* partial_l) {
+        float* partial_l, const std::uint32_t* selected_blocks) {
     constexpr int Wc                   = WarpsPerCta;
     constexpr int RowCount             = TokenTile * Geometry::GroupSize;
     constexpr int RowTiles             = (RowCount + 15) / 16;
@@ -335,6 +335,27 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
     for (int kb = 0; kb < key_blocks; ++kb) {
         const int k0 = first_tile + kb * Bc;
 
+        // LOCAL PROTOTYPE (fast path): skip key tiles with no selected pages. A fully
+        // deselected tile contributes exactly nothing (all scores -inf -> alpha 0/1 with
+        // zero block sum, acc/m/l unchanged), so skipping the dequant+MMA+softmax+PV work
+        // is bit-identical to executing it. The predicate is CTA-uniform (depends only on
+        // k0, the split bounds and the bitmap), so predicating whole sections keeps every
+        // __syncthreads() converged. With a retrieval selection of ~192/4096 pages this
+        // removes ~95% of key-tile work in deep decode. Dense (bitmap == nullptr) always
+        // takes the active path, reproducing the original behaviour bit-for-bit.
+        const auto tile_has_selected_keys = [&](int tile_k0) {
+            if (selected_blocks == nullptr) { return true; }
+            const int lo = tile_k0 < split_start ? split_start : tile_k0;
+            const int hi = tile_k0 + Bc > split_end ? split_end : tile_k0 + Bc;
+            for (int key = lo; key < hi; key += kPagedKVPageShift) {
+                const int page = key >> kPagedKVPageShift;
+                if (((selected_blocks[page >> 5] >> (page & 31)) & 1U) != 0U) { return true; }
+            }
+            return false;
+        };
+        const bool tile_active = tile_has_selected_keys(k0);
+
+        if (tile_active) {
 #pragma unroll 1
         for (int chunk = tid; chunk < Bc * (D / 16); chunk += Threads) {
             const int key_l = chunk / (D / 16);
@@ -355,8 +376,9 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             }
         }
         __syncthreads();
+        }  // if (tile_active)
 
-        if (warp < ProducerWarps) {
+        if (tile_active && warp < ProducerWarps) {
             const int row_base = warp * 16;
             __half* p_sw       = &p_s[row_base * PStride];
             float score[QKNt][4];
@@ -383,6 +405,14 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                 }
             }
 
+            // LOCAL PROTOTYPE: block-level retrieval mask (see launch.h). A null bitmap selects
+            // every 64-token KV page, reproducing the original dense result bit-for-bit.
+            const auto block_selected = [&](int key) {
+                if (selected_blocks == nullptr) { return true; }
+                const int page = key >> kPagedKVPageShift;
+                return ((selected_blocks[page >> 5] >> (page & 31)) & 1U) != 0U;
+            };
+
             const int row0 = row_base + gid;
             const int row1 = row0 + 8;
             int q_head0 = 0, token0 = 0, q_head1 = 0, token1 = 0;
@@ -398,19 +428,23 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                 const int key0 = k0 + col0;
                 const int key1 = key0 + 1;
                 score[nt][0] =
-                    row0 < RowCount && key0 >= split_start && key0 < split_end && key0 <= qabs0
+                    row0 < RowCount && key0 >= split_start && key0 < split_end && key0 <= qabs0 &&
+                            block_selected(key0)
                         ? score[nt][0] * attention_scale
                         : -CUDART_INF_F;
                 score[nt][1] =
-                    row0 < RowCount && key1 >= split_start && key1 < split_end && key1 <= qabs0
+                    row0 < RowCount && key1 >= split_start && key1 < split_end && key1 <= qabs0 &&
+                            block_selected(key1)
                         ? score[nt][1] * attention_scale
                         : -CUDART_INF_F;
                 score[nt][2] =
-                    row1 < RowCount && key0 >= split_start && key0 < split_end && key0 <= qabs1
+                    row1 < RowCount && key0 >= split_start && key0 < split_end && key0 <= qabs1 &&
+                            block_selected(key0)
                         ? score[nt][2] * attention_scale
                         : -CUDART_INF_F;
                 score[nt][3] =
-                    row1 < RowCount && key1 >= split_start && key1 < split_end && key1 <= qabs1
+                    row1 < RowCount && key1 >= split_start && key1 < split_end && key1 <= qabs1 &&
+                            block_selected(key1)
                         ? score[nt][3] * attention_scale
                         : -CUDART_INF_F;
                 bm0 = fmaxf(bm0, fmaxf(score[nt][0], score[nt][1]));
@@ -459,6 +493,10 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                 alpha_s[row1] = alpha1;
             }
         } else if constexpr (!CompactKVStage) {
+            if (!tile_active) {
+                // Fully deselected tile: QK/MMA/softmax contribute nothing (see tile_active
+                // above), and the PV section below is skipped as well, so there is no work.
+            } else {
             // The non-QK warps expand V while the producer warps consume K. Keeping K and V in
             // separate shared tiles makes the FP16 accuracy path overlap its decode work instead
             // of turning the small-T GQA warps into barrier waiters.
@@ -483,10 +521,12 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                               make_int4(0, 0, 0, 0));
                 }
             }
+            }  // else tile_active (V expand)
         }
-        __syncthreads();
+        if (tile_active) { __syncthreads(); }
 
         if constexpr (CompactKVStage) {
+            if (tile_active) {
             // Once all producer warps finish QK, overwrite the compact FP16 K tile with V. The
             // smaller arena admits two resident CTAs for RowTiles<=2, which is more valuable than
             // overlapping V decode with QK in these bandwidth-oriented shapes.
@@ -511,10 +551,14 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                 }
             }
             __syncthreads();
+            }  // if (tile_active)
         }
 
         const bool has_next = kb + 1 < key_blocks;
-        if (has_next) {
+        // v2: skip the NEXT tile's HBM prefetch (and its wait below) when it has no
+        // selected pages. Same CTA-uniform predicate, so convergence is preserved.
+        const bool next_active = has_next && tile_has_selected_keys(k0 + Bc);
+        if (next_active) {
             const int next_k0 = k0 + Bc;
             if ((next_k0 & kPagedKVPageMask) == 0) {
                 physical_page = page_at(next_k0);
@@ -525,6 +569,7 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         const int consumer_tile     = warp % RowTiles;
         const int consumer_slice    = warp / RowTiles;
         const int consumer_row_base = consumer_tile * 16;
+        if (tile_active) {
         __half* p_consumer          = &p_s[consumer_row_base * PStride];
         const float alpha0          = alpha_s[consumer_row_base + gid];
         const float alpha1          = alpha_s[consumer_row_base + gid + 8];
@@ -555,7 +600,8 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                         vf[0], vf[1]);
             }
         }
-        if (has_next) { ninfer::ops::cp_wait<0>(); }
+        }  // if (tile_active)
+        if (next_active) { ninfer::ops::cp_wait<0>(); }
         __syncthreads();
     }
 

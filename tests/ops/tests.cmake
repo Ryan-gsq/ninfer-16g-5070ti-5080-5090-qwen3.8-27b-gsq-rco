@@ -1,6 +1,7 @@
 set(ninfer_op_tests
   add_bias
   gelu
+  glp_project
   hadamard_transform
   silu_mul
   residual_add

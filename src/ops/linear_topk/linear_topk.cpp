@@ -51,8 +51,12 @@ HeadProfile resolve_profile(QType qtype, std::int32_t head_rows, std::int32_t in
     if (head_rows == detail::kLinearTopKOptimizedRows && qtype == QType::Q4_G64_FP16) {
         return HeadProfile::Q4Optimized;
     }
-    if (qtype == QType::T2_G128_FP16 && (head_rows == detail::kLinearTopKFullRows ||
-                                         head_rows == detail::kLinearTopKOptimizedRows)) {
+    // The ternary family. HeadProfile::T2 is the "materialise the ternary head into a BF16 plane"
+    // tag and nothing below re-tests the qtype, so admitting PTQ1_0 here is what makes the whole
+    // profile work for it. The I line has no ternary branch in its linear_topk at all, so this
+    // widening (and the geometry arm below) is DERIVED from row_split_format, not copied.
+    if (is_ternary(qtype) && (head_rows == detail::kLinearTopKFullRows ||
+                              head_rows == detail::kLinearTopKOptimizedRows)) {
         return HeadProfile::T2;
     }
     if (is_gguf(qtype) && (head_rows == detail::kLinearTopKFullRows ||
@@ -147,14 +151,22 @@ void require_q4(const Weight& head) {
 }
 
 void require_t2(const Weight& head, std::int32_t rows) {
+    // The ternary family, with the plane expectation following the member: T2 carries no high
+    // plane, PTQ1_0 carries two bytes per 128-group. The byte arithmetic in
+    // require_no_weight_overlap indexes whole 128-groups, so k must be a whole number of them --
+    // checked here rather than assumed, since a padded k would make those products disagree with
+    // the plane the artifact actually stores.
     const bool common =
-        head.qtype == QType::T2_G128_FP16 && head.layout == QuantLayout::RowSplit &&
+        is_ternary(head.qtype) && head.layout == QuantLayout::RowSplit &&
         head.scale_dtype == DType::FP16 && head.group_size == 128 && head.group == 128 &&
         head.ndim == 2 && head.n == rows && head.k == detail::kLinearTopKHidden &&
         head.shape[0] == head.n && head.shape[1] == head.k && head.padded_shape[0] == head.n &&
-        head.padded_shape[1] == head.k && head.qhigh == nullptr && head.high_plane_bytes == 0 &&
+        head.padded_shape[1] == head.k && (head.k % 128) == 0 &&
+        (head.qtype == QType::T2_G128_FP16
+             ? (head.qhigh == nullptr && head.high_plane_bytes == 0)
+             : (head.qhigh != nullptr && head.high_plane_bytes != 0)) &&
         aligned_to(head.qdata, 16) && aligned_to(head.scales, 16);
-    if (!common) { throw std::invalid_argument("linear_topk: invalid T2 head"); }
+    if (!common) { throw std::invalid_argument("linear_topk: invalid ternary head"); }
 }
 
 void require_no_weight_overlap(const Weight& head, const Tensor& hidden,
@@ -166,6 +178,12 @@ void require_no_weight_overlap(const Weight& head, const Tensor& hidden,
             ? static_cast<std::size_t>(head.n) * (head.k / block.elements) * block.bytes
         : head.qtype == QType::Q4_G64_FP16  ? static_cast<std::size_t>(head.n) * head.k / 2
         : head.qtype == QType::T2_G128_FP16 ? static_cast<std::size_t>(head.n) * head.k / 4
+        // PTQ1_0 is 24 base + 2 high bytes per 128 weights, so n*k/4 (2 bits per weight) is wrong
+        // for it by 28/24. Taken from row_split_format rather than restated, and only reached after
+        // require_t2 has established k is a whole number of 128-groups.
+        : head.qtype == QType::PTQ1_G128_FP16
+            ? static_cast<std::size_t>(head.n) * (head.k / 128) *
+                  row_split_format(QType::PTQ1_G128_FP16).code_bytes
                                             : static_cast<std::size_t>(head.n) * head.k;
     const std::size_t scale_bytes =
         is_gguf(head.qtype) ? 0
@@ -173,7 +191,7 @@ void require_no_weight_overlap(const Weight& head, const Tensor& hidden,
             ? static_cast<std::size_t>(head.n) * (head.k / 32) * sizeof(std::uint16_t)
         : head.qtype == QType::Q4_G64_FP16
             ? static_cast<std::size_t>(head.n) * (head.k / 64) * sizeof(std::uint16_t)
-        : head.qtype == QType::T2_G128_FP16
+        : is_ternary(head.qtype)
             ? static_cast<std::size_t>(head.n) * (head.k / 128) * sizeof(std::uint16_t)
             : static_cast<std::size_t>(head.n) * sizeof(std::uint16_t);
     const Tensor* tensors[]{&hidden,

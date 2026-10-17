@@ -100,30 +100,22 @@ struct SyntheticWeight {
 };
 
 SyntheticWeight row_split_weight(QType qtype, std::int32_t n, std::int32_t k) {
-    std::int32_t group      = 64;
-    std::int32_t high_bytes = 0;
-    switch (qtype) {
-    case QType::Q4_G64_FP16:
-        break;
-    case QType::Q5_G64_FP16:
-        high_bytes = 8;
-        break;
-    case QType::Q6_G64_FP16:
-        high_bytes = 16;
-        break;
-    case QType::Q8_G32_FP16:
-        group = 32;
-        break;
-    case QType::T2_G128_FP16:
-        group = 128;
-        break;
-    default:
+    // Geometry from core/weight.h's row_split_format -- the single source of truth -- instead of a
+    // second copy of the same table. The copy that used to live here hardcoded 32 base bytes per
+    // group, which holds for every grouped format EXCEPT PTQ1_0 (24 base + 2 high); a synthetic
+    // weight built with the wrong plane sizes would calibrate the device against bytes no artifact
+    // has. Nothing routes PTQ1_0 here today -- see the note in calibrate_ternary -- but the trap is
+    // gone either way.
+    const RowSplitFormat format = row_split_format(qtype);
+    if (format.group == 0) {
         throw std::invalid_argument("calibration: unsupported synthetic weight format");
     }
+    const std::int32_t group      = static_cast<std::int32_t>(format.group);
+    const std::int32_t high_bytes = static_cast<std::int32_t>(format.high_bytes);
     const auto align    = [](std::uint64_t value) { return (value + 255) / 256 * 256; };
     const std::uint64_t groups =
         static_cast<std::uint64_t>(n) * static_cast<std::uint64_t>(k / group);
-    const std::uint64_t low_bytes    = groups * 32;
+    const std::uint64_t low_bytes    = groups * format.code_bytes;
     const std::uint64_t high_total   = groups * static_cast<std::uint64_t>(high_bytes);
     const std::uint64_t high_offset  = align(low_bytes);
     const std::uint64_t scale_offset = high_offset + align(high_total);
@@ -344,6 +336,11 @@ std::vector<std::int32_t> decode_widths() {
 
 // Ternary Bonsai 2 27B projections, in the launches the model makes: the GDN and attention input
 // pairs, the output and down projections with their residual adds, the gate/up and the LM head.
+//
+// PTQ1_0 is deliberately NOT calibrated here. Calibration bakes a device profile for the routes the
+// ternary profile can SELECT, and PTQ1_0 currently has exactly one rung -- the reference GEMM, which
+// t2_dispatch calls unconditionally -- so there is no PTQ1_0 route for a profile entry to choose.
+// Adding one would time a rung nothing can pick. Revisit when PTQ1_0 gets its fast rungs.
 void calibrate_ternary(ops::DeviceRouteProfile& profile, Timer& timer,
                        const CalibrationOptions& options) {
     constexpr std::int32_t hidden = 5120;
@@ -381,7 +378,10 @@ void calibrate_ternary(ops::DeviceRouteProfile& profile, Timer& timer,
         Tensor x          = tensor(x_hidden, hidden, cols);
         Tensor qkv_plane  = tensor(qkv, 10240, cols);
         Tensor z_plane    = tensor(z, 6144, cols);
-        const auto active = ops::detail::t2_a8_quantize(x, workspace, stream);
+        // The quantiser must take the SAME route as the projections that read its planes, so a
+        // PTQ1_0 weight has to say so here (its tile floor is below T2's; see t2_ptq1_tile_min_tokens).
+        const auto active = ops::detail::t2_a8_quantize(
+            x, workspace, stream, gdn_qk.weight.qtype == QType::PTQ1_G128_FP16);
         ops::detail::t2_a8_project_split_pair(active, {gdn_qk.weight, qkv_plane, 0, 4096, qkv_plane, 0},
                                               {gdn_vz.weight, qkv_plane, 4096, 6144, z_plane, 0},
                                               stream);
@@ -393,7 +393,8 @@ void calibrate_ternary(ops::DeviceRouteProfile& profile, Timer& timer,
         Tensor gate_plane = tensor(gate, 6144, cols);
         Tensor k_plane    = tensor(k, 1024, cols);
         Tensor v_plane    = tensor(v, 1024, cols);
-        const auto active = ops::detail::t2_a8_quantize(x, workspace, stream);
+        const auto active = ops::detail::t2_a8_quantize(
+            x, workspace, stream, attn_qk.weight.qtype == QType::PTQ1_G128_FP16);
         ops::detail::t2_a8_project_split_pair(active, {attn_qk.weight, q_plane, 0, 6144, k_plane, 0},
                                               {attn_gv.weight, gate_plane, 0, 6144, v_plane, 0},
                                               stream);

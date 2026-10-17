@@ -20,6 +20,33 @@ namespace frontend {
 struct ToolCallOutputContract;
 }
 
+// LOCAL (KVMem query span, D-12, 2026-10-02): publish this request's absolute query span (the last user
+// turn, in TOKEN indices of the complete rendered prompt) to the KVMem scorer. Declared HERE and
+// defined in the model runtime (program/prefill.cpp) on purpose: the frontend must not grow a CUDA/ops
+// include just to reach the scorer, and the publish has to happen in the REQUEST path -- publishing
+// only from the prefill driver missed the suffix-only prefill of a cached-prefix turn 2, which then
+// silently ran on a STALE span (measured 2026-10-02; see the fallback comment in kvmem_score.h).
+// -1/-1 = unknown -> the scorer keeps its tail rule.
+void kvmem_publish_query_span(std::int32_t begin, std::int32_t end) noexcept;
+
+// LOCAL (ActKV Sec. 8.1 semantic protection, 2026-10-16): publish this request's two never-compress
+// spans -- the leading system/developer instruction block, and the current user task -- in the same
+// absolute TOKEN indices the query span uses. Declared here and defined in program/prefill.cpp for
+// exactly the reason above: the frontend already knows both frontiers (it computes the query span
+// from them) and must not grow a CUDA/ops include to reach the scorer.
+//
+// The current user task is passed separately from the query span on purpose even though the two are
+// the same span today. They answer different questions: the query span is "what to rank against",
+// the protected task span is "what must never be evicted", and upstream keeps them separate, so a
+// later change to the ranking query cannot silently move the protection.
+//
+// Published unconditionally on every request, -1 included: a request with no instruction prefix or
+// no user turn must CLEAR a stale span rather than inherit the previous request's (the same
+// inheritance bug already recorded for the query span).
+void kvmem_publish_protect_spans(std::int32_t instruction_begin, std::int32_t instruction_end,
+                                 std::int32_t task_begin, std::int32_t task_end,
+                                 std::int32_t total_tokens) noexcept;
+
 inline constexpr std::size_t kPreparedVisionPatchFeatures = 3ULL * 2ULL * 16ULL * 16ULL;
 inline constexpr std::uint64_t kRawPatchesPerVisionToken  = 4;
 // Aggregate prompt capacity and one-item execution capacity are intentionally distinct. Multiple
@@ -165,6 +192,17 @@ struct PreparedPromptData {
     std::shared_ptr<const frontend::ToolCallOutputContract> tool_call_output;
     bool starts_in_reasoning = false;
     PrepareStats prepare;
+    // LOCAL (KVMem query span, 2026-10-02, D-12): the retrieval query span in TOKEN indices -- the LAST
+    // USER TURN, per the official service-layer rule (donor default: refs kvmem-qw3-main/src/
+    // qw3_server.cpp:4779-4804 "use the complete final user message"; our reserve note:
+    // 02-交接与状态\KVMem-移植-交接-20260921.md:308). Filled in where the message frontiers are already
+    // known in token space (frontend/frontend.cpp) and consumed by the KVMem scorer, which intersects it
+    // with each prefill chunk and scores only the chunk that contains it. -1 = unknown -> the scorer
+    // keeps its tail rule (_SCORE_QUERY_TAIL), which is also this field's negative control.
+    // APPENDED AT THE END ON PURPOSE: a mid-struct insert shifts every later member and any TU still
+    // holding the old layout reads the wrong offsets (the stale-obj startup death of 2026-10-02).
+    std::int32_t query_span_begin = -1;
+    std::int32_t query_span_end   = -1;
 
     [[nodiscard]] std::span<const std::int32_t> position_axis(int axis) const;
 

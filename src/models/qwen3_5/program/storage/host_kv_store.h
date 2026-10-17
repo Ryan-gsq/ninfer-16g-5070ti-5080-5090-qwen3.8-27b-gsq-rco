@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>       // LOCAL FIX (2026-10-02): the publish path reports a decline instead of aborting
 #include <exception>
 #include <limits>
 #include <optional>
@@ -175,20 +176,54 @@ public:
         return extents_[reservation.descriptor_].page_count;
     }
 
-    [[nodiscard]] HostKVExtentCapability publish(HostKVExtentReservation&& reservation) noexcept {
-        if (!valid(reservation)) { std::terminate(); }
+    // LOCAL FIX (silent death in the publish path, 2026-10-02): this function used to
+    // `std::terminate()` when a page's host replica could not be attached. Being `noexcept`, the only
+    // observable result was `abort()` -- no log, no dump, no error line (the field saw exit
+    // 0xC0000409). The mechanism: fork/COW pages are REFERENCE-COUNTED, so the same logical page can
+    // enter one 64-page demotion batch through two non-live addresses; the second attach throws and the
+    // whole engine died with the batch. K fixed this in ebd7ad46 -- the only change their notes call
+    // production-validated ("T2 previously died at 284-407 s every time and now survives").
+    //
+    // Now the refusal is VISIBLE: return std::optional and say why. `noexcept` is kept, because that is
+    // the contract its callers rely on, so the failure path can only be a return value plus a printed
+    // line -- never a throw.
+    [[nodiscard]] std::optional<HostKVExtentCapability> publish(HostKVExtentReservation&& reservation) noexcept {
+        if (!valid(reservation)) {
+            std::fprintf(stderr, "[ninfer] publish declined: page=0 of 0 reason=invalid-reservation\n");
+            return std::nullopt;
+        }
         Extent& extent     = extents_[reservation.descriptor_];
         std::uint32_t node = extent.head;
         for (std::uint32_t index = 0; index < extent.page_count; ++index) {
-            if (node == kInvalidIndex) { std::terminate(); }
+            if (node == kInvalidIndex) {
+                std::fprintf(stderr,
+                             "[ninfer] publish declined: page=%u of %u reason=broken-membership-chain\n",
+                             index, extent.page_count);
+                abort(reservation);
+                return std::nullopt;
+            }
             const Membership& entry = memberships_[node];
             if (!extent.page_store->can_attach_host_replica(entry.page, entry.epoch,
                                                             entry.coverage)) {
-                std::terminate();
+                // The pre-pass runs before ANY mutation, so giving the extent back through the existing
+                // give-up path (abort) leaves the store exactly as it was -- this is the same-page-twice
+                // case, and it is the one the field actually hit.
+                std::fprintf(stderr,
+                             "[ninfer] publish declined: page=%u of %u epoch=%u coverage=%u "
+                             "reason=host-replica-not-attachable\n",
+                             index, extent.page_count, entry.epoch, entry.coverage);
+                abort(reservation);
+                return std::nullopt;
             }
             node = entry.next;
         }
-        if (node != kInvalidIndex) { std::terminate(); }
+        if (node != kInvalidIndex) {
+            std::fprintf(stderr,
+                         "[ninfer] publish declined: page=%u of %u reason=membership-chain-too-long\n",
+                         extent.page_count, extent.page_count);
+            abort(reservation);
+            return std::nullopt;
+        }
         extent.state = ExtentState::Published;
         const HostKVExtentCapability capability(this, reservation.descriptor_, extent.generation);
         node = extent.head;
@@ -201,7 +236,18 @@ public:
                                                   .membership_node   = node,
                                                   .content_epoch     = entry.epoch,
                                                   .committed_columns = entry.coverage});
-            } catch (...) { std::terminate(); }
+            } catch (...) {
+                // MID-LOOP failure: some replicas are already attached, so this extent is NOT rolled
+                // back -- rolling back would leave those replicas pointing into a freed extent, which is
+                // strictly worse than a partial publish. The extent stays Published and the caller sees
+                // a decline; the pages that did attach keep working, the missing ones are simply absent,
+                // and the line below says exactly that so nobody has to guess which of the two happened.
+                std::fprintf(stderr,
+                             "[ninfer] publish PARTIAL: page=%u of %u attached=%u reason=attach-threw; "
+                             "extent left published, caller sees a decline\n",
+                             index, extent.page_count, index);
+                return std::nullopt;
+            }
             extent.page_store->unpin_source(entry.page);
             node = entry.next;
         }

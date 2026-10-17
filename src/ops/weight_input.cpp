@@ -211,9 +211,14 @@ ProjectionWeights input_projection(std::span<const WeightInput, 4> inputs, bool 
     const auto second = single(inputs.last<2>());
     const bool q4_q5 =
         first.weight.qtype == QType::Q4_G64_FP16 && second.weight.qtype == QType::Q5_G64_FP16;
-    const bool t2 =
-        first.weight.qtype == QType::T2_G128_FP16 && second.weight.qtype == QType::T2_G128_FP16;
-    require(q4_q5 || t2, "input projection: paired native form requires Q4 and Q5, or two T2");
+    // The paired native form is two parents of ONE ternary format, which is the I line's
+    // require_ternary_*_parents rule (both ternary, and the same format). The I line has no
+    // counterpart to this file, so the rule is applied here from that precedent rather than copied.
+    const bool ternary_pair =
+        is_ternary(first.weight.qtype) && first.weight.qtype == second.weight.qtype;
+    require(q4_q5 || ternary_pair,
+            "input projection: paired native form requires Q4 and Q5, or two ternary parents of the "
+            "same format");
     return PairedProjectionWeights{first.weight, second.weight, LinearPolicy::A16Only,
                                    common_signs(inputs)};
 }

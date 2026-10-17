@@ -276,17 +276,31 @@ __global__ __maxnreg__(120) void causal_attention_prompt_nvfp4_kernel(
             const int qabs0            = row0 < tile_rows ? base_pos + q0 + row0 : -1;
             const int qabs1            = row1 < tile_rows ? base_pos + q0 + row1 : -1;
             const bool full_score_tile = q0 + Br <= tokens && k0 + Bc - 1 <= base_pos + q0;
+            // LOCAL PROTOTYPE: a retrieval mask must be applied even inside a full score tile.
+            const bool selection_active = metadata.selected_blocks != nullptr;
             float bm0                  = -CUDART_INF_F;
             float bm1                  = -CUDART_INF_F;
 #pragma unroll
             for (int nt = 0; nt < QKNt; ++nt) {
                 const int key0 = k0 + col_base + nt * 8 + 2 * lid;
                 const int key1 = key0 + 1;
-                if (!full_score_tile) {
-                    score[nt][0] = key0 <= qabs0 ? score[nt][0] : -CUDART_INF_F;
-                    score[nt][1] = key1 <= qabs0 ? score[nt][1] : -CUDART_INF_F;
-                    score[nt][2] = key0 <= qabs1 ? score[nt][2] : -CUDART_INF_F;
-                    score[nt][3] = key1 <= qabs1 ? score[nt][3] : -CUDART_INF_F;
+                if (!full_score_tile || selection_active) {
+                    score[nt][0] =
+                        (key0 <= qabs0 && paged_kv_block_selected(metadata.selected_blocks, key0))
+                            ? score[nt][0]
+                            : -CUDART_INF_F;
+                    score[nt][1] =
+                        (key1 <= qabs0 && paged_kv_block_selected(metadata.selected_blocks, key1))
+                            ? score[nt][1]
+                            : -CUDART_INF_F;
+                    score[nt][2] =
+                        (key0 <= qabs1 && paged_kv_block_selected(metadata.selected_blocks, key0))
+                            ? score[nt][2]
+                            : -CUDART_INF_F;
+                    score[nt][3] =
+                        (key1 <= qabs1 && paged_kv_block_selected(metadata.selected_blocks, key1))
+                            ? score[nt][3]
+                            : -CUDART_INF_F;
                 }
                 bm0 = fmaxf(bm0, fmaxf(score[nt][0], score[nt][1]));
                 bm1 = fmaxf(bm1, fmaxf(score[nt][2], score[nt][3]));

@@ -100,33 +100,20 @@ WeightGeometry weight_geometry(QType format, QuantLayout layout,
     const auto k       = shape[1];
     out.padded_columns = k;
     if (is_row_split(layout)) {
-        std::uint64_t high_per_group = 0;
-        switch (format) {
-        case QType::Q4_G64_FP16:
-            out.group_size = 64;
-            break;
-        case QType::Q5_G64_FP16:
-            out.group_size = 64;
-            high_per_group = 8;
-            break;
-        case QType::Q6_G64_FP16:
-            out.group_size = 64;
-            high_per_group = 16;
-            break;
-        case QType::Q8_G32_FP16:
-            out.group_size = 32;
-            break;
-        case QType::T2_G128_FP16:
-            out.group_size = 128;
-            break;
-        default:
+        // The plane geometry comes from core/weight.h's row_split_format(), which is its single
+        // source of truth -- the row views in ops/linear/t2/t2_weight_view.h advance the same planes
+        // by the same numbers, and a format described one way here and another way there slices
+        // plausible-looking garbage instead of failing.
+        const RowSplitFormat geometry = row_split_format(format);
+        if (geometry.group == 0) {
             throw std::invalid_argument("RowSplit requires a grouped integer format");
         }
+        out.group_size          = geometry.group;
         out.padded_columns      = aligned(k, 128);
         const auto groups       = out.padded_columns / out.group_size;
-        out.code_bytes_per_row  = mul(groups, 32);
-        out.high_bytes_per_row  = mul(groups, high_per_group);
-        out.scale_bytes_per_row = mul(groups, 2);
+        out.code_bytes_per_row  = mul(groups, geometry.code_bytes);
+        out.high_bytes_per_row  = mul(groups, geometry.high_bytes);
+        out.scale_bytes_per_row = mul(groups, geometry.scale_bytes);
         out.code_bytes          = mul(n, out.code_bytes_per_row);
         out.high_offset         = aligned(out.code_bytes, 256);
         out.high_bytes          = mul(n, out.high_bytes_per_row);

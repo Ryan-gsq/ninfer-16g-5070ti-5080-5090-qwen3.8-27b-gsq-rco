@@ -2,6 +2,7 @@
 
 #include "ops/common/math.cuh"
 #include "ops/common/memory.cuh"
+#include "ops/linear/fp8/fp8_a16_codec.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp4.h>
@@ -24,6 +25,22 @@ __device__ __forceinline__ float decode_nvfp4_e4m3(std::uint8_t storage) {
 }
 
 __device__ __forceinline__ unsigned nvfp4_scaled_pair_bf16(std::uint8_t code, std::uint8_t scale) {
+#if NINFER_NATIVE_FP8_FP4_PAIR_CVT
+    // E2M1 times a finite E4M3 scale needs at most six significand bits, so the BF16 product is
+    // exact and equals the FP32 expansion below.
+    unsigned values, multiplier, result;
+    asm("{\n"
+        ".reg .b8 packed;\n"
+        "mov.b32 {packed, _, _, _}, %1;\n"
+        "cvt.rn.bf16x2.e2m1x2 %0, packed;\n"
+        "}\n"
+        : "=r"(values)
+        : "r"(static_cast<unsigned>(code)));
+    const auto scale_pair = static_cast<std::uint16_t>(scale | (static_cast<unsigned>(scale) << 8));
+    asm("cvt.rn.bf16x2.e4m3x2 %0, %1;" : "=r"(multiplier) : "h"(scale_pair));
+    asm("mul.rn.bf16x2 %0, %1, %2;" : "=r"(result) : "r"(values), "r"(multiplier));
+    return result;
+#else
     const float2 values    = decode_nvfp4_e2m1x2(code);
     const float multiplier = decode_nvfp4_e4m3(scale);
 
@@ -34,6 +51,7 @@ __device__ __forceinline__ unsigned nvfp4_scaled_pair_bf16(std::uint8_t code, st
 
     result.pair = __floats2bfloat162_rn(values.x * multiplier, values.y * multiplier);
     return result.bits;
+#endif
 }
 
 __device__ __forceinline__ int nvfp4_a16_shared_col_64(int row, int col) {

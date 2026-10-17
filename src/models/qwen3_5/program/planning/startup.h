@@ -97,6 +97,10 @@ struct SequencePlanningInputs {
     const execution::Parameters* parameters = nullptr;
     std::uint32_t capacity                  = 0;
     std::uint32_t max_concurrency           = 1;
+    // LOCAL PORT (CraneBW `kvmem_resident_pages`): true when the pool size is ours to choose. Only
+    // then may the ring cap it at the resident working set -- an explicit --kv-capacity is an
+    // operator's number and must survive untouched.
+    bool kv_capacity_automatic              = false;
     std::uint32_t prefill_chunk             = 0;
     bool fast_prefill_kernel                = false;
     std::uint32_t draft_window              = 0;

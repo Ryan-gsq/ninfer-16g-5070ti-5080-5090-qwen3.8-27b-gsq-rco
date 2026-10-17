@@ -255,7 +255,14 @@ void causal_attention_prompt_attention_launch(const Tensor& q, const Tensor& pos
         causal_attention_prompt_fp8_attention_launch(q, positions, scale, cache, out, stream);
         return;
     }
-    const PagedKVDirectMetadata metadata{static_cast<const std::int32_t*>(cache.block_table.data)};
+    // LOCAL FIX (ring mask on bf16 / int8-family prompt routes, 2026-10-02): this direct-route
+    // metadata used to carry only the block table, so these kernels read whatever physical slot the
+    // table named -- including a slot the ring had already freed and handed to another page. Same
+    // expression as the fp8/k8v4 routes: the per-request bitmap, else the env prototype mask, else
+    // nullptr (dense, bit-identical to before).
+    const PagedKVDirectMetadata metadata{
+        static_cast<const std::int32_t*>(cache.block_table.data),
+        cache.selected_blocks != nullptr ? cache.selected_blocks : proto_selected_blocks()};
     if (q.ne[1] == CausalD256H24Kv4::QHeads) {
         causal_attention_prompt_attention_launch_for<CausalD256H24Kv4>(q, positions, scale, cache,
                                                                        metadata, out, fast, stream);
@@ -293,6 +300,10 @@ void causal_attention_prompt_launch(const Tensor& q, const Tensor& k, const Tens
                 Masked ? static_cast<const std::int32_t*>(valid_columns.data) : nullptr,
             .table_rows   = static_cast<const std::int32_t*>(table_rows.data),
             .table_stride = cache.block_tables.ne[0],
+            // LOCAL FIX (ring mask on bf16 / int8-family prompt routes, 2026-10-02): see the
+            // direct-route comment in causal_attention_prompt_attention_launch.
+            .selected_blocks =
+                cache.selected_blocks != nullptr ? cache.selected_blocks : proto_selected_blocks(),
         };
         if (q.ne[1] == CausalD256H24Kv4::QHeads) {
             causal_attention_prompt_attention_launch_for<CausalD256H24Kv4>(

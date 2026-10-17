@@ -454,6 +454,12 @@ struct SequenceState {
     std::int32_t rope_delta               = 0;
     std::uint32_t text_kv_valid           = 0;
     std::uint32_t mtp_kv_valid            = 0;
+    // LOCAL PROTOTYPE (KVMem-style ring retrieval hysteresis): the retrieval set selected by the
+    // previous mapping call. Pages kept here are spared from demotion while resident (no restore
+    // needed) but are NOT restored once gone; the set is refreshed every call that rescores.
+    std::vector<std::uint32_t> ring_keep;
+    // Mapped text pages at the last rescore; rescoring only happens when this changes.
+    std::uint32_t ring_scored_mapped      = 0;
     std::uint32_t dflash_context_frontier = 0;
     std::array<TokenId, qwen3_5::kMtpDecodeMaximumDrafts> mtp_drafts{};
     std::uint32_t mtp_draft_count = 0;
@@ -1595,6 +1601,49 @@ private:
     void unbind_sequence_kv(SequenceState& sequence) noexcept;
     void ensure_sequence_kv_mapped(SequenceState& sequence, std::uint32_t main_tokens,
                                    std::uint32_t backend_tokens = 0);
+    // LOCAL FIX (B01 ring room): the ring's "make room before mapping" beat, callable from every
+    // mapping site. It demotes inactive addresses first and then this address's own pages, and fails
+    // the request with a readable error (ContextCacheExhausted, a std::bad_alloc, so the worker's
+    // out-of-memory path fails just this request) when the pages this step must map cannot be freed.
+    // Self-guarding: a no-op unless the ring is active (a Device pool smaller than the logical
+    // context with a window configured). `total_tokens` is the frontier to be mapped, in tokens.
+    // Call this before ensure_mapped_to_tokens from any path that does not go through
+    // ensure_sequence_kv_mapped -- that bypass is what let the DFlash context append and the
+    // causal-scoring lane ask a full pool for pages with nothing left to demote.
+    void ensure_ring_room(KVAddressSpaceStore& addresses, LogicalKVPageStore& pages,
+                          const KVAddressSpaceHandle& address, std::uint32_t total_tokens,
+                          std::span<const std::uint32_t> preferred);
+
+    // LOCAL PROTOTYPE (KVMem-style ring): demote the oldest Device-resident pages (skipping the
+    // attention sink and, on the first pass, `preferred`) until at least `target_free` Device pages
+    // have been released, or nothing more can be demoted. The content is always preserved on the
+    // Host first, so demotion is lossless and retrieval can bring a page back.
+    std::uint32_t demote_kv_pages_to_host(KVAddressSpaceStore& addresses, LogicalKVPageStore& pages,
+                                          const KVAddressSpaceHandle& address,
+                                          std::uint32_t sink_pages, std::uint32_t target_free,
+                                          std::span<const std::uint32_t> preferred);
+    // LOCAL PROTOTYPE (KVMem-style ring): release Device pages held by OTHER (inactive) addresses
+    // until `target_free` more Device pages are free. Inactive addresses are pure cache in ring mode
+    // (reuse of a host-demoted source is declined), so their Device replicas can go without affecting
+    // any live sequence. Returns the number of Device pages released.
+    std::uint32_t demote_other_addresses_to_host(KVAddressSpaceStore& addresses,
+                                                 LogicalKVPageStore& pages,
+                                                 const KVAddressSpaceHandle& skip,
+                                                 std::uint32_t target_free);
+    // LOCAL PROTOTYPE (KVMem-style ring retrieval): rank the pages in [begin, end) by an
+    // inverse-document-frequency weighted token overlap with the recent context (the sequence
+    // ledger is Host-side), and return the top `budget` page indices in ascending order.
+    [[nodiscard]] std::vector<std::uint32_t> select_retrieval_pages(const SequenceState& sequence,
+                                                                    std::uint32_t begin,
+                                                                    std::uint32_t end,
+                                                                    std::uint32_t budget) const;
+    // LOCAL PROTOTYPE (KVMem-style ring retrieval): bring the selected Host-resident pages back onto
+    // the Device (H2D) and re-publish their block-table slots. Returns the pages actually restored.
+    [[nodiscard]] std::vector<std::uint32_t>
+    restore_kv_pages_from_host(KVAddressSpaceStore& addresses, LogicalKVPageStore& pages,
+                               const KVAddressSpaceHandle& address,
+                               std::span<const std::uint32_t> logical_pages);
+    void release_sequence_kv_strict(SequenceState& sequence) noexcept;
 
     [[nodiscard]] std::uint32_t kv_lease_growth_margin_tokens() const noexcept {
         return std::max(prefill_chunk, kKVLeaseGrowthMarginTokens);
@@ -1642,6 +1691,18 @@ private:
 } // namespace ninfer::models::qwen3_5::detail
 
 namespace ninfer::models::qwen3_5::detail {
+
+// F batch: declaration for the engine body's ring predicate (defined in planning\startup.cpp).
+// Same single definition (NINFER_KV_WINDOW > 0); external linkage so program_impl.cpp's F-2
+// warning gate can call it.
+bool ring_requested();
+
+// LOCAL PROTOTYPE (host-backed reuse): one switch for the two gates that keep a ring-demoted reuse
+// source from being adopted - the publish gate (capture.cpp) and the capacity gate (pressure.cpp).
+// Defined once in planning\startup.cpp next to ring_requested(), read the same way
+// (NINFER_KV_REUSE_HOSTBACKED: set to anything but "0" = on). Unset or "0" = the behaviour before
+// this change, byte for byte.
+bool reuse_hostbacked_enabled();
 
 struct PressurePlanningSessionImpl {
     using Core                         = ProgramImpl;

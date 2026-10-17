@@ -4,11 +4,13 @@
 
 #include "ops/common/math.h"
 #include "ops/kernel/embed_gather.cuh"
+#include "ops/linear/t2/t2_rowsplit_storage.cuh" // PTQ1RowSplitStorage / PTQ1DecodeAtom
 #include "core/device.h" // CUDA_CHECK
 #include "core/pdl.cuh"
 
 #include <algorithm>
 #include <cstdint>
+#include <stdexcept>
 
 namespace ninfer::ops::detail {
 namespace {
@@ -181,6 +183,21 @@ void embed_gather_fp8_launch(const Tensor& ids, const Weight& table, Tensor& out
         launch_fp8<10, 128>(ids, table, out, stream);
     else
         launch_fp8<5, 128>(ids, table, out, stream);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void embed_gather_ptq1_launch(const Tensor& ids, const Weight& table, Tensor& out,
+                              cudaStream_t stream) {
+    const std::int32_t d = out.ne[0];
+    const std::int32_t T = ids.ne[0];
+    const std::int64_t n = static_cast<std::int64_t>(d) * T;
+    embed_gather_ternary_kernel<PTQ1RowSplitStorage, PTQ1DecodeAtom>
+        <<<grid_for(n), kBlock, 0, stream>>>(
+            static_cast<const std::int32_t*>(ids.data),
+            static_cast<const std::uint8_t*>(table.qdata),
+            static_cast<const std::uint8_t*>(table.qhigh),
+            static_cast<const std::uint8_t*>(table.scales),
+            static_cast<__nv_bfloat16*>(out.data), d, T, table.padded_shape[1]);
     CUDA_CHECK(cudaGetLastError());
 }
 

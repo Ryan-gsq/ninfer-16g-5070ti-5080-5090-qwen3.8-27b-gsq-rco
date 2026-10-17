@@ -483,6 +483,12 @@ struct EngineOptions {
     std::filesystem::path device_profile_path;
     StartupObserver startup_observer;
     DiagnosticObserver diagnostic_observer;
+    // GLP (GGUF Layer Projection) runtime steering: removes the component of each writer output
+    // (attention / GDN / FFN down) along a per-layer refusal direction, which lifts the refusal
+    // behaviour of an abliterated model to the official GLP baseline without re-quantising weights.
+    // Empty glp_vector disables the path; the default alpha of 0 makes projection a bit-exact no-op.
+    std::filesystem::path glp_vector;
+    float glp_alpha = 0.0F;
 };
 
 enum class SamplingMode : std::uint8_t {

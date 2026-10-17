@@ -16,6 +16,8 @@
 #include "models/qwen3_5/frontend/prepared_prompt.h"
 #include "models/qwen3_5/program/round_buffers.h"
 #include "models/qwen3_5/execution/stage_runtime.h"
+#include "models/qwen3_5/execution/glp_state.h"
+#include "models/qwen3_5/execution/linear.h"
 
 #include <array>
 #include <cstddef>
@@ -119,8 +121,24 @@ public:
 
     void set_mtp_proposal_extent(std::uint32_t extent) noexcept { mtp_proposal_extent_ = extent; }
 
+    // GLP steering: when set, each writer site removes this layer's direction from its output
+    // before the residual accumulation. Passing null (the default) leaves the stock fused path.
+    void set_glp_state(const GlpState* state) noexcept { glp_state_ = state; }
+
     void set_linear_state_slots(std::int32_t source_slot, std::int32_t destination_slot);
     void set_gdn_state_action(GdnStateAction action, const GdnReplayRecords* replay_records);
+
+    // ---- LOCAL (KVMem content scoring, 2026-10-02) --------------------------------------------
+    // Open the harvest round for the chunk about to run, and close it (index append + selection)
+    // once the chunk's attention has written its KV. Mirrors the donor engine's round lifecycle
+    // (fusion: targets/qwen3_6/impl/runtime/text_prefill_impl.h:118-124 before the chunk and
+    // :183-199 after it) but keeps the geometry (layers / kv_heads / head_dim / max_context) where it
+    // lives -- on this object -- so the prefill driver only makes two calls.
+    //
+    // Both are no-ops when NINFER_TERNARY_KVMEM is off: raw_k_shadow_harvest_for() returns null and the
+    // methods then do nothing at all, which is what keeps the OFF arm bit-identical.
+    void kvmem_round_begin();
+    void kvmem_round_end();
 
     [[nodiscard]] const LinearParameters* proposal_head() const noexcept { return proposal_head_; }
 
@@ -209,6 +227,9 @@ private:
     // ReplaySSM record storage for GDN layer `layer`, from the shard that holds it.
     [[nodiscard]] GdnReplayRecordLayer replay_layer(std::uint32_t layer, std::int32_t batch,
                                                     std::int32_t width) const;
+
+    // The GLP steering handle for the layer currently being executed, or an inactive handle.
+    [[nodiscard]] GlpSteering glp_steering() const;
     template <class Tap>
     void target_verify_batch_impl(const Tensor& ids, const Tensor& cache_positions,
                                   const Tensor& rope_positions, const Tensor& valid_columns,
@@ -262,8 +283,12 @@ private:
     LinearAttentionStatePool& state_;
     qwen3_5::RoundState& io_;
     Tensor& prefill_hidden_;
-    std::uint32_t prefill_chunk_;
-    bool fast_prefill_kernel_ = false;
+    std::uint32_t prefill_chunk_;    bool fast_prefill_kernel_ = false;
+    // LOCAL (KVMem content scoring, 2026-10-02): the harvest round for the chunk in progress (opaque
+    // so this header keeps no KVMem dependency), and the width the round was opened with. Both are
+    // null/zero when the feature is off -- every reader then does nothing.
+    void*         kvmem_harvest_       = nullptr;
+    std::int32_t  kvmem_round_width_   = 0;
     void* first_token_logits_ = nullptr;
     std::uint32_t text_kv_base_;
     const Tensor* active_cache_positions_                                          = nullptr;
@@ -297,6 +322,11 @@ private:
     std::uint32_t mtp_attention_window_         = 0;
     const MtpParameters* mtp_                   = nullptr;
     StageRuntime* stage_runtime_                = nullptr;
+    // GLP steering. `active_layer_` is set by run_stage_layers for the duration of one layer so
+    // the mixer and FFN helpers can look up that layer's direction without threading the layer
+    // index through every signature (the index they already take is a per-kind compact index).
+    const GlpState* glp_state_                  = nullptr;
+    std::int32_t active_layer_                  = -1;
 };
 
 } // namespace ninfer::models::qwen3_5::execution

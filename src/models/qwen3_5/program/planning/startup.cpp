@@ -11,6 +11,10 @@
 #include "models/qwen3_5/execution/workspace.h"
 #include "core/device.h"
 #include "core/host_kv_arena.h"
+// LOCAL (2026-10-02, defect D-1): the startup warning below names the content-scorer switch state, so
+// this file needs the switch's own predicate (host-safe header: no CUDA kernel is pulled in).
+#include "ops/kvmem/kvmem_score.h"
+#include "ops/kvmem/kvmem_shadow.h"   // B06: the mean-K index / raw-K harvest switch (kvmem_shadow_enabled)
 #include "ninfer/ops/gated_delta_net.h"
 #include "ninfer/ops/candidate_selector.h"
 #include "ninfer/ops/context_kv_materialize.h"
@@ -26,6 +30,7 @@
 #include "ninfer/ops/speculative_round.h"
 #include <algorithm>
 #include <cstdlib>
+#include <cstdio>
 #include <initializer_list>
 #include <limits>
 #include <stdexcept>
@@ -34,6 +39,27 @@
 #include <vector>
 
 namespace ninfer::models::qwen3_5::detail {
+
+// LOCAL PROTOTYPE (KVMem-style ring): the experimental ring is opt-in through the same
+// environment switch the engine-side gate reads (NINFER_KV_WINDOW). Defined once here so both
+// validation sites stay in step.
+// F batch: MOVED out of the anonymous namespace (body unchanged) so program_impl.cpp's F-2
+// warning gate can call it too - that needs external linkage. Declared in program_impl.h.
+bool ring_requested() {
+    const char* text = std::getenv("NINFER_KV_WINDOW");
+    if (text == nullptr || text[0] == '\0') { return false; }
+    return std::strtol(text, nullptr, 10) > 0;
+}
+
+// LOCAL PROTOTYPE (host-backed reuse): gate for the "adopt a source whose range the pool cannot
+// hold" path (S3) and for the publish gate in capture.cpp (S2). Read once here, beside
+// ring_requested(), so every gate reads the same switch; startup prints its state so an arm's log
+// names it. Unset or "0" keeps the pre-change behaviour exactly.
+bool reuse_hostbacked_enabled() {
+    const char* text = std::getenv("NINFER_KV_REUSE_HOSTBACKED");
+    return text != nullptr && text[0] != '\0' && text[0] != '0';
+}
+
 namespace {
 
 using execution::dimension;
@@ -73,6 +99,20 @@ std::uint32_t page_count(std::uint32_t capacity) {
     return 1U + (capacity - 1U) / static_cast<std::uint32_t>(kPagedKVPageSize);
 }
 
+// 2026-10-05 (P1-a startup guard): how many leading pages the attention-sink pin takes.
+// MIRRORS storage/context.cpp's proto_kv_sink_pages() exactly -- same env var, same default (4 pages
+// = 256 tokens, StreamingLLM-style), same integer division by the page size. It is re-derived here
+// rather than called because that helper has INTERNAL linkage in context.cpp (no header declares it),
+// so the planner cannot reach it. If either copy changes, change BOTH -- and the guard's whole point
+// is that the two must agree about what the sink will reserve at run time.
+std::uint32_t sink_pages_for_guard() {
+    const char* text = std::getenv("NINFER_KV_SINK");
+    if (text == nullptr) { return 4U; }
+    const long tokens = std::strtol(text, nullptr, 10);
+    if (tokens <= 0) { return 0U; }
+    return static_cast<std::uint32_t>(tokens / static_cast<long>(kPagedKVPageSize));
+}
+
 // The Main KV pages a plan may hold. The Legacy cache retains context in continuations whose pages
 // fit the C active lanes' windows, so C * L pages bound it. The hybrid cache keeps every Device
 // page no active lease holds as cached blocks, so only the token capacity representation (pages *
@@ -89,6 +129,35 @@ std::uint64_t maximum_main_page_groups(std::uint32_t concurrency, std::uint32_t 
         throw std::overflow_error("maximum Main KV page count exceeds uint32");
     }
     return maximum;
+}
+
+// LOCAL PORT (CraneBW / laamaafung `kvmem_resident_pages`; source of the copied SEMANTICS:
+// E:\infer-build\exp\cranebw\diffwork\theirs_layouts_impl.h:673-697). Under the ring the Device pool
+// is a resident WORKING SET rather than an image of the address space, so a pool size WE choose must
+// follow what the runtime asks of it -- one window plus the prefill piece a lane maps next, per lane
+// -- and NOT the device memory that happens to be free. Sizing it by free VRAM is how a KVMem-style
+// arm quietly spends the whole card on resident KV it does not need, which is the opposite of the
+// goal this port exists for. Window is read exactly like the ring reads it
+// (storage\context.cpp:1855-1865): integer division by the page size, 0/unset = the whole context.
+// The ring's own slack (storage\context.cpp kRingSlackPages) is added because the restore path
+// always needs a free Device page; the retrieval set it brings back is derived from the pool itself
+// (pool / 4) and therefore needs no term of its own.
+std::uint64_t ring_resident_pages(std::uint32_t capacity, std::uint32_t prefill_chunk,
+                                  std::uint32_t concurrency) {
+    constexpr std::uint64_t kRingPoolSlackPages = 8;
+    const std::uint64_t logical_pages           = page_count(capacity);
+    const char* text                            = std::getenv("NINFER_KV_WINDOW");
+    const long window_tokens = text == nullptr ? 0 : std::strtol(text, nullptr, 10);
+    const std::uint64_t window_pages =
+        window_tokens > 0 ? static_cast<std::uint64_t>(window_tokens) /
+                                static_cast<std::uint32_t>(kPagedKVPageSize)
+                          : logical_pages;
+    const std::uint64_t lanes = concurrency == 0 ? 1U : concurrency;
+    const std::uint64_t per_lane =
+        std::min<std::uint64_t>(window_pages + page_count(prefill_chunk == 0 ? 1U : prefill_chunk),
+                                logical_pages);
+    const std::uint64_t demand = per_lane * lanes + kRingPoolSlackPages;
+    return std::max<std::uint64_t>(std::min<std::uint64_t>(demand, logical_pages), lanes);
 }
 
 template <class ProfileAllowance>
@@ -140,6 +209,19 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
                   ((static_cast<std::uint64_t>(plan.draft_window - 1U) + kPagedKVPageSize - 1U) /
                    static_cast<std::uint32_t>(kPagedKVPageSize))
             : 0ULL;
+    // MEASURED 2026-09-30 (arms S2a6/S2a7 vs S2a8): porting CraneBW's
+    // `mtp_base_pages = host_backed ? logical_pages : physical_pages`
+    // (E:\infer-build\exp\cranebw\diffwork\theirs_layouts_impl.h:107-123) into THIS engine BREAKS the
+    // MTP pool, so it is deliberately NOT applied here. Sizing the MTP pool to the LOGICAL context
+    // clears `allow_logical_reservation` (state\decoder_state.cpp:84 derives it from
+    // logical_pages > physical_page_groups), i.e. the MTP pool stops being over-subscribable -- but
+    // our ring streams and demotes the MTP pool too (`ring_one(backend...)`,
+    // storage\context.cpp:2172-2175), so it NEEDS that allowance. Readings: ring + 16-page text pool
+    // + --spec mtp + --prefill-chunk 256 went turn1 200 / turn2 200 (before, S2a5) ->
+    // turn1 200 / turn2 HTTP 429 "engine out of memory during execution"
+    // (runtime 1.13 -> 1.26 GiB); the same arm without MTP (S2a8) stayed 200/200, which pins the
+    // regression on this change. His fix applies where the MTP pool has no tier of its own; ours
+    // does. Kept at the previous figure on purpose.
     const std::uint32_t mtp_physical_pages = static_cast<std::uint32_t>(
         checked_i32(static_cast<std::uint64_t>(physical_pages) + mtp_extra_pages,
                     "MTP Paged KV physical pages exceed int32"));
@@ -420,12 +502,26 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     const auto add_scratch = [&](WorkspaceLayoutBuilder& layout,
                                  const execution::LinearParameters& p, int first, int last,
                                  bool wide_verification = false) {
-        scratch(layout,
-                execution::rotated_workspace_bytes(
-                    p.hadamard_signs, p.weight.k, last,
-                    ops::linear_add_workspace_capacity_bytes(
-                        p.weight.qtype, p.weight.n, p.weight.k,
-                        execution::residual_projection_policy(p, wide_verification), first, last)));
+        const std::size_t stock = execution::rotated_workspace_bytes(
+            p.hadamard_signs, p.weight.k, last,
+            ops::linear_add_workspace_capacity_bytes(
+                p.weight.qtype, p.weight.n, p.weight.k,
+                execution::residual_projection_policy(p, wide_verification), first, last));
+        // GLP steering materialises the writer output (ops::linear) and projects it before the
+        // residual add, instead of accumulating inside a fused linear_add. That exposes one
+        // {output_rows, tokens} buffer and the linear workspace, so the reservation has to cover
+        // the larger of the two when the layer will steer.
+        if (!parameters.text.glp.enabled()) {
+            scratch(layout, stock);
+            return;
+        }
+        const std::size_t glp = execution::rotated_workspace_bytes(
+            p.hadamard_signs, p.weight.k, last,
+            ops::linear_workspace_capacity_bytes(p.weight.qtype, p.weight.n, p.weight.k, p.policy,
+                                                 first, last) +
+                static_cast<std::size_t>(p.weight.n) * static_cast<std::size_t>(last) *
+                    static_cast<std::size_t>(dtype_size(DType::BF16)));
+        scratch(layout, std::max(stock, glp));
     };
     const auto target_body = [&](WorkspaceLayoutBuilder& layout, std::int32_t first,
                                  std::int32_t last, TextPhase phase, GdnWorkspacePath path,
@@ -485,7 +581,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
             (void)workspace::post_mixer_hidden(layout, config, last);
             scratch(layout,
                     execution::ffn_workspace_bytes(block.ffn, first, last, false,
-                                                   phase == TextPhase::Verify, wide_verification));
+                                                   phase == TextPhase::Verify, wide_verification,
+                                                   parameters.text.glp.enabled()));
         }
         if (!plan.causal_scoring) {
             linear_scratch(layout, parameters.text.output_head, first, last);
@@ -493,7 +590,8 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
     };
     const auto mtp_post_mixer = [&](WorkspaceLayoutBuilder& layout, int first, int last) {
         linear_scratch(layout, parameters.mtp->output, first, last);
-        scratch(layout, execution::ffn_workspace_bytes(parameters.mtp->ffn, first, last, true));
+        scratch(layout, execution::ffn_workspace_bytes(parameters.mtp->ffn, first, last, true,
+                                                       false, false, parameters.text.glp.enabled()));
     };
     const auto proposal_scratch = [&](WorkspaceLayoutBuilder& layout, std::int32_t columns) {
         if (plan.proposal_head == ProposalHead::Optimized) {
@@ -963,12 +1061,17 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
         if (options.enable_vision) { unsupported("vision"); }
     }
     const std::uint32_t logical_pages = page_count(options.max_context);
-    const std::uint32_t minimum_pages = std::max(logical_pages, options.max_concurrency);
+    // LOCAL PROTOTYPE (KVMem-style ring): the ring lets the Device pool be SMALLER than the logical
+    // context (the address-space allocator recycles the oldest pages). Off the ring the original
+    // floor stays exactly as it was, so the OFF arm is unchanged.
+    const std::uint32_t minimum_pages =
+        ring_requested() ? options.max_concurrency
+                         : std::max(logical_pages, options.max_concurrency);
     const std::uint64_t maximum_pages64 =
         maximum_main_page_groups(options.max_concurrency, logical_pages, options.context_cache);
     switch (options.kv_capacity.mode) {
     case KvCapacityMode::Explicit: {
-        if (options.kv_capacity.explicit_tokens < options.max_context) {
+        if (!ring_requested() && options.kv_capacity.explicit_tokens < options.max_context) {
             throw std::invalid_argument("kv_capacity must be at least max_context");
         }
         const std::uint32_t requested_pages = page_count(options.kv_capacity.explicit_tokens);
@@ -976,6 +1079,67 @@ void validate_target_options(const execution::Parameters& parameters, DeviceCont
             throw std::invalid_argument(
                 "kv_capacity is outside the usable range for max_context and max_concurrency");
         }
+        // ---- P1-a STARTUP GUARD (2026-10-05): the sink pin must fit the pool. ------------------
+        // WHY THIS EXISTS: without it, NINFER_KV_SINK larger than the pool does NOT fail at startup.
+        // It fails on EVERY request instead, and the failure is not a capacity error the client can
+        // read: demote_kv_pages_to_host starts its scan AT sink_pages, so when sink_pages >= mapped
+        // the scan breaks immediately, freed stays 0, and the answer is cut off at the lease.
+        // Measured 2026-10-05 on the 8 GB tier's real pool (--kv-capacity 2176 = 34 pages) with the
+        // MEASURED skeleton size (2,808 tokens = 44 pages): sink 44 > pool 34 => every request dies,
+        // and the output was truncated to 2 tokens before the client could see why.
+        // The guard turns that into one readable refusal at startup, naming the gap and three ways out.
+        // The "+ 1" is deliberate: a pool that exactly equals the sink leaves no room for the request
+        // being served, and the measured failure mode of that case was "needs 16 free, 15 available"
+        // -- i.e. short by exactly one page.
+        const std::uint32_t sink_pages = sink_pages_for_guard();
+        // ---- SECOND GATE (2026-10-05, added after measurement): a pin that fills the pool is as
+        // unservable as a pin that does not fit. The "+ 1" gate alone ACCEPTED pool 45 + sink 44 and
+        // then every request failed. The threshold is measured, not guessed: sweeping the pool with
+        // the pin fixed at 44 pages (probe-kmin-sweep.ps1, one request each) gave
+        //     pool 45..52  (free 0)                    -> HTTP 429
+        //     pool 55..59  (free 0..3)                 -> HTTP 200 but the WRONG tool was named
+        //     pool 60..64  (free 4..8)                 -> HTTP 200 and the tool named correctly
+        // i.e. correctness needs at least kMinWorkingPages of pool beyond the pin. 4 pages = 256
+        // tokens of working room; below that the ring has no room to restore what it dropped.
+        constexpr std::uint32_t kMinWorkingPages = 4U;
+        if (sink_pages != 0) {
+            const std::uint32_t needed_total = sink_pages + kMinWorkingPages;
+            if (needed_total > requested_pages) {
+                const std::uint32_t shortfall = needed_total - requested_pages;
+                throw std::invalid_argument(
+                    std::string("NINFER_KV_SINK pin leaves no working room in the KV pool: the pin "
+                                "needs ") + std::to_string(sink_pages) +
+                    " page(s) and the ring needs at least " + std::to_string(kMinWorkingPages) +
+                    " page(s) beyond it (measured: below that the tool block is dropped and answers "
+                    "name a tool that does not exist), so the pool must hold at least " +
+                    std::to_string(needed_total) + " page(s); it holds " +
+                    std::to_string(requested_pages) + " -- short by " +
+                    std::to_string(shortfall) + " page(s).\n"
+                    "       Sizing: NINFER_KV_SINK is measured in TOKENS and is divided by the page "
+                    "size (" + std::to_string(static_cast<unsigned>(kPagedKVPageSize)) +
+                    "), so it rounds DOWN; set a multiple of that.\n"
+                    "       Ways out (pick one):\n"
+                    "         1) raise --kv-capacity to at least " + std::to_string(needed_total) +
+                    " page(s) (= " +
+                    std::to_string(static_cast<std::uint64_t>(needed_total) *
+                                   static_cast<std::uint64_t>(kPagedKVPageSize)) +
+                    " tokens), remembering to raise --max-context with it;\n"
+                    "         2) lower NINFER_KV_SINK so that it leaves " +
+                    std::to_string(kMinWorkingPages) + " page(s) of room;\n"
+                    "         3) unset NINFER_KV_SINK (or set it to 0) to drop the pin and accept "
+                    "that the prefix/tool block may be demoted.\n"
+                    "       Current configuration: pool " + std::to_string(requested_pages) +
+                    " page(s) (--kv-capacity " + std::to_string(options.kv_capacity.explicit_tokens) +
+                    " tokens), logical " + std::to_string(logical_pages) + " page(s) (--max-context " +
+                    std::to_string(options.max_context) + " tokens), max_concurrency " +
+                    std::to_string(options.max_concurrency) + ", NINFER_KV_SINK " +
+                    std::to_string(sink_pages) + " page(s).");
+            }
+        }
+        // NOTE (2026-10-05): an earlier, weaker gate here was `sink_pages + 1 > requested_pages`.
+        // It is deliberately GONE because the kMinWorkingPages gate above is strictly stronger
+        // (sink + 4 > sink + 1 for every sink), so keeping it would only be dead code that
+        // suggests a weaker contract than the one actually enforced.
         break;
     }
     case KvCapacityMode::Automatic:
@@ -1073,7 +1237,94 @@ std::unique_ptr<SequencePlanImpl> build_sequence_candidate(const SequencePlannin
     impl->context_cache       = inputs.context_cache;
     impl->kv_storage          = inputs.kv_storage;
     impl->persistent          = persistent_layout(*impl);
+    // MEASURED LIMIT (2026-09-30, first two-lane run of the ring): the ring's demotion only reclaims
+    // the CALLING sequence's own Device pages - `demote_other_addresses_to_host` returns early for
+    // every ACTIVE address (`active || handle == skip`), so a second active lane's pages can never be
+    // reclaimed. With a pool below the combined working set the pool's reservation invariant then
+    // fails inside DeviceKVPagePool::materialize ("Paged KV reservation invariant was violated") and
+    // BOTH lanes end with HTTP 500. Measured with pool 128 pages, --max-concurrency 2, 40K-token
+    // prompts; the dense control (same fixture, ring off) passes with both lanes hitting their own
+    // needle. Refuse loudly at startup instead of crashing mid-request.
+    // LOCAL PROTOTYPE (host-backed reuse): name the switch's state in every startup log, so an arm's
+    // readings attribute themselves without guessing (this file is the switch's single definition).
+    std::fprintf(stderr, "[ninfer] reuse host-backed: %s\n",
+                 reuse_hostbacked_enabled() ? "on" : "off");
+    // LOCAL (2026-10-02, defect D-1, then D-1b): the ring is on but the CONTENT SCORER is off. That now
+    // only happens when the operator asked for it EXPLICITLY -- since 2026-10-02 the scorer defaults ON
+    // whenever the ring is configured (kvmem_score.h: "explicit value wins; otherwise ring on => on"),
+    // because a fix that ships switched off is a fix the user does not have (measured shipping-shape
+    // cost: pool 4000, multi-needle n=6 => hit 2/6 with every wrong answer a bare `300` from the filler).
+    // This line therefore reports a DELIBERATE choice plus what it costs, and names the way back.
+    if (ring_requested() && !ops::detail::kvmem_score_enabled()) {
+        std::fprintf(stderr,
+                     "[ring] the content scorer was EXPLICITLY DISABLED (NINFER_TERNARY_KVMEM=0 or "
+                     "NINFER_TERNARY_KVMEM_SCORE=0): retrieval falls back to the lexical IDF ranking, "
+                     "which measured 4/6 where the content ranking measured 6/6 at the same restore "
+                     "budget -- and 2/6 vs 6/6 at pool 4000 on the multi-needle fixture.\n"
+                     "       Drop that variable to get the default (scorer ON whenever the ring is on). "
+                     "If you DO want it on with an explicit override, the shape is:\n"
+                     "         NINFER_TERNARY_KVMEM=1\n"
+                     "         NINFER_TERNARY_KVMEM_SCORE=1\n"
+                     "         NINFER_TERNARY_KVMEM_SCORE_QUERY_TAIL=64   <- the QUESTION window. "
+                     "Never widen it: with --prefill-chunk 1024 a missing tail made the scorer skip every "
+                     "chunk, and a WIDE tail mis-ranks at a small pool (measured, pool 4000, n=6: turn2 "
+                     "2/6 at tail=256 vs 6/6 at tail=64; the wide window is mostly filler + the previous "
+                     "turn's answer)\n");
+    }
+    // LOCAL (2026-10-02, D-1b): the mirror image of the line below -- when the scorer is ON without any
+    // explicit switch, SAY SO. Silence would make "which ranking am I running?" unanswerable from the
+    // log, which is exactly how the shipped default managed to hide the fix in the first place.
+    if (ring_requested() && ops::detail::kvmem_score_enabled() &&
+        std::getenv("NINFER_TERNARY_KVMEM_SCORE") == nullptr) {
+        std::fprintf(stderr,
+                     "[ring] content scoring ON by default (the ring is configured): retrieval ranks pages "
+                     "by the query-conditioned content score. Set NINFER_TERNARY_KVMEM_SCORE=0 (or the "
+                     "master switch NINFER_TERNARY_KVMEM=0) to fall back to the lexical ranking (that is "
+                     "the negative control, not a tuning knob).\n");
+    }
+    if (ring_requested() && inputs.max_concurrency > 1) {
+        std::fprintf(stderr,
+                     "[ring] NINFER_KV_WINDOW (KVMem ring) serves ONE active sequence: the ring cannot "
+                     "reclaim another lane's Device pages.\n"
+                     "       Run with --max-concurrency 1, or unset NINFER_KV_WINDOW.\n");
+        throw std::invalid_argument(
+            "NINFER_KV_WINDOW (KVMem ring) requires --max-concurrency 1");
+    }
+    // B06 (2026-10-04): the mean-K index is ONE process-wide slot, registered as a known limitation by
+    // the component itself (mean_k_index.h:248-251): "one index for the whole process means two
+    // concurrent sequences share it. V1 drives a single sequence... before --max-concurrency > 1 is used
+    // with KVMem on, this must become one index per lane and the arena account must grow by
+    // N x mean_k_index_bytes(layers, blocks, kv_heads, head_dim)".
+    // The guard above only covers the RING configuration. The scorer can also be switched on with the
+    // ring OFF (an explicit NINFER_TERNARY_KVMEM=1 and no NINFER_KV_WINDOW), and that configuration was
+    // reachable with --max-concurrency > 1: two lanes then share the index -- and the raw-K harvest,
+    // which is gated by the same switch -- so one sequence's KEPT set can be another sequence's blocks.
+    // A silent wrong retrieval is the one class of defect this project refuses to ship, so refuse the
+    // combination loudly and name both ways out. Making the index per-lane is a component change (one
+    // index per lane + the arena account xN), not a flag; until that exists, this combination is the
+    // boundary, not a tuning knob.
+    if (inputs.max_concurrency > 1 && ops::detail::kvmem_shadow_enabled()) {
+        std::fprintf(stderr,
+                     "[kvmem] the KVMem content scorer keeps ONE mean-K index (and one raw-K harvest) for "
+                     "the whole process, so two active sequences would rank each other's blocks "
+                     "(mean_k_index.h:248-251).\n"
+                     "       Run with --max-concurrency 1, or switch the scorer off "
+                     "(NINFER_TERNARY_KVMEM=0).\n");
+        throw std::invalid_argument("KVMem content scoring requires --max-concurrency 1");
+    }
     if (impl->context_cache.enabled && impl->context_cache.mode == ContextCacheMode::Hybrid) {
+        if (ring_requested()) {
+            // LOCAL PROTOTYPE (KVMem-style ring): this branch zeroes the Host KV budget below, so
+            // `host_kv_arena` is never created and the ring loses its only demotion target -
+            // attention would silently stay dense. Refuse loudly instead of degrading in silence.
+            std::fprintf(stderr,
+                         "[ring] NINFER_KV_WINDOW (KVMem ring) conflicts with ContextCacheMode::Hybrid: "
+                         "Hybrid zeroes the Host KV budget, so the ring has no demotion target.\n"
+                         "       Use Legacy mode with --host-kv-mib, or unset NINFER_KV_WINDOW.\n");
+            throw std::invalid_argument(
+                "NINFER_KV_WINDOW (KVMem ring) requires the Legacy context-cache Host KV pool; "
+                "Hybrid mode disables it");
+        }
         // The whole Host budget is the hybrid slab pool that KV blocks and state snapshots share
         // (docs/maintainer/hybrid-prefix-cache-spec.md §5.4); the Legacy Host pools stay empty.
         // A budget too small for one snapshot is rejected here, before anything is allocated.
@@ -1341,6 +1592,7 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .parameters                 = &parameters,
         .capacity                   = options.max_context,
         .max_concurrency            = options.max_concurrency,
+        .kv_capacity_automatic      = options.kv_capacity.mode == KvCapacityMode::Automatic,
         .prefill_chunk              = effective_prefill_chunk(parameters, options),
         .fast_prefill_kernel        = options.fast_prefill_kernel,
         .draft_window               = options.speculative.draft_tokens,
@@ -1362,9 +1614,24 @@ make_sequence_planner_impl(const execution::Parameters& parameters, DeviceContex
         .context_cache              = options.context_cache,
     };
     const std::uint32_t logical_pages = page_count(inputs.capacity);
-    const std::uint32_t minimum_pages = std::max(logical_pages, inputs.max_concurrency);
-    const auto maximum_pages          = static_cast<std::uint32_t>(
+    // LOCAL PROTOTYPE (KVMem-style ring): see the plan-side floor above.
+    const std::uint32_t minimum_pages =
+        ring_requested() ? inputs.max_concurrency
+                         : std::max(logical_pages, inputs.max_concurrency);
+    const auto maximum_pages_unbounded    = static_cast<std::uint32_t>(
         maximum_main_page_groups(inputs.max_concurrency, logical_pages, inputs.context_cache));
+    // LOCAL PORT (CraneBW `kvmem_resident_pages`): when the pool size is OURS to choose, the ring's
+    // pool is a resident working set, so cap it at that working set instead of letting automatic
+    // sizing spend the free VRAM on resident KV the ring does not need. An explicit --kv-capacity
+    // (kv_capacity_automatic == false) is an operator's number and is deliberately left untouched --
+    // the measured "pool >= prefix" configuration (cache 40,068 = 99.9%) depends on it.
+    std::uint32_t maximum_pages = maximum_pages_unbounded;
+    if (ring_requested() && inputs.kv_capacity_automatic) {
+        maximum_pages = static_cast<std::uint32_t>(std::min<std::uint64_t>(
+            maximum_pages_unbounded,
+            ring_resident_pages(inputs.capacity, inputs.prefill_chunk, inputs.max_concurrency)));
+        maximum_pages = std::max(maximum_pages, minimum_pages);
+    }
 
     auto planner     = std::make_unique<qwen3_5::detail::SequencePlannerImpl>();
     planner->inputs  = inputs;
@@ -1420,6 +1687,51 @@ finalize_sequence_plan_impl(std::unique_ptr<qwen3_5::detail::SequencePlannerImpl
             throw std::logic_error(
                 "Qwen3.5 physical sequence layout is not affine in Main KV page capacity on a "
                 "further device");
+        }
+    }
+    // RING HOST-BUDGET GUARD (measured 2026-09-30; pitfall table §5.138). The ring's ONLY demotion
+    // target is the Legacy Host KV tier, so every mapped page the Device pool cannot hold has to fit
+    // there. With `--host-kv-mib 64` (32 pages) against 1,024 logical pages the very first COLD
+    // request died inside DeviceKVPagePool::materialize ("Paged KV reservation invariant was
+    // violated", HTTP 500) after `demote-other short: freed=0 want=8/4/10/7 ...`: the pool could not
+    // be drained because the Host tier had nowhere to put the pages. Refuse loudly at startup
+    // instead of crashing mid-generation.
+    //
+    // CRITERION: host_pages + pool_pages >= logical_pages. It is evaluated here, on the RESOLVED
+    // plan, because the Device pool is chosen by the runtime capacity curve and is only known at
+    // this point -- and the resolved pool is what the ring will actually run with. `host_pages` uses
+    // the same division the engine uses for its own logical-page budget (program_impl.cpp:249).
+    // Boundary not covered: pages the pool lends to the context cache would shrink the effective
+    // pool, which this check does not model (unverified).
+    if (ring_requested()) {
+        const std::size_t host_stride = plan->persistent.host_kv_text_page_stride;
+        const std::uint64_t host_pages =
+            host_stride == 0
+                ? 0U
+                : static_cast<std::uint64_t>(plan->context_cache.host_kv_capacity_bytes) /
+                      static_cast<std::uint64_t>(host_stride);
+        const std::uint64_t logical_pages = page_count(plan->capacity);
+        const std::uint64_t pool_pages    = plan->main_page_groups;
+        if (host_pages + pool_pages < logical_pages) {
+            std::fprintf(stderr,
+                         "[ring] NINFER_KV_WINDOW (KVMem ring) cannot demote: the Legacy Host KV tier "
+                         "holds %llu page(s) and the resolved Device pool holds %llu, but the logical "
+                         "context needs %llu.\n"
+                         "       The ring's only demotion target is the Host tier, so the pool could "
+                         "never be drained and the first request would fail mid-generation.\n"
+                         "       Raise --host-kv-mib to cover at least %llu page(s) (or lower "
+                         "--max-context).\n",
+                         static_cast<unsigned long long>(host_pages),
+                         static_cast<unsigned long long>(pool_pages),
+                         static_cast<unsigned long long>(logical_pages),
+                         static_cast<unsigned long long>(logical_pages > pool_pages
+                                                            ? logical_pages - pool_pages
+                                                            : 0U));
+            throw std::invalid_argument(
+                "NINFER_KV_WINDOW (KVMem ring) needs a Host KV tier that can hold every page the "
+                "Device pool cannot: host_pages=" + std::to_string(host_pages) + " pool_pages=" +
+                std::to_string(pool_pages) + " logical_pages=" + std::to_string(logical_pages) +
+                " (raise --host-kv-mib)");
         }
     }
     return plan;

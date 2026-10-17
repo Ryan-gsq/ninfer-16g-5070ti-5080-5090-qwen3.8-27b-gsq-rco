@@ -814,25 +814,55 @@ void ProgramImpl::prepare_materialization(MaterializationTransaction& transactio
         (source_state != nullptr || shared_state != nullptr) && details.text_prefix_fork_required;
     const bool backend_prefix_fork = (source_state != nullptr || shared_state != nullptr) &&
                                      details.backend_prefix_fork_required;
+    // ROUTE 3 (lazy adopt): ask, per address, whether the activation range cannot be made
+    // Device-resident at all. Only then is the activation committed with deferred replicas and the
+    // remainder handed to the ring -- never as a silent degradation of a range that would have fit.
+    // Gated: without NINFER_KV_REUSE_HOSTBACKED (or off the ring) this is false and every historic
+    // path stays byte-identical.
+    const auto judge_deferred_replicas = [&](KVAddressSpaceStore& addresses,
+                                             LogicalKVPageStore& pages, KVAddressSpaceHandle address,
+                                             std::optional<std::uint32_t> frontier) {
+        if (!reuse_hostbacked_enabled() || !ring_requested() || !frontier) { return false; }
+        const std::uint32_t required = kv_pages_for_frontier(*frontier);
+        if (required > addresses.mapped_pages(address)) { return false; }
+        std::uint32_t missing = 0;
+        for (std::uint32_t page = 0; page < required; ++page) {
+            if (!pages.device_resident(addresses.logical_page(address, page))) { ++missing; }
+        }
+        const auto& pool         = pages.physical_pool();
+        const std::uint32_t room = pool.usable_pages() > pool.allocated_pages()
+                                       ? pool.usable_pages() - pool.allocated_pages()
+                                       : 0U;
+        return missing > room;
+    };
+    bool defer_text_replicas = false;
     if (text_prefix_fork) {
         transaction.text_source_restore_reservation.emplace(
             text_kv_pages->physical_pool().make_empty_reservation());
     } else {
         const KVAddressSpaceHandle activation_address =
             retained_source ? *transaction.root_text_address : text_address;
+        defer_text_replicas =
+            judge_deferred_replicas(*text_kv_addresses, *text_kv_pages, activation_address,
+                                    transaction.text_activation_frontier);
         transaction.text_activation.emplace(text_kv_addresses->prepare_activation(
             activation_address, details.text_kv_page_entitlement, static_cast<std::int32_t>(lane),
-            transaction.text_activation_frontier));
+            transaction.text_activation_frontier, defer_text_replicas));
     }
+    bool defer_backend_replicas = false;
     if (backend_address && backend_prefix_fork) {
         transaction.backend_source_restore_reservation.emplace(
             backend_kv_pages->physical_pool().make_empty_reservation());
     } else if (backend_address) {
         const KVAddressSpaceHandle activation_address =
             retained_source ? *transaction.root_backend_address : *backend_address;
+        defer_backend_replicas =
+            judge_deferred_replicas(*backend_kv_addresses, *backend_kv_pages, activation_address,
+                                    transaction.backend_activation_frontier);
         transaction.backend_activation.emplace(backend_kv_addresses->prepare_activation(
             activation_address, details.backend_kv_page_entitlement,
-            static_cast<std::int32_t>(lane), transaction.backend_activation_frontier));
+            static_cast<std::int32_t>(lane), transaction.backend_activation_frontier,
+            defer_backend_replicas));
     }
 
     const auto prepare_kv_restores =
@@ -840,7 +870,7 @@ void ProgramImpl::prepare_materialization(MaterializationTransaction& transactio
             std::optional<std::uint32_t> activation_frontier, bool source_reservation,
             DeviceKVPageReservation& reservation,
             std::vector<MaterializationTransaction::KVRestorePage>& restores,
-            std::vector<DeviceKVPageHandle>& destinations) {
+            std::vector<DeviceKVPageHandle>& destinations, bool defer) {
             const std::uint32_t mapped = activation_frontier
                                              ? kv_pages_for_frontier(*activation_frontier)
                                              : addresses.mapped_pages(address);
@@ -851,12 +881,38 @@ void ProgramImpl::prepare_materialization(MaterializationTransaction& transactio
             for (std::uint32_t page = 0; page < mapped; ++page) {
                 if (!pages.device_resident(addresses.logical_page(address, page))) { ++missing; }
             }
+            // LOCAL FIX (ring restore room): restoring a checkpoint's Host pages needs
+            // Device room, but nothing demoted first, so a pool already holding other
+            // residents failed the single-page materialization. Drain the inactive
+            // addresses (pure cache) before restoring this one.
+            if (missing != 0) {
+                (void)demote_other_addresses_to_host(addresses, pages, address, missing);
+            }
             if (source_reservation) {
                 pages.physical_pool().resize_reservation(reservation, missing);
             }
-            for (std::uint32_t page = 0; page < mapped; ++page) {
+            // ROUTE 3 (lazy adopt): materialize only what the Device can hold right now, NEWEST pages
+            // first -- the ring's window is the recent tail and its mask covers exactly the resident
+            // set. Every page left behind keeps its reservation page as this lane's on-demand budget,
+            // and the ring restores it a page at a time (restore_kv_pages_from_host,
+            // storage\context.cpp:2183) when the retrieval window asks for it. Without the gate this
+            // is the historic "restore the whole activation range, ascending" walk, unchanged.
+            std::uint32_t restore_budget = missing;
+            if (defer) {
+                const auto& pool           = pages.physical_pool();
+                const std::uint32_t room   = pool.usable_pages() > pool.allocated_pages()
+                                                 ? pool.usable_pages() - pool.allocated_pages()
+                                                 : 0U;
+                constexpr std::uint32_t kDeferredSlack = 4U;  // room for the ring's own restore churn
+                restore_budget = std::min<std::uint32_t>(
+                    missing, room > kDeferredSlack ? room - kDeferredSlack : room);
+            }
+            std::uint32_t restored = 0;
+            for (std::uint32_t index = 0; index < mapped; ++index) {
+                const std::uint32_t page = defer ? mapped - 1U - index : index;
                 const LogicalKVPageHandle logical = addresses.logical_page(address, page);
                 if (pages.device_resident(logical)) { continue; }
+                if (defer && restored >= restore_budget) { continue; }
                 if (!pages.host_resident(logical) || !host_kv_extents) {
                     throw std::logic_error("checkpoint KV page has no restorable replica");
                 }
@@ -869,6 +925,7 @@ void ProgramImpl::prepare_materialization(MaterializationTransaction& transactio
                     .extent_page = replica.page_offset,
                 });
                 destinations.push_back(destination);
+                ++restored;
             }
         };
     DeviceKVPageReservation& text_restore_reservation =
@@ -877,7 +934,7 @@ void ProgramImpl::prepare_materialization(MaterializationTransaction& transactio
     prepare_kv_restores(*text_kv_addresses, *text_kv_pages, text_address,
                         transaction.text_activation_frontier, text_prefix_fork,
                         text_restore_reservation, transaction.text_restores,
-                        transaction.text_restore_destinations);
+                        transaction.text_restore_destinations, defer_text_replicas);
     if (backend_address) {
         DeviceKVPageReservation& backend_restore_reservation =
             backend_prefix_fork
@@ -886,7 +943,7 @@ void ProgramImpl::prepare_materialization(MaterializationTransaction& transactio
         prepare_kv_restores(*backend_kv_addresses, *backend_kv_pages, *backend_address,
                             transaction.backend_activation_frontier, backend_prefix_fork,
                             backend_restore_reservation, transaction.backend_restores,
-                            transaction.backend_restore_destinations);
+                            transaction.backend_restore_destinations, defer_backend_replicas);
     }
     if (host_state_restore) {
         start_context_transfer_timer(runtime::ContextResourceClass::State);
@@ -1231,7 +1288,17 @@ void ProgramImpl::publish_materialization_transfers(MaterializationTransaction& 
                 if (host_kv_extents == nullptr) {
                     throw std::logic_error("retained KV tail Host store disappeared");
                 }
-                (void)host_kv_extents->publish(std::move(*backup));
+                // LOCAL FIX (2026-10-02): publish can decline now (see host_kv_store.h -- it used to
+                // be a silent std::terminate, i.e. abort() with no log). A decline here means the
+                // retained tail has NO Host copy, so the `drop_device_replica` two lines below would
+                // destroy the only copy: fail the transaction loudly instead. The `publish declined`
+                // line names the page; this line names the consequence.
+                if (!host_kv_extents->publish(std::move(*backup))) {
+                    throw std::runtime_error(
+                        "retained KV tail could not be published to the Host store "
+                        "(see the `publish declined` line; the Device replica is kept and the "
+                        "transaction fails)");
+                }
                 backup.reset();
             }
             addresses.settle_prefix_fork_tail_source(*fork);
@@ -1683,7 +1750,15 @@ void ProgramImpl::publish_pressure_work(MaterializationTransaction::PressureWork
                 }
                 if (change.backup) {
                     if (!host_kv_extents) { std::terminate(); }
-                    (void)host_kv_extents->publish(std::move(*change.backup));
+                    // LOCAL FIX (2026-10-02): same reasoning as the prefix-fork site above -- a
+                    // declined publish leaves this mutation with no Host copy, and the loop right below
+                    // drops every Device replica of `change.pages`. Fail loudly rather than lose them.
+                    if (!host_kv_extents->publish(std::move(*change.backup))) {
+                        throw std::runtime_error(
+                            "KV mutation backup could not be published to the Host store "
+                            "(see the `publish declined` line; the Device replicas are kept and the "
+                            "mutation is abandoned)");
+                    }
                     change.backup.reset();
                 }
                 for (const LogicalKVPageHandle page : change.pages) {

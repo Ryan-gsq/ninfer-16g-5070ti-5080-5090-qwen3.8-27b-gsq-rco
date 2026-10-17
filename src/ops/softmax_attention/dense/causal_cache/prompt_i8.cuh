@@ -485,17 +485,34 @@ __global__ __maxnreg__(NINFER_PROMPT_I8_MAXNREG) void causal_attention_prompt_i8
             const int qabs1            = row1 < tile_rows ? base_pos + row_token(row1) : -1;
             const bool full_score_tile =
                 q0 + Br <= valid_rows && k0 + Bc - 1 <= base_pos + row_token(0);
+            // LOCAL FIX (ring mask on the int8 family prompt route, 2026-10-02): identical to
+            // prompt_fp8.cuh:266-292 and to the k8v4 route. This one file serves int8, rk8v4, rk4v4
+            // and rk2v4-e8 (prompt.cu:145, kv_cache_is_int8_family), so the whole family is covered
+            // here. A demoted page's device slot is recycled, so its K/V must not be read at all.
+            const bool selection_active = metadata.selected_blocks != nullptr;
             float bm0                  = -CUDART_INF_F;
             float bm1                  = -CUDART_INF_F;
 #pragma unroll
             for (int nt = 0; nt < QKNt; ++nt) {
                 const int key0 = k0 + nt * 8 + 2 * lid;
                 const int key1 = key0 + 1;
-                if (!full_score_tile) {
-                    score[nt][0] = key0 <= qabs0 ? score[nt][0] : -CUDART_INF_F;
-                    score[nt][1] = key1 <= qabs0 ? score[nt][1] : -CUDART_INF_F;
-                    score[nt][2] = key0 <= qabs1 ? score[nt][2] : -CUDART_INF_F;
-                    score[nt][3] = key1 <= qabs1 ? score[nt][3] : -CUDART_INF_F;
+                if (!full_score_tile || selection_active) {
+                    score[nt][0] =
+                        (key0 <= qabs0 && paged_kv_block_selected(metadata.selected_blocks, key0))
+                            ? score[nt][0]
+                            : -CUDART_INF_F;
+                    score[nt][1] =
+                        (key1 <= qabs0 && paged_kv_block_selected(metadata.selected_blocks, key1))
+                            ? score[nt][1]
+                            : -CUDART_INF_F;
+                    score[nt][2] =
+                        (key0 <= qabs1 && paged_kv_block_selected(metadata.selected_blocks, key0))
+                            ? score[nt][2]
+                            : -CUDART_INF_F;
+                    score[nt][3] =
+                        (key1 <= qabs1 && paged_kv_block_selected(metadata.selected_blocks, key1))
+                            ? score[nt][3]
+                            : -CUDART_INF_F;
                 }
                 bm0 = fmaxf(bm0, fmaxf(score[nt][0], score[nt][1]));
                 bm1 = fmaxf(bm1, fmaxf(score[nt][2], score[nt][3]));

@@ -14,12 +14,19 @@
 #include "ops/common/rowsplit_a8_mma.cuh"
 #include "ops/linear/t2/t2_prefill_i8.cuh"
 #include "ops/linear/t2/t2_small_t_i8.cuh"
+// The imported I-line wide-T MMA kernel (bf16 A operand). CUDA-only header, included here and by the
+// judge harness; its launcher is declared in t2_launch.h.
+#include "ops/linear/t2/t2_launch.h"
+#include "ops/linear/t2/t2_ptq1_wide_t.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
+#include <mutex>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -28,6 +35,25 @@ namespace ninfer::ops::detail {
 namespace {
 
 namespace a8 = rowsplit_a8;
+
+// NINFER_T2_A8_DEBUG=1: report each DISTINCT route decision once, so "which kernel took this load
+// band" is a reading rather than an inference. The handoff flagged the absence of exactly this probe
+// ("要逐档打印命中的 T/rung 还得自己加"); off by default, deduplicated by the whole line, so a 27B
+// model's thousands of calls cost one comparison each and stderr gets one line per case.
+bool debug_enabled() {
+    static const bool enabled = std::getenv("NINFER_T2_A8_DEBUG") != nullptr;
+    return enabled;
+}
+
+void debug_note(const std::string& line) {
+    if (!debug_enabled()) { return; }
+    static std::mutex guard;
+    static std::set<std::string> seen;
+    std::lock_guard<std::mutex> lock(guard);
+    if (!seen.insert(line).second) { return; }
+    std::fprintf(stderr, "t2_a8 %s\n", line.c_str());
+    std::fflush(stderr);
+}
 
 using Rows = a8::ContiguousRows<1>;
 
@@ -63,6 +89,21 @@ bool prefill_tile() {
     }();
     return enabled;
 }
+
+// NINFER_T2_A8_PAIR=off: keep the integer route, but take the FUSED PAIR off it.
+//
+// WHY THIS EXISTS (2026-10-01, the PTQ1 score-path catastrophe). With the a8 route on, the PTQ1
+// packing reads ~1e6 on the score path and the reading is NOT repeatable (same command twice:
+// 1,130,407.776 then 1,173,051.538; the t2 packing on the same engine, corpus and caliber is
+// bit-identical: 6.344101 twice). The judge meanwhile proves the tile's arithmetic correct at every
+// width, for the single destination AND through the split epilogue, with a poisoned workspace and a
+// determinism control -- so the difference is not in the kernels but in WHICH of the route's two call
+// shapes the engine takes. The pair (attention q/k and GDN qk/vz) is the shape the single-projection
+// judge leg never exercises; with this switch off, the same four parts run as separate linear() calls
+// -- which still reach the SAME tile for their own width, because linear()'s PTQ1 arm admits it -- so
+// the reading separates "the fused pair is the corrupt one" from "every tile call is".
+// The predicate itself is a public function (t2_a8_pair_enabled, below) because the two projection
+// wrappers are what consult it.
 
 std::int32_t tile_columns(std::int32_t tokens) {
     constexpr std::int32_t kColumns = T2PrefillI8::kColumns;
@@ -111,6 +152,20 @@ Route route(std::int32_t tokens) {
     if (tokens >= band.lo && tokens <= band.hi) { return Route::SmallT; }
     if (tokens >= t2_a8_min_tokens()) { return Route::Prefill; }
     return Route::None;
+}
+
+// PTQ1_0's route, which deliberately does NOT follow T2's band table or a device profile:
+//   tokens >= t2_ptq1_tile_min_tokens() -> the int8 tile (prefill)
+//   below that floor                   -> the small-T band (t2_dispatch owns PTQ1's rung there)
+// WHY it ignores the profile: a profile is calibrated per hardware class, and its "small" verdict for
+// a width would send PTQ1_0 to the T2 small-T kernel, which reads 2-bit T2 fields out of the code
+// plane -- that mis-decodes PTQ1's five-trits-per-byte SILENTLY rather than failing. The floor is the
+// one place PTQ1's own boundary lives, and NINFER_PTQ1_TILE_MIN is the A/B lever for it.
+Route route_for(bool ptq1_tile, std::int32_t tokens) {
+    if (ptq1_tile && prefill_tile()) {
+        return tokens >= t2_ptq1_tile_min_tokens() ? Route::Prefill : Route::SmallT;
+    }
+    return route(tokens);
 }
 
 // Columns [col0, col0 + cols) of the activations, cols <= kT2I8LaunchColumns.
@@ -345,6 +400,28 @@ bool tile_rows_fast(std::int32_t output_rows, std::int32_t columns) {
 
 template <std::int32_t kCols, class Epilogue>
 void tile_gemm(const T2A8Activations& x, const Weight& w, Epilogue epilogue, cudaStream_t stream) {
+    if (w.qtype == QType::PTQ1_G128_FP16) {
+        // PTQ1_0's tile: its own schedule (64 rows, a single-buffered int8 plane), and the raw high
+        // plane handed to the kernel -- the only argument the T2 instantiation does not take.
+        using C                      = T2PrefillI8Ptq1;
+        const std::int32_t columns   = tile_columns(x.tokens);
+        const bool rows_fast         = tile_rows_fast(w.n, columns);
+        const unsigned column_blocks = static_cast<unsigned>(columns / C::kColumns);
+        const unsigned row_blocks    = static_cast<unsigned>(w.n / C::kRows);
+        const dim3 grid = rows_fast ? dim3(row_blocks, column_blocks) : dim3(column_blocks, row_blocks);
+        if (debug_enabled()) {
+            debug_note("tile-ptq1 k=" + std::to_string(w.k) + " n=" + std::to_string(w.n) +
+                       " tokens=" + std::to_string(x.tokens) + " columns=" + std::to_string(columns) +
+                       " rows_fast=" + std::to_string(rows_fast ? 1 : 0) +
+                       " blocks=" + std::to_string(column_blocks) + "x" + std::to_string(row_blocks));
+        }
+        t2_prefill_i8_kernel<kCols, Epilogue, true><<<grid, C::kThreads, 0, stream>>>(
+            static_cast<const std::uint8_t*>(w.qdata), static_cast<const __half*>(w.scales), x.codes,
+            x.scales, columns, x.tokens, rows_fast, epilogue,
+            static_cast<const std::uint8_t*>(w.qhigh));
+        CUDA_CHECK(cudaGetLastError());
+        return;
+    }
     using C                    = T2PrefillI8;
     const std::int32_t columns = tile_columns(x.tokens);
     const bool rows_fast       = tile_rows_fast(w.n, columns);
@@ -362,7 +439,7 @@ void project(const T2A8Activations& x, const Weight& w, Epilogue epilogue, cudaS
     if (w.k != x.input_rows || !t2_a8_supported(w, x.tokens)) {
         throw std::invalid_argument("t2 a8: unsupported profile");
     }
-    if (route(x.tokens) == Route::SmallT) {
+    if (route_for(w.qtype == QType::PTQ1_G128_FP16, x.tokens) == Route::SmallT) {
         return small_route<Epilogue>(x, {&w, epilogue}, nullptr, stream);
     }
     if (prefill_tile()) {
@@ -378,7 +455,8 @@ template <class Epilogue>
 void run(const Tensor& x, const Weight& w, Epilogue epilogue, WorkspaceArena& workspace,
          cudaStream_t stream) {
     auto scope = workspace.scope();
-    project(t2_a8_quantize(x, workspace, stream), w, epilogue, stream);
+    const bool ptq1 = w.qtype == QType::PTQ1_G128_FP16;
+    project(t2_a8_quantize(x, workspace, stream, ptq1), w, epilogue, stream);
 }
 
 void require_plane(const Tensor& plane, std::int32_t tokens, const char* label) {
@@ -417,9 +495,69 @@ std::int32_t t2_a8_min_tokens() {
     return minimum;
 }
 
+std::int32_t t2_ptq1_tile_min_tokens() {
+    static const std::int32_t floor = [] {
+        const char* value = std::getenv("NINFER_PTQ1_TILE_MIN");
+        const std::int32_t parsed = value != nullptr ? std::atoi(value) : kPtq1TileMinTokens;
+        return std::clamp(parsed, 1, kT2I8SmallMaxTokens);
+    }();
+    return floor;
+}
+
 bool t2_a8_admits(LinearPolicy policy) {
     return policy == LinearPolicy::AllowA8Int || policy == LinearPolicy::AllowA8IntDecode ||
            policy == LinearPolicy::AllowPrefillCublas;
+}
+
+// NINFER_T2_A8_PAIR=off: see the note in the anonymous namespace above. Default (unset) keeps the
+// fused pair on, which is the shipping behaviour.
+bool t2_a8_pair_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("NINFER_T2_A8_PAIR");
+        return value == nullptr || std::string(value) != "off";
+    }();
+    return enabled;
+}
+
+// NINFER_PTQ1_WIDE_T=on: PTQ1_0's single-projection prefill rides the imported I-line wide-T MMA
+// kernel instead of the int8 tile.
+//
+// Default OFF, and that is the whole point: with this unset the int8 route is byte-for-byte what it
+// has been, so the import cannot regress anything. It is a RUNG CHOICE, not a correctness switch --
+// the kernel's own container-convention port (this tree stores the payload as two's complement where
+// the I line stored it offset-binary) is judged by the wide-t leg of _tucheck_ptq1_smallt_ab.cu
+// before any reading from this switch is worth anything.
+//
+// WHY IT IS INTERESTING AT ALL: the kernel keeps the A operand in bf16 (no int8 activation
+// quantisation) and streams one weight window per 64-token tile, and in the I line it sits at
+// T >= 41 -- but behind the int8 route, i.e. it is that line's fallback rather than its default. That
+// is the same relationship it has here.
+bool t2_ptq1_wide_t_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("NINFER_PTQ1_WIDE_T");
+        return value != nullptr && std::string(value) != "0" && std::string(value) != "off";
+    }();
+    return enabled;
+}
+
+std::int32_t t2_ptq1_wide_t_min_tokens() {
+    static const std::int32_t floor = [] {
+        const char* value = std::getenv("NINFER_PTQ1_WIDE_T_MIN");
+        const std::int32_t parsed = value != nullptr ? std::atoi(value) : kTernaryWideMinTokens;
+        return parsed > 0 ? parsed : kTernaryWideMinTokens;
+    }();
+    return floor;
+}
+
+// Every admission the ported kernel makes that does not involve the destination, asked BEFORE anything
+// is quantised: the wide-T rung reads the bf16 activations directly, so taking it also skips the
+// activation planes (and their workspace) entirely. Kept in one place so the debug note and the call
+// site cannot disagree; the destination's own checks live at the call site.
+bool t2_ptq1_wide_t_admits(const Tensor& x, const Weight& w) {
+    if (!t2_ptq1_wide_t_enabled() || w.qtype != QType::PTQ1_G128_FP16) { return false; }
+    return x.dtype == DType::BF16 && x.ne[1] >= t2_ptq1_wide_t_min_tokens() &&
+           w.qhigh != nullptr && (reinterpret_cast<std::uintptr_t>(w.qhigh) & 7u) == 0u &&
+           w.padded_shape[1] == w.k && (w.k % kTernaryWideChunkK) == 0 && x.ne[0] == w.k;
 }
 
 bool t2_a8_shape_supported(std::int32_t output_rows, std::int32_t input_rows) {
@@ -428,15 +566,26 @@ bool t2_a8_shape_supported(std::int32_t output_rows, std::int32_t input_rows) {
 }
 
 bool t2_a8_supported(const Weight& w, std::int32_t tokens) {
-    return w.qtype == QType::T2_G128_FP16 && w.layout == QuantLayout::RowSplit &&
-           w.qdata != nullptr && w.scales != nullptr && t2_a8_shape_supported(w.n, w.k) &&
-           route(tokens) != Route::None;
+    // PTQ1_0 rides the same tile GEMM with its own schedule, and takes it from its own floor up
+    // (t2_ptq1_tile_min_tokens), NOT from T2's band table: below that floor this route's small-T
+    // kernel would read PTQ1's five-trits-per-byte as 2-bit T2 fields -- silently wrong, not a throw
+    // -- so the arm requires the Prefill verdict of route_for, the tile body, and its high plane.
+    const bool ptq1 = w.qtype == QType::PTQ1_G128_FP16;
+    const bool packing_ok =
+        w.qtype == QType::T2_G128_FP16 ||
+        (ptq1 && w.qhigh != nullptr && prefill_tile() && route_for(true, tokens) == Route::Prefill);
+    return packing_ok && w.layout == QuantLayout::RowSplit && w.qdata != nullptr &&
+           w.scales != nullptr && t2_a8_shape_supported(w.n, w.k) &&
+           route_for(ptq1, tokens) != Route::None;
 }
 
 std::size_t t2_a8_activation_bytes(std::int32_t input_rows, std::int32_t max_tokens) {
     const auto round  = [](std::size_t value) { return (value + 255) / 256 * 256; };
     std::size_t bytes = 0;
-    if (max_tokens >= t2_a8_min_tokens() && prefill_tile()) {
+    // The tile's planes are reserved from the LOWER of the two floors: PTQ1_0's tile floor is below
+    // T2's, so covering only T2's would under-reserve a PTQ1 prefill call at that width.
+    const std::int32_t tile_floor = std::min(t2_a8_min_tokens(), t2_ptq1_tile_min_tokens());
+    if (max_tokens >= tile_floor && prefill_tile()) {
         const std::size_t columns = static_cast<std::size_t>(tile_columns(max_tokens));
         bytes = round(columns * static_cast<std::size_t>(input_rows)) +
                 round(columns * static_cast<std::size_t>(input_rows / T2PrefillI8::kGroupK) *
@@ -491,29 +640,46 @@ std::size_t t2_a8_workspace_bytes(std::int32_t output_rows, std::int32_t input_r
 }
 
 bool t2_a8_layout_activations(WorkspaceLayoutBuilder& layout, std::int32_t input_rows,
-                              std::int32_t tokens) {
-    const Route taken = route(tokens);
+                              std::int32_t tokens, bool ptq1_tile) {
+    // The planes one route allocates for this width.
+    const auto planes = [&](Route taken) {
+        const bool tile = taken == Route::Prefill && prefill_tile();
+        const std::size_t groups =
+            static_cast<std::size_t>(input_rows) / (tile ? T2PrefillI8::kGroupK : a8::kGroup);
+        const std::size_t columns = static_cast<std::size_t>(
+            taken == Route::SmallT ? tokens : tile ? tile_columns(tokens) : padded_tokens(tokens));
+        const std::size_t scale_columns =
+            taken == Route::SmallT ? static_cast<std::size_t>(kT2I8MaxColumns) : columns;
+        return std::pair<std::size_t, std::size_t>{
+            columns * static_cast<std::size_t>(input_rows), scale_columns * groups * sizeof(__half)};
+    };
+    const Route taken = route_for(ptq1_tile, tokens);
     if (taken == Route::None) { return false; }
-    const bool tile          = taken == Route::Prefill && prefill_tile();
-    const std::size_t groups = static_cast<std::size_t>(input_rows) /
-                               (tile ? T2PrefillI8::kGroupK : a8::kGroup);
-    const std::size_t columns = static_cast<std::size_t>(
-        taken == Route::SmallT ? tokens : tile ? tile_columns(tokens) : padded_tokens(tokens));
-    const std::size_t scale_columns =
-        taken == Route::SmallT ? static_cast<std::size_t>(kT2I8MaxColumns) : columns;
-    (void)layout.alloc_bytes(columns * static_cast<std::size_t>(input_rows));
-    (void)layout.alloc_bytes(scale_columns * groups * sizeof(__half));
+    auto [codes, scales] = planes(taken);
+    // A caller that does not know the weight's format (the width-only planners) must not under-size:
+    // PTQ1_0's tile floor is below T2's, so the same width can take either layout and the larger one
+    // is the safe reservation. Over-reserving costs kilobytes; under-reserving is a silent aliasing.
+    const Route other = route_for(!ptq1_tile, tokens);
+    if (other != Route::None) {
+        const auto [other_codes, other_scales] = planes(other);
+        codes  = std::max(codes, other_codes);
+        scales = std::max(scales, other_scales);
+    }
+    (void)layout.alloc_bytes(codes);
+    (void)layout.alloc_bytes(scales);
     return true;
 }
 
-T2A8Activations t2_a8_quantize(const Tensor& x, WorkspaceArena& workspace, cudaStream_t stream) {
+T2A8Activations t2_a8_quantize(const Tensor& x, WorkspaceArena& workspace, cudaStream_t stream,
+                               bool ptq1_tile) {
     const std::int32_t input_rows = x.ne[0];
     const std::int32_t tokens     = x.ne[1];
     if (x.dtype != DType::BF16 || x.data == nullptr || !x.is_contiguous() || x.ne[2] != 1 ||
-        x.ne[3] != 1 || route(tokens) == Route::None || !t2_a8_shape_supported(T2PrefillI8::kRows, input_rows)) {
+        x.ne[3] != 1 || route_for(ptq1_tile, tokens) == Route::None ||
+        !t2_a8_shape_supported(T2PrefillI8::kRows, input_rows)) {
         throw std::invalid_argument("t2 a8: x must be a contiguous BF16 [K, T] of a registered K");
     }
-    if (route(tokens) == Route::SmallT) {
+    if (route_for(ptq1_tile, tokens) == Route::SmallT) {
         const DeviceSpan codes  = workspace.alloc_bytes(static_cast<std::size_t>(tokens) *
                                                         static_cast<std::size_t>(input_rows));
         const DeviceSpan scales = workspace.alloc_bytes(
@@ -572,7 +738,11 @@ void t2_a8_project_split_pair(const T2A8Activations& x, const T2A8Split& a, cons
                               cudaStream_t stream) {
     const SplitStoreEpilogue first  = split_epilogue(x, a);
     const SplitStoreEpilogue second = split_epilogue(x, b);
-    if (route(x.tokens) != Route::SmallT) {
+    // Either parent can be the PTQ1_0 one (the pair is only ever admitted when BOTH are), so the
+    // small/tile choice is asked the same way project() asks it.
+    const bool ptq1 = a.weight.qtype == QType::PTQ1_G128_FP16 ||
+                      b.weight.qtype == QType::PTQ1_G128_FP16;
+    if (route_for(ptq1, x.tokens) != Route::SmallT) {
         project(x, a.weight, first, stream);
         project(x, b.weight, second, stream);
         return;
@@ -588,6 +758,36 @@ void t2_a8_project_split_pair(const T2A8Activations& x, const T2A8Split& a, cons
 
 void t2_a8_linear(const Tensor& x, const Weight& w, Tensor& out, WorkspaceArena& workspace,
                   cudaStream_t stream) {
+    if (debug_enabled()) {
+        const Route taken = route_for(w.qtype == QType::PTQ1_G128_FP16, x.ne[1]);
+        debug_note("linear qtype=" + std::to_string(static_cast<int>(w.qtype)) +
+                   " k=" + std::to_string(w.k) + " n=" + std::to_string(w.n) +
+                   " tokens=" + std::to_string(x.ne[1]) + " route=" +
+                   (taken == Route::Prefill ? "tile" : taken == Route::SmallT ? "small" : "none") +
+                   " out=[" + std::to_string(out.ne[0]) + "," + std::to_string(out.ne[1]) + "] nb=[" +
+                   std::to_string(out.nb[0]) + "," + std::to_string(out.nb[1]) + "]");
+    }
+    // NINFER_PTQ1_WIDE_T=on: the alternative rung (see the gate above). Taken only when the ported
+    // kernel's own shape rules hold AND the destination is a bf16 plane whose token row stride can be
+    // expressed for it -- the kernel stores at `token * out_row_stride + row`, which is exactly what
+    // the int8 route's StoreEpilogue{out, w.n, 0} assumes, so a destination that is correct for one is
+    // correct for the other. Nothing is quantised on this path, so the workspace is not touched at all;
+    // the layout planner still reserves the activation planes for this width, which is over-reserving
+    // rather than under-reserving, and safe.
+    if (t2_ptq1_wide_t_admits(x, w) && out.dtype == DType::BF16 && out.ne[0] >= w.n) {
+        const std::int64_t stride_elems =
+            out.nb[1] / static_cast<std::int64_t>(sizeof(__nv_bfloat16));
+        const std::int32_t stride =
+            static_cast<std::int32_t>(stride_elems < w.n ? w.n : stride_elems);
+        if (debug_enabled()) {
+            debug_note("linear-wide-t qtype=" + std::to_string(static_cast<int>(w.qtype)) +
+                       " k=" + std::to_string(w.k) + " n=" + std::to_string(w.n) +
+                       " tokens=" + std::to_string(x.ne[1]) + " out_row_stride=" +
+                       std::to_string(stride));
+        }
+        launch_t2_ptq1_wide_t(x, w, out, stride, stream);
+        return;
+    }
     run(x, w, a8::StoreEpilogue{reinterpret_cast<__nv_bfloat16*>(out.data), w.n, 0}, workspace,
         stream);
 }

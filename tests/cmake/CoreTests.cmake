@@ -109,12 +109,20 @@ ninfer_add_test(ninfer_gdn_replay_records_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/../test_gdn_replay_records.cpp"
   LIBRARIES ninfer_core)
 
+# Ledger B01: the single-page materialization path does not repeat the batch path's capacity
+# arithmetic, and the logical-reservation pools of the KVMem ring do not back-check a resize.
+# The host-side evidence for that asymmetry (see the test's header for the full argument).
+ninfer_add_test(ninfer_paged_kv_one_page_capacity_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/../core/test_paged_kv_one_page_capacity.cpp"
+  LIBRARIES ninfer_core)
+
 set_tests_properties(
   ninfer_device_test
   ninfer_decode_graph_test
   ninfer_arena_test
   ninfer_kv_cache_test
   ninfer_state_store_test
+  ninfer_paged_kv_one_page_capacity_test
   PROPERTIES SKIP_RETURN_CODE 77)
 
 ninfer_add_test(ninfer_host_timing_test

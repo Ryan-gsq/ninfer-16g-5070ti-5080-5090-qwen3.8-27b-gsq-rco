@@ -246,13 +246,15 @@ void test_kv_store(ninfer::DeviceContext& device) {
            "incomplete KV D2H does not publish Host replicas");
     CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
     auto host_extent = extents.publish(std::move(*host_backup));
+    expect(host_extent.has_value(), "Host KV extent publication succeeds");
     expect(pages.host_resident(logical_pages[0]) && pages.host_resident(logical_pages[1]),
            "KV extent publication attaches every logical Host replica");
     const std::array first_host_release{logical_pages[0]};
     expect(extents.release_page_replicas(pages, first_host_release),
            "first Host page release transaction");
     const auto retained_host_extent = pages.host_replica(logical_pages[1]).extent;
-    expect(!extents.valid(host_extent) && !pages.host_resident(logical_pages[0]) &&
+    expect(host_extent.has_value() && !extents.valid(*host_extent) &&
+               !pages.host_resident(logical_pages[0]) &&
                extents.valid(retained_host_extent) &&
                pages.host_replica(logical_pages[1]).page_offset == 0,
            "partial Host release partitions an extent and republishes the retained run");
@@ -270,8 +272,10 @@ void test_kv_store(ninfer::DeviceContext& device) {
                                 device.transfer_stream);
     CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
     const auto second_host_extent = extents.publish(std::move(*second_host_backup));
+    expect(second_host_extent.has_value(), "second Host KV extent publication succeeds");
     expect(pages.drop_device_replica(logical_pages[0]) &&
-               pages.drop_device_replica(logical_pages[1]) && !extents.release(second_host_extent),
+               pages.drop_device_replica(logical_pages[1]) &&
+               !extents.release(*second_host_extent),
            "Host-only KV pages remain valid and cannot lose their last replica");
     const std::array last_reference_release{store::HostKVPageReplicaRelease{
         .pages = &pages,
@@ -291,12 +295,12 @@ void test_kv_store(ninfer::DeviceContext& device) {
     const std::array restore_destinations{
         pages.reserve_device_replica(logical_pages[0], *restore_reservation),
         pages.reserve_device_replica(logical_pages[1], *restore_reservation)};
-    physical_pages.copy_from_host(extents.view(second_host_extent), restore_destinations,
+    physical_pages.copy_from_host(extents.view(*second_host_extent), restore_destinations,
                                   device.transfer_stream);
     CUDA_CHECK(cudaStreamSynchronize(device.transfer_stream));
     pages.publish_device_replica(logical_pages[0]);
     pages.publish_device_replica(logical_pages[1]);
-    expect(extents.release(second_host_extent) && host_arena.occupied_bytes() == 0,
+    expect(extents.release(*second_host_extent) && host_arena.occupied_bytes() == 0,
            "KV Host restore republishes Device replicas before releasing the extent");
     auto activation = addresses.prepare_activation(*address, 3, 1);
     expect(addresses.bound_row(*address) == -1 && addresses.entitlement(*address) == 2 &&
@@ -409,7 +413,8 @@ void test_kv_store(ninfer::DeviceContext& device) {
     const std::array alternating_release{alternating_pages[0], alternating_pages[2]};
     expect(extents.release_page_replicas(pages, alternating_release),
            "alternating Host page release transaction");
-    expect(!extents.valid(alternating_extent) && !pages.host_resident(alternating_pages[0]) &&
+    expect(alternating_extent.has_value() && !extents.valid(*alternating_extent) &&
+               !pages.host_resident(alternating_pages[0]) &&
                pages.host_resident(alternating_pages[1]) &&
                !pages.host_resident(alternating_pages[2]) &&
                pages.host_resident(alternating_pages[3]) &&

@@ -36,10 +36,65 @@ enum class QType : std::uint16_t {
     GGUF_IQ1_M   = 22,
     GGUF_IQ4_NL  = 23,
     GGUF_IQ4_XS  = 24,
+    // Prism PTQ1_0 exactly as the source packed it: 24 base-3 trit bytes (five trits per byte)
+    // plus 2 high trit bytes (four each) plus one binary16 multiplier per 128 weights = 28 B/128.
+    // Row-split only. Appended LAST on purpose: `is_gguf()` below is a range test over
+    // GGUF_Q8_0..GGUF_IQ4_XS, so a new value must land outside that range, and the wire format
+    // carries the name rather than the number, so nothing may be renumbered.
+    PTQ1_G128_FP16 = 25,
 };
 
 [[nodiscard]] constexpr bool is_gguf(QType format) {
     return format >= QType::GGUF_Q8_0 && format <= QType::GGUF_IQ4_XS;
+}
+
+// The range test above only stays correct while the ggml block types remain the contiguous top of
+// the enum. Pin it, so a later insertion cannot silently make a ternary weight "a gguf block".
+static_assert(!is_gguf(QType::T2_G128_FP16));
+static_assert(!is_gguf(QType::PTQ1_G128_FP16));
+
+// The ternary family: the SAME {-1, 0, +1} trits in two packings. They are told apart by the high
+// plane -- PTQ1_0 carries 2 bytes per 128-group, T2 carries none -- which is also what the kernels
+// key on.
+//
+// !! This predicate answers "may this weight take a ternary code path", NOT "does this weight store
+// sixteen 2-bit codes per 32-bit word". Those are different questions and conflating them decodes
+// silently wrong: the word-based kernels and the int8 route read 2-bit fields straight out of the
+// code plane, so PTQ1_0 bytes fed to them are garbage rather than an error. Any site that reads the
+// code plane itself must keep testing QType::T2_G128_FP16 exactly, or take its geometry from
+// weight_geometry / the format's own storage struct. Use is_ternary only where the site validates,
+// admits or sizes a ternary weight for a path that decodes through an atom.
+[[nodiscard]] constexpr bool is_ternary(QType format) {
+    return format == QType::T2_G128_FP16 || format == QType::PTQ1_G128_FP16;
+}
+
+// The grouped RowSplit formats' plane geometry: weights per group and that group's three plane
+// sizes in bytes. THIS IS THE SINGLE SOURCE OF TRUTH for those numbers -- weight_geometry() builds
+// the row pitches from it and the row views advance the plane pointers by it, so a format cannot be
+// described one way in the container and another way in a slice.
+//
+// The one that bites: every grouped format that existed before PTQ1 carries exactly 32 base bytes
+// per group (q4/q5/q6 over 64 weights, q8 over 32, t2 over 128), which is why "32" was hardcoded in
+// both places. PTQ1_0 is the first to break it at 24 base + 2 high, and slicing it with the 32/0
+// split reads the wrong byte ranges -- plausible-looking garbage rather than an error.
+struct RowSplitFormat {
+    std::uint32_t group       = 0; // weights per group
+    std::uint32_t code_bytes  = 0; // base-plane bytes per group
+    std::uint32_t high_bytes  = 0; // extra-bit-plane bytes per group
+    std::uint32_t scale_bytes = 2; // binary16 multipliers per group
+};
+
+// {0, 0, 0, 0} for every format that is not a grouped RowSplit format.
+[[nodiscard]] constexpr RowSplitFormat row_split_format(QType format) {
+    switch (format) {
+    case QType::Q4_G64_FP16: return {64, 32, 0, 2};
+    case QType::Q5_G64_FP16: return {64, 32, 8, 2};
+    case QType::Q6_G64_FP16: return {64, 32, 16, 2};
+    case QType::Q8_G32_FP16: return {32, 32, 0, 2};
+    case QType::T2_G128_FP16: return {128, 32, 0, 2};
+    case QType::PTQ1_G128_FP16: return {128, 24, 2, 2};
+    default: return {};
+    }
 }
 
 struct GgufBlockShape {

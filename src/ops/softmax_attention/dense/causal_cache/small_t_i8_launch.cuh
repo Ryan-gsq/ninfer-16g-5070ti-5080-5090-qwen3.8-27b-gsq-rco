@@ -75,7 +75,11 @@ void launch_tc_partial_i8(const Tensor& q, CacheInput input, const Tensor& pos, 
                     : static_cast<const std::int32_t*>(invocation.table_rows->data),
                 cache.block_tables.ne[0], invocation.full_width, invocation.column_begin,
                 logical_capacity, wave_splits, scale, static_cast<float*>(partial_acc.data),
-                static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data));
+                static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data),
+                // LOCAL FIX (ring mask on the int8 family decode route, 2026-10-02): hand the kernel
+                // the bitmap the caller already carries. nullptr keeps the dense behaviour bit-for-bit.
+                invocation.selected_blocks != nullptr ? invocation.selected_blocks
+                                                     : proto_selected_blocks());
         };
         auto issue = [&]<bool PackedValues, KvKeyCoding Keys>() {
             if (small_t_pv_f16()) {

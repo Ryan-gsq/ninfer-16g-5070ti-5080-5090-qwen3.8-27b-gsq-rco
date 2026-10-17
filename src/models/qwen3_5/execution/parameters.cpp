@@ -33,7 +33,17 @@ public:
     void integer_route(LinearParameters& p, QType format, std::int32_t n, std::int32_t k) const {
 #if defined(NINFER_SM8X_COMPAT)
         if (!model_.options().prefill_a8) { return; }
-        if (p.policy == ops::LinearPolicy::A16Only && p.weight.qtype == format &&
+        // The ternary PACKINGS share these routes, so the format test accepts either of them: a
+        // PTQ1_0 model stores the same projections at the same shapes, and which packings a route's
+        // kernels can actually take is decided one layer down (t2_a8_supported refuses PTQ1_0 outside
+        // the prefill verdict, and t2_dispatch owns the rest). Testing T2 exactly here left every
+        // PTQ1_0 weight on A16Only, which is what kept its prefill on the per-weight reference rung.
+        //
+        // Additive by construction: a T2 weight still matches through the equality, and for a q4/q5
+        // format is_ternary() is false on both sides, so nothing else changes.
+        const bool format_ok =
+            p.weight.qtype == format || (is_ternary(format) && is_ternary(p.weight.qtype));
+        if (p.policy == ops::LinearPolicy::A16Only && format_ok &&
             p.weight.n == n && p.weight.k == k) {
             // The cuBLAS route is a superset: it admits everything AllowA8Int does and adds the
             // materialise-and-call-cuBLAS path above its width gate, so the resolver still picks
@@ -55,8 +65,13 @@ public:
         if (!model_.options().prefill_a8) { return; }
         auto* pair = std::get_if<ops::PairedProjectionWeights>(&projection);
         if (pair == nullptr || pair->policy != ops::LinearPolicy::A16Only) { return; }
-        if (pair->first.qtype == first_format && pair->first.n == first_rows &&
-            pair->first.k == input_rows && pair->second.qtype == second_format &&
+        // Same widening as integer_route: either ternary packing satisfies the format half, so a
+        // PTQ1_0 pair reaches the same route. Both sides of the pair must agree, as before.
+        const auto matches = [](QType want, QType got) {
+            return got == want || (is_ternary(want) && is_ternary(got));
+        };
+        if (matches(first_format, pair->first.qtype) && pair->first.n == first_rows &&
+            pair->first.k == input_rows && matches(second_format, pair->second.qtype) &&
             pair->second.n == second_rows && pair->second.k == input_rows) {
             // The split projections are the separable half of the trade, so they take the cuBLAS
             // policy only when both settings ask for it.
@@ -407,13 +422,17 @@ Parameters::Parameters(const Model& source) : model(source) {
     const auto& w        = model.weights();
     text.token_embedding = native_weight(model.weight(w.text.token_embedding).view);
     text.output_head     = prepare.head(w.text.output_head_use);
-    if (text.token_embedding.qtype == QType::T2_G128_FP16) {
+    if (is_ternary(text.token_embedding.qtype)) {
         // A ternary checkpoint stores its token table rotated by the same hidden-width signs as
         // every 5120-wide input, the output head's among them; the table has no Use of its own.
+        // The family, not T2 specifically: PTQ1_0 stores the table in the same rotated basis (its
+        // GGUF declares prism.hadamard.inverse_weight_names = ['token_embd.weight']), and without
+        // this the table would take the unrotated route, which has no ternary case at all.
         if (!rotated(text.output_head.hadamard_signs) ||
             text.output_head.hadamard_signs.ne[0] != text.token_embedding.k) {
             throw std::invalid_argument(
-                "a T2 token embedding needs a rotated output head carrying the hidden-width signs");
+                "a ternary token embedding needs a rotated output head carrying the hidden-width "
+                "signs");
         }
         text.token_embedding_signs = text.output_head.hadamard_signs;
     }

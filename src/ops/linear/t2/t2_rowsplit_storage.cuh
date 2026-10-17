@@ -60,4 +60,76 @@ struct T2DecodeAtom {
     }
 };
 
+// ---------------------------------------------------------------------------------------------
+// PTQ1_0 -- the Prism packing, kept native.
+//
+// WHY IT IS HERE: the converter expands PTQ1_0 into the T2 geometry at pack time (both decode to
+// the same ternary values), which costs 34/28 = 21% more bytes. For a 5.5 GiB artifact that is the
+// difference between fitting an 8 GB card and not, so the engine learns the 28 B/128 packing
+// instead. Ported from the I line's ops/linear/ternary/ternary_rowsplit_storage.cuh, where it ran
+// the fast paths for a year; the geometry below is format-independent and is copied verbatim.
+//
+// Group 128 -> 24 base-3 trit bytes (five trits per byte) + 2 high trit bytes (four each) + one
+// binary16 multiplier per group = 28 B/128.
+//
+// !! CONVENTION: this container stores ternary payload as two-bit TWO'S COMPLEMENT (T2DecodeAtom
+// above). The I line's container stored the same trits OFFSET-BINARY, value = (code - 1) * d, so
+// every trit -> stored-code mapping must be `(code - 1) & 3` here and not `code`. The one and only
+// place that happens is t2_ptq1_repack.cuh.
+// ---------------------------------------------------------------------------------------------
+struct PTQ1RowSplitStorage {
+    static constexpr int kGroupK             = 128;
+    static constexpr int kCodeBytesPerGroup  = 24;
+    static constexpr int kHighBytesPerGroup  = 2;
+    static constexpr int kScaleBytesPerGroup = 2;
+};
+
+// 3^n for n in [0,5], as the table ggml's dequantizer reads. A branch chain, so no device-side
+// array lookup is needed on the hot path.
+__device__ __forceinline__ constexpr std::uint8_t ptq1_pow3(int n) {
+    return n <= 0 ? 1u : n == 1 ? 3u : n == 2 ? 9u : n == 3 ? 27u : n == 4 ? 81u : 243u;
+}
+
+// Per-weight form of dequantize_row_ptq1_0 (ggml-quants.c); a literal port of the I line's
+// PTQ1SimtDecodeAtom::decode_one. This returns the VALUE, so it is convention-free.
+//
+// The stage walk matters and is not symmetric: for a 24-byte qs the c=32 stage never runs
+// (0 + 32 > 24), c=16 runs once and emits weights 0..79 reading qs[0..15], c=8 runs once and emits
+// weights 80..119 reading qs[16..23]; the 2-byte qh then carries weights 120..127. That is
+// 80 + 40 + 8 = 128. Each trit is recovered as ((uint16)(q * 3^n) * 3) >> 8, with the uint8
+// wrap-around the C code relies on (`uint8_t q = qs[..] * pow3[n];` truncates on assignment).
+struct PTQ1DecodeAtom {
+    static constexpr int kGroupK = PTQ1RowSplitStorage::kGroupK;
+
+    static __device__ __forceinline__ float load_scale(const std::uint8_t* scale_ptr) {
+        return __half2float(__ushort_as_half(*reinterpret_cast<const std::uint16_t*>(scale_ptr)));
+    }
+
+    // qs lives in the base plane, qh in the high plane.
+    static __device__ __forceinline__ float decode_one(const std::uint8_t* codes,
+                                                      const std::uint8_t* high, float scale,
+                                                      int index) {
+        std::uint8_t raw;
+        int trit;
+        if (index < 80) {
+            // c = 16 stage: weights n*16 + m, byte qs[m]
+            trit = index >> 4;
+            raw  = codes[index & 15];
+        } else if (index < 120) {
+            // c = 8 stage: weights 80 + n*8 + m, byte qs[16 + m]
+            const int local = index - 80;
+            trit            = local >> 3;
+            raw             = codes[16 + (local & 7)];
+        } else {
+            // qh tail: weights 120 + n*2 + h, byte qh[h]
+            const int local = index - 120;
+            trit            = local >> 1;
+            raw             = high[local & 1];
+        }
+        const std::uint8_t q = static_cast<std::uint8_t>(raw * ptq1_pow3(trit));
+        const int xi         = static_cast<int>((static_cast<std::uint16_t>(q) * 3u) >> 8);
+        return static_cast<float>(xi - 1) * scale;
+    }
+};
+
 } // namespace ninfer::ops::detail

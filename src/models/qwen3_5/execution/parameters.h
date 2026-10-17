@@ -1,5 +1,6 @@
 #pragma once
 
+#include "models/qwen3_5/execution/glp_state.h"
 #include "models/qwen3_5/model.h"
 #include "ninfer/ops/weight_input.h"
 
@@ -78,6 +79,10 @@ struct TextParameters {
     std::size_t rank_count = 1;
     // Stage s owns layers [stage_begin[s], stage_end(s)).
     std::vector<std::uint32_t> stage_begin{0};
+    // GLP steering state: per-layer direction stack plus its alpha. Disabled by default, which
+    // leaves every writer on the stock fused path. `mutable` because the projection strength is
+    // a runtime setting on an otherwise-const parameter block.
+    mutable GlpState glp;
 
     [[nodiscard]] bool split_execution() const noexcept { return rank_count > 1; }
     [[nodiscard]] std::uint32_t stage_end(std::size_t stage) const {

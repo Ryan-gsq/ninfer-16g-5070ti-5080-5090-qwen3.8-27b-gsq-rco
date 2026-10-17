@@ -6,6 +6,15 @@
 #include "ninfer/ops/rmsnorm_rope.h"
 #include "ninfer/ops/rope.h"
 
+// LOCAL (KVMem content scoring, 2026-10-02): the pre-RoPE harvest and the query-side scoring glue.
+// These are the ported KVMem component's host-safe halves; kvmem_score.h is header-only (inline), so
+// nothing new has to be added to the build.
+#include "ops/kvmem/kvmem_score.h"
+#include "ops/kvmem/raw_k_harvest.h"
+#include "ops/kvmem/raw_k_shadow.h"
+
+#include <cstdint>
+#include <cstdio>
 #include <stdexcept>
 
 namespace ninfer::models::qwen3_5::execution {
@@ -97,6 +106,97 @@ void text_rope(const Tensor& positions, const RopeConfig& config, const ops::Rop
     ops::rope(positions, dimension(config.rotary_dim), config.rope_theta, yarn, query, key, stream);
 }
 
+// ---- LOCAL (KVMem content scoring, 2026-10-02) ------------------------------------------------
+// The harvest hook. Mirrors the donor engine's per-layer capture (fusion:
+// targets/qwen3_6/impl/runtime/text_context_impl.h:950-963 for the pre-RoPE key and :971-973 for the
+// query) but carries the round state as file-static state in this translation unit, so the header
+// stays free of KVMem includes and no existing signature changes.
+namespace {
+
+struct KvmemHook {
+    void*         harvest = nullptr;   // ops::RawKShadowHarvest*, opaque here on purpose
+    std::int32_t  layer   = -1;        // full-attention layer index for the call in progress
+    std::int32_t  tokens  = 0;         // chunk width (== q_layer_stride == round tokens)
+    bool          shape_noted = false; // the "this pass is not the armed round" line prints once
+};
+
+KvmemHook& kvmem_hook() {
+    static KvmemHook hook;
+    return hook;
+}
+
+// True while a round is armed for harvesting: the KVMem index wants this round's pre-RoPE keys, and
+// only the three separate calls can hand them over (rmsnorm leaves the normalized BF16 tensor alive
+// for the hook; the fused Op rotates in a single pass and materialises no pre-RoPE tensor,
+// rmsnorm_rope.h:22-23 and :56-62). `tokens` is the width the round was armed with, so a pass of a
+// different shape still reports armed and is then skipped by kvmem_harvest_pre_rope's shape guard.
+bool kvmem_harvest_armed() {
+    const KvmemHook& hook = kvmem_hook();
+    return hook.harvest != nullptr && hook.tokens > 0 && hook.layer >= 0;
+}
+
+void kvmem_harvest_pre_rope(const Tensor& query, const Tensor& key, cudaStream_t stream) {
+    KvmemHook& hook = kvmem_hook();
+    if (hook.harvest == nullptr || hook.tokens <= 0 || hook.layer < 0) { return; }
+    // SHAPE GUARD. The staging view is sized by the width the hook was armed with, and the component
+    // THROWS when the source does not match it (raw_k_shadow.h: geometry mismatch is an exception by
+    // design, so a wrong-shaped harvest can never be silently mis-laid-out). That exception is fatal in
+    // this engine: on 2026-10-02 a verify-phase call inherited the prefill round's armed width and
+    // killed the worker with `shadow [1024, 4] does not match the raw key [256, 4, 1, 1]`, surfacing as
+    // HTTP 500 on turn 2. A pass that does not have this round's shape is simply not this round's
+    // business; say so once instead of throwing.
+    const std::int32_t key_tokens =
+        static_cast<std::int32_t>(key.ne[2]) * (key.ne[3] > 0 ? static_cast<std::int32_t>(key.ne[3]) : 1);
+    if (key_tokens != hook.tokens) {
+        if (!hook.shape_noted) {
+            hook.shape_noted = true;
+            std::fprintf(stderr,
+                         "[ninfer] kvmem harvest: skipped a %d-token key (round width is %d, layer %d); "
+                         "this pass is not the prefill round the harvest was armed for\n",
+                         key_tokens, hook.tokens, hook.layer);
+        }
+        return;
+    }
+    auto* harvest = static_cast<ops::RawKShadowHarvest*>(hook.harvest);
+    // Same source object the donor feeds: `kn` is the RMS-normalised key, a real BF16 tensor in the
+    // arena, still pre-RoPE at this point. Geometry {head_dim, kv_heads, tokens} is what
+    // raw_k_shadow.h's contract accepts and what the index's layout expects.
+    Tensor shadow = harvest->staging_for_round(hook.layer);
+    ops::raw_k_shadow_copy(key, shadow, stream);
+    // LOCAL FIX (B08): stamp this layer as harvested IN THIS ROUND. The harvest's own contract says
+    // every slot that was NOT written must be marked, because it still holds the previous round's bytes
+    // (raw_k_harvest.h:172-177) -- but nothing in the tree ever called mark_layer_harvested, so every
+    // slot read as "not harvested": the raw-K arena gate (raw_k_block_arena.h:462) could never pass
+    // (that arm stored nothing), and the index feed had no way to tell a fresh slot from a stale one.
+    // With the stamp in place `layers_harvested() == layers()` becomes B08's positive criterion -- the
+    // round covered EVERY full-attention layer, layer 0 included -- and the index can refuse a stale
+    // slot instead of ranking blocks by another round's keys.
+    harvest->mark_layer_harvested(hook.layer);
+    // The query half: score what this chunk is ASKING with, in the same content frame. `q_layer_stride`
+    // inside the scorer is a token count, and the live plane's row count is the chunk width, so both
+    // arguments are `tokens`. A span longer than MAXQ used to be skipped there; since 2026-10-04 the
+    // scorer segments it and sums the segments (B05 -- see the LOCAL FIX comment in kvmem_score.h), so
+    // the delivered chunk width of 1024 no longer requires NINFER_TERNARY_KVMEM_SCORE_QUERY_TAIL to be
+    // set for it.
+    ops::detail::kvmem_score_accumulate(hook.layer, query.data, hook.tokens, hook.tokens, stream);
+}
+
+} // namespace
+
+void text_set_kvmem_hook(std::int32_t layer_index, std::int32_t chunk_tokens,
+                         void* harvest) noexcept {
+    KvmemHook& hook = kvmem_hook();
+    hook.harvest = harvest;
+    hook.layer   = layer_index;
+    hook.tokens  = chunk_tokens;
+    if (harvest == nullptr) { return; }
+    // The round's WIDTH has to be recorded before the first copy: staging_for_round() hands out a view
+    // sized by it, and a short final chunk must not publish the tail of an earlier, wider round
+    // (raw_k_harvest.h:70-81). The width is only known here -- the round is opened before the chunk,
+    // where the caller knows the chunk capacity, not this chunk's real token count.
+    static_cast<ops::RawKShadowHarvest*>(harvest)->set_round_width(chunk_tokens);
+}
+
 void text_qk_norm_rope(const Tensor& positions, const RopeConfig& rope,
                        const AttentionConfig& attention, float rms_norm_eps,
                        const Tensor& q_norm_weight, const Tensor& k_norm_weight,
@@ -104,14 +204,22 @@ void text_qk_norm_rope(const Tensor& positions, const RopeConfig& rope,
                        Tensor& normalized_key, const ops::RopeYarn& yarn, cudaStream_t stream) {
     require_rope_axes(positions, rope);
     // The fused Op rotates unscaled positions at the unscaled frequencies, so YaRN or position
-    // interpolation keeps the three separate calls.
-    if (!yarn.active() && fused_text_qk_norm_rope(positions, rope, attention, query.ne[2])) {
+    // interpolation keeps the three separate calls -- and so does an ARMED KVMem harvest: the fused
+    // Op materialises no pre-RoPE tensor (rmsnorm_rope.h:22-23), which is why rounds that took it
+    // used to be missing from the index entirely (`fused rmsnorm+rope branch cannot expose the
+    // pre-RoPE key (layer 0, N tokens); this chunk is NOT in the index`). The two forms are
+    // documented bit-identical (rmsnorm_rope.h:56-62), so routing an armed round through the three
+    // calls changes no numerics; it only gives up the fused Op's own 22-52% edge at <= 256 tokens,
+    // and only for the rounds the index is armed for.
+    if (!yarn.active() && !kvmem_harvest_armed() &&
+        fused_text_qk_norm_rope(positions, rope, attention, query.ne[2])) {
         ops::rmsnorm_rope(positions, q_norm_weight, k_norm_weight, query, key, normalized_query,
                           normalized_key, stream);
         return;
     }
     ops::rmsnorm(query, q_norm_weight, rms_norm_eps, true, normalized_query, stream);
     ops::rmsnorm(key, k_norm_weight, rms_norm_eps, true, normalized_key, stream);
+    kvmem_harvest_pre_rope(normalized_query, normalized_key, stream);
     ops::rope(positions, dimension(rope.rotary_dim), rope.rope_theta, yarn, normalized_query,
               normalized_key, stream);
 }

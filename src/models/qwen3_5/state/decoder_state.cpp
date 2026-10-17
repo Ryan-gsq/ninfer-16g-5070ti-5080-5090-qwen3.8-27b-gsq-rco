@@ -6,6 +6,9 @@
 #include <limits>
 #include <stdexcept>
 #include <utility>
+#include <cuda_runtime.h>
+#include <cstdint>
+#include <vector>
 
 namespace ninfer::models::qwen3_5 {
 namespace {
@@ -32,9 +35,10 @@ PagedKVCacheLayout plan_cache(std::span<LayoutBuilder* const> builders,
     const bool scaled                     = profile.quant_group != 0;
 
     const std::uint32_t logical_pages = page_count(capacity);
-    if (physical_page_groups < logical_pages) {
-        throw std::invalid_argument("Paged KV physical pages are below logical capacity");
-    }
+    // LOCAL PROTOTYPE (KVMem-style ring): the physical pool is allowed to be SMALLER than the
+    // logical capacity. The address-space allocator recycles the oldest logical pages as the
+    // sequence grows, and the retrieval mask keeps attention inside the resident window.
+    (void)logical_pages;
 
     if (!layer_rank.empty() && layer_rank.size() != layers) {
         throw std::invalid_argument("Paged KV layer rank map does not cover every layer");
@@ -77,6 +81,7 @@ PagedKVCacheLayout plan_cache(std::span<LayoutBuilder* const> builders,
         .pages = plan_device_kv_page_pool(
             builders, plane_rank,
             DeviceKVPagePoolSpec{.page_group_count = physical_page_groups,
+                                 .allow_logical_reservation = logical_pages > physical_page_groups,
                                  .geometry         = std::move(geometry)}),
         .execution_tables = {},
         .layers         = layers,
@@ -124,7 +129,17 @@ PagedKVCache::PagedKVCache(DeviceSpan backing, const PagedKVCacheLayout& layout)
 PagedKVCache::PagedKVCache(std::span<const DeviceSpan> backings, const PagedKVCacheLayout& layout)
     : pages_(backings, layout.pages), execution_tables_(backings, layout.execution_tables, pages_),
       layers_(layout.layers), max_context_(layout.max_context), kv_heads_(layout.kv_heads),
-      head_dim_(layout.head_dim), storage_(layout.storage) {}
+      head_dim_(layout.head_dim), storage_(layout.storage) {
+    // LOCAL PROTOTYPE (KVMem-style ring): when the pool is smaller than the logical capacity the
+    // retrieval mask is always active. Allocate its (all-ones) device buffer up front so the
+    // pointer stays stable across CUDA Graph capture, which bakes kernel arguments.
+    const std::uint32_t logical_pages = page_count(max_context_);
+    if (pages_.usable_pages() < logical_pages) {
+        const std::size_t words = (static_cast<std::size_t>(logical_pages) + 31U) / 32U;
+        std::vector<std::uint32_t> ones(words, ~0U);
+        install_selection(ones);
+    }
+}
 
 PagedKVCacheView::PagedKVCacheView(const PagedKVCache& cache, KVExecutionRowHandle row) noexcept
     : cache_(&cache), row_(row) {}
@@ -171,6 +186,7 @@ PagedKVLayerView PagedKVCache::layer_view(std::uint32_t layer,
         .head_dim      = head_dim_,
         .num_kv_heads  = kv_heads_,
         .storage       = storage_,
+        .selected_blocks = selected_blocks_,
     };
 }
 
@@ -185,9 +201,41 @@ PagedKVBatchLayerView PagedKVCache::batch_layer_view(std::uint32_t layer) const 
         .head_dim      = direct.head_dim,
         .num_kv_heads  = direct.num_kv_heads,
         .storage       = direct.storage,
+        .selected_blocks = direct.selected_blocks,
     };
 }
 
+PagedKVCache::~PagedKVCache() {
+    if (selection_device_ != nullptr) {
+        (void)cudaFree(selection_device_);
+        selection_device_ = nullptr;
+    }
+}
+
+void PagedKVCache::install_selection(std::span<const std::uint32_t> words) {
+    if (words.empty()) {
+        clear_selection();
+        return;
+    }
+    if (words.size() > selection_words_) {
+        if (selection_device_ != nullptr) {
+            (void)cudaFree(selection_device_);
+            selection_device_ = nullptr;
+        }
+        selection_words_ = 0;
+        if (cudaMalloc(reinterpret_cast<void**>(&selection_device_), words.size_bytes()) !=
+            cudaSuccess) {
+            selection_device_ = nullptr;
+            throw std::runtime_error("PagedKVCache: retrieval bitmap allocation failed");
+        }
+        selection_words_ = words.size();
+    }
+    if (cudaMemcpy(selection_device_, words.data(), words.size_bytes(), cudaMemcpyHostToDevice) !=
+        cudaSuccess) {
+        throw std::runtime_error("PagedKVCache: retrieval bitmap upload failed");
+    }
+    selected_blocks_ = selection_device_;
+}
 std::size_t DecoderStateLayout::kv_payload_bytes() const noexcept {
     return text_kv.payload_bytes() + (mtp_kv ? mtp_kv->payload_bytes() : 0);
 }

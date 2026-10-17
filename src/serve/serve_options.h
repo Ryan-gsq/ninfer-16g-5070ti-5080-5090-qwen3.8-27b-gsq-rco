@@ -91,6 +91,10 @@ struct ServeOptions {
     bool prefill_a8         = true;
     bool prefill_cublas     = false;
     bool prefill_cublas_projections = true;
+    // --glp-vector: path to a `.glpbin` GLP direction stack; empty disables steering (stock).
+    std::filesystem::path glp_vector;
+    // --glp-alpha: projection strength applied to every steered writer site (0 = identity).
+    float glp_alpha = 0.0F;
     // Explicit total CUDA Graph driver-state allowance in MiB; 0 keeps the computed allowance.
     std::uint64_t cuda_graph_allowance_mib = 0;
     bool allow_prefix_reuse = true;
@@ -113,6 +117,13 @@ struct ServeOptions {
     // End-of-thinking message fed to the model when it hits the thinking budget; empty
     // preserves the model's built-in control suffix.
     std::string thinking_budget_message;
+    // S2 (issue #3, reported 2026-10-05; landed 2026-10-07): a SEPARATE presence penalty for the
+    // thinking channel. F4 (thinking wants presence ~1.0..1.5 to break recursion) and L1 (tool
+    // scenarios want a global presence of 0 to avoid XML leakage) conflict on one knob; this one only
+    // replaces the presence penalty while a request is in thinking mode, so the NonThinking/tool
+    // channel keeps the global value. Unset => the resolved sampling overrides are left untouched
+    // (byte-identical to before this change).
+    std::optional<float> thinking_presence_penalty;
     int default_max_tokens = kDefaultMaxTokens;
     bool enable_cors       = false; // send permissive CORS headers for browser UIs
     // --log-colours on|off: on colours the console log's levels and statistics, off keeps it plain;

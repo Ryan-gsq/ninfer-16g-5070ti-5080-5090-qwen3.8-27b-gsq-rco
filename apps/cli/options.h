@@ -47,6 +47,10 @@ struct Options {
     float rope_scaling_factor                   = 1.0F;
     std::uint32_t rope_scaling_original_context = 0;
     bool wddm_evictable_budget = false;
+    // GLP steering: `--glp-vector` names a `.glpbin` direction stack and `--glp-alpha` sets the
+    // projection strength. Alpha defaults to 0, so the flag pair is inert until both are given.
+    std::filesystem::path glp_vector;
+    float glp_alpha = 0.0F;
     CudaMemoryPolicy cuda_memory_policy = CudaMemoryPolicy::DriverDefault;
     std::size_t cuda_vram_reserve_bytes = 64ULL << 20;
     std::size_t cuda_memory_probe_step_bytes = 128ULL << 20;

@@ -33,7 +33,8 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         const std::int32_t* block_tables, const std::int32_t* valid_columns,
         const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t full_width,
         std::int32_t column_begin, std::int32_t logical_capacity, float attention_scale,
-        float* partial_acc, float* partial_m, float* partial_l) {
+        float* partial_acc, float* partial_m, float* partial_l,
+        const std::uint32_t* selected_blocks) {
     constexpr int Wc                   = WarpsPerCta;
     constexpr int RowCount             = TokenTile * Geometry::GroupSize;
     constexpr int RowTiles             = (RowCount + 15) / 16;
@@ -355,10 +356,26 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
 
     for (int kb = 0; kb < key_blocks; ++kb) {
         const int k0 = first_tile + kb * Bc;
+        // ★ K 的 mask-skip v2（照抄他 small_t_nvfp4.cuh:330-348 的形态到 fp8 路由）：
+        // 整块被掩码剔除的 tile 贡献恰为 0（全部 score = -inf ⇒ p = 0、块和 0、acc/m/l 不变），
+        // 所以跳过 dequant+MMA+softmax+PV 与执行它**逐位等价**。谓词只依赖 k0、split 边界与位图
+        // ⇒ CTA 一致，谓词化的分段不会破坏 __syncthreads() 收敛（本移植保持同步点无条件）。
+        const auto tile_has_selected_keys = [&](int tile_k0) {
+            if (selected_blocks == nullptr) { return true; }
+            const int lo = tile_k0 < split_start ? split_start : tile_k0;
+            const int hi = tile_k0 + Bc > split_end ? split_end : tile_k0 + Bc;
+            for (int key = lo; key < hi; key += kPagedKVPageShift) {
+                const int page = key >> kPagedKVPageShift;
+                if (((selected_blocks[page >> 5] >> (page & 31)) & 1U) != 0U) { return true; }
+            }
+            return false;
+        };
+        const bool tile_active = tile_has_selected_keys(k0);
         if (warp < RowTiles) {
             const int row_base = warp * 16;
             __half* p_sw       = &p_s[row_base * PStride];
             float score[QKNt][4];
+            if (tile_active) {
 #pragma unroll
             for (int nt = 0; nt < QKNt; ++nt) {
                 score[nt][0] = score[nt][1] = score[nt][2] = score[nt][3] = 0.0F;
@@ -389,6 +406,13 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             causal_small_t_tc_row_to_qt<Geometry>(row1, TokenTile, kv_head, q_head1, token1);
             const int qabs0 = row0 < RowCount ? positions[token0] : -1;
             const int qabs1 = row1 < RowCount ? positions[token1] : -1;
+            // ring/retrieval mask (ported from tancau's nvfp4 route to fp8): a null bitmap
+            // selects every 64-token KV page, reproducing the original dense result bit-for-bit.
+            const auto block_selected = [&](int key) {
+                if (selected_blocks == nullptr) { return true; }
+                const int page = key >> kPagedKVPageShift;
+                return ((selected_blocks[page >> 5] >> (page & 31)) & 1U) != 0U;
+            };
             float bm0       = -CUDART_INF_F;
             float bm1       = -CUDART_INF_F;
 #pragma unroll
@@ -397,19 +421,23 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                 const int key0 = k0 + col0;
                 const int key1 = key0 + 1;
                 score[nt][0] =
-                    row0 < RowCount && key0 >= split_start && key0 < split_end && key0 <= qabs0
+                    row0 < RowCount && key0 >= split_start && key0 < split_end && key0 <= qabs0 &&
+                            block_selected(key0)
                         ? score[nt][0] * attention_scale
                         : -CUDART_INF_F;
                 score[nt][1] =
-                    row0 < RowCount && key1 >= split_start && key1 < split_end && key1 <= qabs0
+                    row0 < RowCount && key1 >= split_start && key1 < split_end && key1 <= qabs0 &&
+                            block_selected(key1)
                         ? score[nt][1] * attention_scale
                         : -CUDART_INF_F;
                 score[nt][2] =
-                    row1 < RowCount && key0 >= split_start && key0 < split_end && key0 <= qabs1
+                    row1 < RowCount && key0 >= split_start && key0 < split_end && key0 <= qabs1 &&
+                            block_selected(key0)
                         ? score[nt][2] * attention_scale
                         : -CUDART_INF_F;
                 score[nt][3] =
-                    row1 < RowCount && key1 >= split_start && key1 < split_end && key1 <= qabs1
+                    row1 < RowCount && key1 >= split_start && key1 < split_end && key1 <= qabs1 &&
+                            block_selected(key1)
                         ? score[nt][3] * attention_scale
                         : -CUDART_INF_F;
                 bm0 = fmaxf(bm0, fmaxf(score[nt][0], score[nt][1]));
@@ -457,7 +485,13 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                 alpha_s[row0] = alpha0;
                 alpha_s[row1] = alpha1;
             }
-        } else {
+            } else if (lid == 0) {
+                // ★ 跳过整块时 **alpha 必须为 1.0**（fp8 路由特有：alpha_s 由生产者写、消费者用，
+                //   不写就会沿用上一块的 alpha 去缩放累加器）⇒ l/m/acc 均不变，与不跳过逐位等价。
+                alpha_s[row_base + gid]     = 1.0F;
+                alpha_s[row_base + gid + 8] = 1.0F;
+            }
+        } else if (tile_active) {
             const int loader_tid = tid - ProducerThreads;
 #pragma unroll 1
             for (int chunk = loader_tid; chunk < Bc * (D / 8); chunk += VLoaderThreads) {
@@ -477,7 +511,10 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         __syncthreads();
 
         const bool has_next = kb + 1 < key_blocks;
-        if (has_next) {
+        // ★ K 的 mask-skip v2（small_t_nvfp4.cuh:552-553）：下一块若无可选页，连它的 HBM 预取
+        //   （以及下面的等待）一起跳过；同一 CTA 一致谓词 ⇒ 收敛不受影响。
+        const bool next_active = has_next && tile_has_selected_keys(k0 + Bc);
+        if (next_active) {
             const int next_k0 = k0 + Bc;
             if ((next_k0 & kPagedKVPageMask) == 0) {
                 physical_page = page_at(next_k0);
@@ -498,9 +535,10 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             acc[n][2] *= alpha1;
             acc[n][3] *= alpha1;
         }
+        if (tile_active) {
 #pragma unroll
-        for (int n = 0; n < PVNtPerWarp; ++n) {
-            const int global_n = consumer_slice * PVNtPerWarp + n;
+            for (int n = 0; n < PVNtPerWarp; ++n) {
+                const int global_n = consumer_slice * PVNtPerWarp + n;
 #pragma unroll
             for (int k = 0; k < PVKs; ++k) {
                 unsigned pf[4];
@@ -517,8 +555,9 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                 mma_f16(acc[n][0], acc[n][1], acc[n][2], acc[n][3], pf[0], pf[1], pf[2], pf[3],
                         vf[0], vf[1]);
             }
+            }
         }
-        if (has_next) {
+        if (next_active) {
             ninfer::ops::cp_wait<0>();
             // `cp_wait<0>()` retires only the *calling thread's* cp.async group. Every thread in
             // the block then walks the whole tile in dequant_k_tile(), reading bytes issued by

@@ -1,7 +1,7 @@
 #include "core/arena.h"
-#include "core/resident_memory.h"
 
 #include <cuda_runtime.h>
+#include <cstdlib>
 
 #if defined(_WIN32) && defined(NINFER_D3D12_RESIDENCY) && NINFER_D3D12_RESIDENCY
 #    define NINFER_WDDM_RESIDENCY 1
@@ -295,11 +295,6 @@ bool wddm_residency_lock_enabled() noexcept { return false; }
 
 DeviceBuffer::DeviceBuffer(std::size_t size_bytes) : bytes(size_bytes) {
     if (bytes == 0) { return; }
-    resident_session_ = core::current_resident_memory();
-    if (resident_session_) {
-        p = resident_session_->allocate_device(bytes);
-        return;
-    }
 
     void* ptr             = nullptr;
     const cudaError_t err = cudaMalloc(&ptr, bytes);
@@ -309,13 +304,9 @@ DeviceBuffer::DeviceBuffer(std::size_t size_bytes) : bytes(size_bytes) {
     p = ptr;
 }
 
-DeviceBuffer::~DeviceBuffer() {
-    if (resident_session_) { resident_session_->free_device(p); }
-    else { free_device(p); }
-}
+DeviceBuffer::~DeviceBuffer() { free_device(p); }
 
-DeviceBuffer::DeviceBuffer(DeviceBuffer&& other) noexcept
-    : p(other.p), bytes(other.bytes), resident_session_(std::move(other.resident_session_)) {
+DeviceBuffer::DeviceBuffer(DeviceBuffer&& other) noexcept : p(other.p), bytes(other.bytes) {
     other.p     = nullptr;
     other.bytes = 0;
 }
@@ -323,9 +314,7 @@ DeviceBuffer::DeviceBuffer(DeviceBuffer&& other) noexcept
 DeviceBuffer& DeviceBuffer::operator=(DeviceBuffer&& other) noexcept {
     if (this == &other) { return *this; }
 
-    if (resident_session_) { resident_session_->free_device(p); }
-    else { free_device(p); }
-    resident_session_ = std::move(other.resident_session_);
+    free_device(p);
     p     = other.p;
     bytes = other.bytes;
 
@@ -433,13 +422,6 @@ DeviceArena::DeviceArena(std::size_t capacity_bytes) {
         throw std::invalid_argument("DeviceArena capacity must be nonzero");
     }
 
-    resident_session_ = core::current_resident_memory();
-    if (resident_session_) {
-        base_ = resident_session_->allocate_device(capacity_bytes);
-        owned_base_ = base_;
-        cap_ = capacity_bytes;
-        return;
-    }
     void* ptr = nullptr;
 #if NINFER_WDDM_RESIDENCY
     if (core::wddm_residency_lock_enabled()) { ptr = allocate_resident_heap(capacity_bytes); }
@@ -477,16 +459,12 @@ DeviceArena::DeviceArena(DeviceSpan storage)
 }
 
 DeviceArena::~DeviceArena() {
-    if (owns_) {
-        if (resident_session_) { resident_session_->free_device(owned_base_); }
-        else { free_arena(owned_base_); }
-    }
+    if (owns_) { free_arena(owned_base_); }
 }
 
 DeviceArena::DeviceArena(DeviceArena&& other) noexcept
     : base_(other.base_), cap_(other.cap_), off_(other.off_), peak_(other.peak_),
-      owns_(other.owns_), owned_base_(other.owned_base_),
-      resident_session_(std::move(other.resident_session_)), ranks_(std::move(other.ranks_)),
+      owns_(other.owns_), owned_base_(other.owned_base_), ranks_(std::move(other.ranks_)),
       active_rank_(other.active_rank_) {
     other.base_        = nullptr;
     other.cap_         = 0;
@@ -501,11 +479,7 @@ DeviceArena::DeviceArena(DeviceArena&& other) noexcept
 DeviceArena& DeviceArena::operator=(DeviceArena&& other) noexcept {
     if (this == &other) { return *this; }
 
-    if (owns_) {
-        if (resident_session_) { resident_session_->free_device(owned_base_); }
-        else { free_arena(owned_base_); }
-    }
-    resident_session_ = std::move(other.resident_session_);
+    if (owns_) { free_arena(owned_base_); }
     base_       = other.base_;
     cap_        = other.cap_;
     off_        = other.off_;
@@ -651,10 +625,25 @@ ScopedArenaRank::~ScopedArenaRank() noexcept {
 
 PinnedHostBuffer::PinnedHostBuffer(std::size_t size_bytes) {
     if (size_bytes == 0) { throw std::invalid_argument("PinnedHostBuffer size must be nonzero"); }
-    resident_session_ = core::current_resident_memory();
-    if (resident_session_) {
-        data_ = resident_session_->allocate_host(size_bytes);
-        size_ = size_bytes;
+
+    // LOCAL PROTOTYPE (KVMem-style ring): allow pageable host memory instead of a pinned mapping.
+    // On Windows/WDDM a pinned allocation is mapped into the GPU address space and charged against
+    // the card, which caps the host arena at whatever VRAM is free; pageable memory is not mapped,
+    // so it is charged to system RAM only. The cost is that cudaMemcpy to and from it is staged
+    // through a bounce buffer rather than being truly asynchronous.
+    // Taking this path returns BEFORE the pending-error read below on purpose: that diagnostic exists
+    // to explain a *pinning* failure, and no CUDA call can fail on the way out here.
+    const char* pageable_env = std::getenv("NINFER_HOST_PAGEABLE");
+    if (pageable_env != nullptr && pageable_env[0] != '\0' && pageable_env[0] != '0') {
+        void* pageable_ptr = std::malloc(size_bytes);
+        if (pageable_ptr == nullptr) {
+            throw std::runtime_error("failed to allocate " +
+                                     std::to_string((size_bytes + (1ULL << 20) - 1) >> 20) +
+                                     " MiB of pageable host memory");
+        }
+        data_     = pageable_ptr;
+        size_     = size_bytes;
+        pageable_ = true;
         return;
     }
 
@@ -715,27 +704,35 @@ PinnedHostBuffer::PinnedHostBuffer(std::size_t size_bytes) {
 }
 
 PinnedHostBuffer::~PinnedHostBuffer() {
-    if (resident_session_) { resident_session_->free_host(data_); }
-    else { free_pinned(data_); }
+    if (pageable_) {
+        std::free(data_);
+    } else {
+        free_pinned(data_);
+    }
 }
 
 PinnedHostBuffer::PinnedHostBuffer(PinnedHostBuffer&& other) noexcept
-    : data_(other.data_), size_(other.size_), resident_session_(std::move(other.resident_session_)) {
-    other.data_ = nullptr;
-    other.size_ = 0;
+    : data_(other.data_), size_(other.size_), pageable_(other.pageable_) {
+    other.data_     = nullptr;
+    other.size_     = 0;
+    other.pageable_ = false;
 }
 
 PinnedHostBuffer& PinnedHostBuffer::operator=(PinnedHostBuffer&& other) noexcept {
     if (this == &other) { return *this; }
 
-    if (resident_session_) { resident_session_->free_host(data_); }
-    else { free_pinned(data_); }
-    resident_session_ = std::move(other.resident_session_);
-    data_ = other.data_;
-    size_ = other.size_;
+    if (pageable_) {
+        std::free(data_);
+    } else {
+        free_pinned(data_);
+    }
+    data_           = other.data_;
+    size_           = other.size_;
+    pageable_       = other.pageable_;
 
-    other.data_ = nullptr;
-    other.size_ = 0;
+    other.data_     = nullptr;
+    other.size_     = 0;
+    other.pageable_ = false;
     return *this;
 }
 

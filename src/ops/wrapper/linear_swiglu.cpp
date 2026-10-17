@@ -56,7 +56,9 @@ std::size_t linear_swiglu_workspace_capacity_bytes(QType qtype, std::int32_t gat
         const detail::GgufShape parent{qtype, gate_up_rows, input_rows};
         return detail::gguf_swiglu_workspace_bytes(parent, nullptr, min_tokens, max_tokens);
     }
-    if (qtype == QType::T2_G128_FP16) {
+    if (is_ternary(qtype)) {
+        // No int8 term here: the ternary SwiGLU route is A16 by construction, so this is unchanged
+        // for T2 and correct as-is for PTQ1_0.
         (void)linear_workspace_capacity_bytes(qtype, gate_up_rows, input_rows,
                                               LinearPolicy::A16Only, min_tokens, max_tokens);
         WorkspaceLayoutBuilder layout;
@@ -167,14 +169,21 @@ void linear_swiglu(const Tensor& x, const Weight& gate_up_weight, Tensor& out, L
         gate_up_weight.qhigh == nullptr && gate_up_weight.high_plane_bytes == 0 && common_row_split;
     const bool nvfp4_weight = large_shape && gate_up_weight.qtype == QType::NVFP4;
     const bool fp8_weight   = large_shape && gate_up_weight.qtype == QType::FP8_E4M3FN_ROW_BF16;
-    const bool t2_weight    = large_shape && gate_up_weight.qtype == QType::T2_G128_FP16 &&
-                              gate_up_weight.qhigh == nullptr &&
-                              gate_up_weight.high_plane_bytes == 0 && common_row_split;
-    if (!q4_weight && !q8_weight && !nvfp4_weight && !fp8_weight && !t2_weight) {
+    // The ternary family, and the plane expectation follows the member: T2 carries no high plane,
+    // PTQ1_0 carries two bytes per 128-group. Demanding an empty high plane here would reject
+    // PTQ1_0; accepting a non-empty one for T2 would run this arithmetic over bytes it does not
+    // describe. The name says family, not T2, on purpose -- everything below decodes through an
+    // atom, which is exactly what makes both packings safe here.
+    const bool ternary_weight =
+        large_shape && is_ternary(gate_up_weight.qtype) && common_row_split &&
+        (gate_up_weight.qtype == QType::T2_G128_FP16
+             ? (gate_up_weight.qhigh == nullptr && gate_up_weight.high_plane_bytes == 0)
+             : (gate_up_weight.qhigh != nullptr && gate_up_weight.high_plane_bytes != 0));
+    if (!q4_weight && !q8_weight && !nvfp4_weight && !fp8_weight && !ternary_weight) {
         throw std::invalid_argument("linear_swiglu: unsupported weight");
     }
 
-    if (t2_weight) {
+    if (ternary_weight) {
         // Ternary rows project gate and up into one plane; SwiGLU is a separate elementwise pass
         // over its two halves. A16 by construction.
         auto scope     = ws.scope();

@@ -66,7 +66,12 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
         const std::int32_t* block_tables, const std::int32_t* valid_columns,
         const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t full_width,
         std::int32_t column_begin, std::int32_t logical_capacity, std::int32_t wave_splits,
-        float scale, float* partial_acc, float* partial_m, float* partial_l) {
+        float scale, float* partial_acc, float* partial_m, float* partial_l,
+        // LOCAL FIX (ring mask on the int8 family decode route, 2026-10-02): the retrieval bitmap.
+        // nullptr = dense (bit-identical to before); passed from invocation.selected_blocks by
+        // small_t_i8_launch.cuh, so the public launcher signature and all 28 explicit instantiations
+        // stay untouched.
+        const std::uint32_t* selected_blocks) {
     constexpr bool PackedKeys          = Keys != KvKeyCoding::Int8;
     constexpr int Wc                   = WarpsPerCta;
     constexpr int RowCount             = TokenTile * Geometry::GroupSize;
@@ -755,6 +760,15 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
             causal_small_t_tc_row_to_qt<Geometry>(row1, TokenTile, kv_head, q_head1, token1);
             const int qabs0 = (row0 < RowCount) ? pos[token0] : -1;
             const int qabs1 = (row1 < RowCount) ? pos[token1] : -1;
+            // LOCAL FIX (ring mask on the int8 family decode route, 2026-10-02): same lambda as
+            // small_t_fp8.cuh:409-415 / small_t_k8v4.cuh. This template serves int8, rk8v4, rk4v4 and
+            // rk2v4-e8 (small_t.cu:403, kv_cache_is_int8_family), so one edit covers the family. A page
+            // the ring demoted has had its device slot recycled, so its K/V must not be read.
+            const auto block_selected = [&](int key) {
+                if (selected_blocks == nullptr) { return true; }
+                const int page = key >> kPagedKVPageShift;
+                return ((selected_blocks[page >> 5] >> (page & 31)) & 1U) != 0U;
+            };
             float bm0 = -CUDART_INF_F, bm1 = -CUDART_INF_F;
 #pragma unroll
             for (int nt = 0; nt < QKNtWarp; ++nt) {
@@ -763,19 +777,23 @@ __launch_bounds__(WarpsPerCta * 32, MinBlocksPerSm) __global__
                 const int key0 = k0 + col0;
                 const int key1 = k0 + col1;
                 score[nt][0] =
-                    (row0 < RowCount && key0 >= split_start && key0 < split_end && key0 <= qabs0)
+                    (row0 < RowCount && key0 >= split_start && key0 < split_end && key0 <= qabs0 &&
+                     block_selected(key0))
                         ? score[nt][0] * scale
                         : -CUDART_INF_F;
                 score[nt][1] =
-                    (row0 < RowCount && key1 >= split_start && key1 < split_end && key1 <= qabs0)
+                    (row0 < RowCount && key1 >= split_start && key1 < split_end && key1 <= qabs0 &&
+                     block_selected(key1))
                         ? score[nt][1] * scale
                         : -CUDART_INF_F;
                 score[nt][2] =
-                    (row1 < RowCount && key0 >= split_start && key0 < split_end && key0 <= qabs1)
+                    (row1 < RowCount && key0 >= split_start && key0 < split_end && key0 <= qabs1 &&
+                     block_selected(key0))
                         ? score[nt][2] * scale
                         : -CUDART_INF_F;
                 score[nt][3] =
-                    (row1 < RowCount && key1 >= split_start && key1 < split_end && key1 <= qabs1)
+                    (row1 < RowCount && key1 >= split_start && key1 < split_end && key1 <= qabs1 &&
+                     block_selected(key1))
                         ? score[nt][3] * scale
                         : -CUDART_INF_F;
                 bm0 = fmaxf(bm0, fmaxf(score[nt][0], score[nt][1]));

@@ -14,6 +14,8 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include <cstdio>
+#include "core/host_kv_arena.h"
 
 namespace ninfer::models::qwen3_5::detail {
 
@@ -103,6 +105,7 @@ public:
         : owner_(std::exchange(other.owner_, nullptr)), address_(other.address_),
           requested_entitlement_(other.requested_entitlement_),
           activation_frontier_(other.activation_frontier_),
+          defer_missing_replicas_(other.defer_missing_replicas_),
           page_reservation_(std::move(other.page_reservation_)), row_(std::move(other.row_)) {}
 
     KVActivationReservation& operator=(KVActivationReservation&&)      = delete;
@@ -114,15 +117,24 @@ private:
                             std::uint32_t requested_entitlement,
                             std::optional<std::uint32_t> activation_frontier,
                             DeviceKVPageReservation&& page_reservation,
-                            KVExecutionRowLease&& row) noexcept
+                            KVExecutionRowLease&& row,
+                            bool defer_missing_replicas) noexcept
         : owner_(&owner), address_(address), requested_entitlement_(requested_entitlement),
-          activation_frontier_(activation_frontier), page_reservation_(std::move(page_reservation)),
-          row_(std::move(row)) {}
+          activation_frontier_(activation_frontier),
+          defer_missing_replicas_(defer_missing_replicas),
+          page_reservation_(std::move(page_reservation)), row_(std::move(row)) {}
 
     KVAddressSpaceStore* owner_ = nullptr;
     KVAddressSpaceHandle address_;
     std::uint32_t requested_entitlement_ = 0;
     std::optional<std::uint32_t> activation_frontier_;
+    // ROUTE 3 (lazy adopt): when set, activation admits mapped pages that have a CURRENT Host
+    // replica but no Device replica yet, and keeps their reservation pages as this lane's on-demand
+    // budget. The ring then materializes them one page at a time
+    // (restore_kv_pages_from_host, storage\context.cpp) as the retrieval window asks for them.
+    // Clear by default: without it the historic invariant "-- every mapped page must be
+    // Device-resident at commit --" is enforced exactly as before.
+    bool defer_missing_replicas_ = false;
     DeviceKVPageReservation page_reservation_;
     std::optional<KVExecutionRowLease> row_;
 
@@ -289,7 +301,13 @@ public:
         for (std::uint32_t index = 0; index < pages_.size(); ++index) {
             free_[index] = static_cast<std::uint32_t>(pages_.size()) - 1U - index;
         }
-        materialization_scratch_.reserve(physical.capacity_pages());
+        // LOCAL PROTOTYPE (KVMem-style ring), K kv_store.h:253-256: reserve the scratch for the
+        // LOGICAL capacity, not the physical pool. Under the ring the pool is smaller than the
+        // logical context, yet a chunked prefill materializes more logical pages in one batch than
+        // the pool holds - with a physical-sized scratch that batch threw
+        // "logical KV batch materialization exceeds descriptor capacity" (master first run,
+        // measured 2026-09-30 at ~14.3k prefill tokens with a 128-page pool / 1024 logical pages).
+        materialization_scratch_.reserve(logical_capacity);
     }
 
     LogicalKVPageStore(const LogicalKVPageStore&)            = delete;
@@ -311,7 +329,7 @@ public:
         if (free_count_ == 0) {
             throw std::logic_error("logical KV descriptors exhausted before physical capacity");
         }
-        DeviceKVPageLease lease   = physical_->materialize_one(reservation);
+        DeviceKVPageLease lease   = physical_->materialize_one(reservation, "logical-grow");
         const std::uint32_t index = free_[--free_count_];
         Page& page                = pages_[index];
         page.device_replica.emplace(std::move(lease));
@@ -331,7 +349,14 @@ public:
         if (destinations.empty()) { return; }
         if (destinations.size() > free_count_ ||
             destinations.size() > materialization_scratch_.capacity()) {
-            throw std::logic_error("logical KV batch materialization exceeds descriptor capacity");
+            // LOCAL DIAGNOSTIC (ring first-run 2026-09-30): the bare message cannot say WHICH
+            // capacity ran out, and both halves are plausible under the ring. Behaviour unchanged:
+            // still throws.
+            throw std::logic_error(
+                std::string("logical KV batch materialization exceeds descriptor capacity: batch=") +
+                std::to_string(destinations.size()) + " free=" + std::to_string(free_count_) +
+                " scratch=" + std::to_string(materialization_scratch_.capacity()) +
+                " logical_capacity=" + std::to_string(pages_.size()));
         }
         for (const LogicalKVPageHandle destination : destinations) {
             if (destination.valid()) {
@@ -346,7 +371,13 @@ public:
         }
 
         std::optional<DeviceKVPageHandle> physical_predecessor;
-        if (preferred_predecessor) { physical_predecessor = physical(*preferred_predecessor); }
+        // LOCAL FIX (ring predecessor), K kv_store.h:310-314: the predecessor is only a contiguity
+        // hint for the allocator. Under the ring it can have been demoted to the Host (no Device
+        // replica), which must fall back to an unconstrained allocation, not throw.
+        // (K also tags this call site for the missing-replica diagnostic; the tag is not ported.)
+        if (preferred_predecessor && device_resident(*preferred_predecessor)) {
+            physical_predecessor = physical(*preferred_predecessor);
+        }
         materialization_scratch_.clear();
         physical_->materialize(reservation, static_cast<std::uint32_t>(destinations.size()),
                                materialization_scratch_, physical_predecessor);
@@ -374,7 +405,7 @@ public:
             committed_columns > static_cast<std::uint32_t>(kPagedKVPageSize) || free_count_ == 0) {
             throw std::invalid_argument("logical KV transfer destination is invalid");
         }
-        DeviceKVPageLease lease   = physical_->materialize_one(reservation);
+        DeviceKVPageLease lease   = physical_->materialize_one(reservation, "transfer-destination");
         const std::uint32_t index = free_[--free_count_];
         Page& page                = pages_[index];
         page.device_replica.emplace(std::move(lease));
@@ -502,7 +533,7 @@ public:
             page.host_replica->committed_columns != page.committed_columns) {
             throw std::logic_error("logical KV Device restore is not reservable");
         }
-        page.pending_device_replica.emplace(physical_->materialize_one(reservation));
+        page.pending_device_replica.emplace(physical_->materialize_one(reservation, "host-restore"));
         page.destination_pinned = true;
         return page.pending_device_replica->handle();
     }
@@ -562,9 +593,9 @@ public:
 
     void release_active_reference(LogicalKVPageHandle handle) {
         Page& page = require(handle);
-        if (page.active_references == 0) {
-            throw std::logic_error("logical KV page has no active reference");
-        }
+        // LOCAL PROTOTYPE (KVMem-style ring): a page demoted to the Host no longer holds its active
+        // reference (see ProgramImpl::demote_sequence_kv_to_host), so releasing it again is a no-op.
+        if (page.active_references == 0) { return; }
         --page.active_references;
     }
 
@@ -646,7 +677,21 @@ public:
         if (!page.device_replica || page.writer_references != 1 ||
             columns < page.committed_columns ||
             columns > static_cast<std::uint32_t>(kPagedKVPageSize)) {
-            throw std::invalid_argument("logical KV committed coverage is not monotonic");
+            // LOCAL DIAGNOSTIC (ring decode first-run 2026-09-30): with the pool smaller than the
+            // sequence, a decode step's page can have been demoted (no device replica, writer
+            // cleared) before this commit. Report every term so the failing condition is named.
+            // Behaviour unchanged: still throws.
+            throw std::invalid_argument(
+                std::string("logical KV committed coverage is not monotonic: page=") +
+                std::to_string(handle.index_) + " columns=" + std::to_string(columns) +
+                " committed=" + std::to_string(page.committed_columns) +
+                " device_replica=" + std::to_string(page.device_replica ? 1 : 0) +
+                " writer_refs=" + std::to_string(page.writer_references) +
+                " refs=" + std::to_string(page.references) +
+                " active_refs=" + std::to_string(page.active_references) +
+                " host_replica=" + std::to_string(page.host_replica ? 1 : 0) +
+                " pins=" + std::to_string(page.source_pins) +
+                " occupied=" + std::to_string(page.occupied ? 1 : 0));
         }
         page.committed_columns = columns;
     }
@@ -727,7 +772,14 @@ public:
     can_release_reference_after_active_reference(LogicalKVPageHandle handle) const noexcept {
         if (!valid(handle)) { return false; }
         const Page& page = pages_[handle.index_];
-        return page.references != 0 && page.active_references != 0 &&
+        // LOCAL FIX (demote-teardown): Host-demoted pages dropped their active
+        // reference by design, and release preserves their descriptor through
+        // host_replica. Demanding an active reference here made every cancel past
+        // pool capacity unwedgeable (118+ demoted pages vetoed the whole lane).
+        // Fully demoted pages are releasable without one; anything else keeps the
+        // veto, so genuine active-state corruption still throws upstream.
+        return page.references != 0 &&
+               (page.active_references != 0 || page.host_replica) &&
                page.active_references <= page.references && page.writer_references <= 1 &&
                page.source_pins == 0 && !page.destination_pinned;
     }
@@ -901,6 +953,10 @@ public:
     // The most pages one address may map or be entitled to.
     [[nodiscard]] std::uint32_t page_capacity() const noexcept { return page_capacity_; }
 
+    // LOCAL PROTOTYPE (KVMem-style ring): the logical page capacity of this address space. When it
+    // is larger than the Device pool's usable pages the ring (Host demotion) is active.
+    [[nodiscard]] std::uint32_t logical_page_capacity() const noexcept { return page_capacity_; }
+
     // `streams` carries every rank's stream: activation publishes the row's table to each replica.
     [[nodiscard]] std::optional<KVAddressSpaceHandle>
     create_active(std::uint32_t entitlement, std::int32_t execution_row, RankStreams streams) {
@@ -947,7 +1003,8 @@ public:
     [[nodiscard]] KVActivationReservation
     prepare_activation(KVAddressSpaceHandle handle, std::uint32_t entitlement,
                        std::int32_t execution_row,
-                       std::optional<std::uint32_t> activation_frontier = std::nullopt) {
+                       std::optional<std::uint32_t> activation_frontier = std::nullopt,
+                       bool defer_missing_replicas = false) {
         Address& address = require(handle);
         if (address.active || address.row || address.reservation.valid() || entitlement == 0 ||
             entitlement > page_capacity_ ||
@@ -971,7 +1028,8 @@ public:
                                                    static_cast<std::uint32_t>(required));
         KVExecutionRowLease row = tables_->acquire(execution_row);
         return KVActivationReservation(*this, handle, entitlement, activation_frontier,
-                                       std::move(reservation), std::move(row));
+                                       std::move(reservation), std::move(row),
+                                       defer_missing_replicas);
     }
 
     [[nodiscard]] std::vector<LogicalKVPageHandle>
@@ -1011,17 +1069,39 @@ public:
              address.committed_frontier != *activation.activation_frontier_)) {
             throw std::logic_error("KV activation destination changed after reservation");
         }
-        const std::uint32_t expected = activation.requested_entitlement_ > address.page_count
-                                           ? activation.requested_entitlement_ - address.page_count
-                                           : 0U;
+        // ROUTE 3 (lazy adopt): a deferred activation may commit a range whose not-yet-materialized
+        // pages keep a CURRENT Host replica. Their reservation pages are deliberately left in the
+        // reservation as this lane's on-demand budget, so the expected total is "growth + replicas
+        // still to materialize". With the flag clear this is the historic figure, unchanged.
+        std::uint32_t deferred_missing = 0;
+        if (activation.defer_missing_replicas_) {
+            for (std::uint32_t page = 0; page < address.page_count; ++page) {
+                const LogicalKVPageHandle logical = membership(address, page);
+                if (pages_->device_resident(logical)) { continue; }
+                if (!pages_->host_resident(logical)) {
+                    throw std::logic_error("KV deferred activation has a page with no replica at all");
+                }
+                ++deferred_missing;
+            }
+        }
+        const std::uint32_t expected =
+            (activation.requested_entitlement_ > address.page_count
+                 ? activation.requested_entitlement_ - address.page_count
+                 : 0U) +
+            deferred_missing;
         if (!activation.page_reservation_.belongs_to(pages_->physical_pool()) ||
             activation.page_reservation_.pages() != expected) {
             throw std::logic_error("KV activation capacity reservation changed");
         }
         for (std::uint32_t page = 0; page < address.page_count; ++page) {
             const LogicalKVPageHandle logical = membership(address, page);
-            if (!pages_->device_resident(logical) || (pages_->address_references(logical) == 1 &&
-                                                      !pages_->can_set_writer(logical, true))) {
+            if (!pages_->device_resident(logical)) {
+                // ROUTE 3: checked above -- Host replica present, Device replica deferred.
+                if (activation.defer_missing_replicas_) { continue; }
+                throw std::logic_error("KV activation has an unavailable Device page");
+            }
+            if (pages_->address_references(logical) == 1 &&
+                !pages_->can_set_writer(logical, true)) {
                 throw std::logic_error("KV activation has an unavailable Device page");
             }
         }
@@ -1033,13 +1113,21 @@ public:
         activation.owner_           = nullptr;
         for (std::uint32_t page = 0; page < address.page_count; ++page) {
             const LogicalKVPageHandle logical = membership(address, page);
+            // ROUTE 3: a not-yet-materialized page carries no active reference -- the ring's restore
+            // path (restore_page_from_host) retains it when it lands, and deactivation's release is
+            // a no-op at zero (kv_store.h:594-599), so the accounting stays balanced both ways.
+            if (!pages_->device_resident(logical)) { continue; }
             if (pages_->address_references(logical) == 1) {
                 pages_->clear_protection(logical);
                 pages_->set_writer(logical, true);
             }
             pages_->retain_active_reference(logical);
         }
-        publish_membership(address, stream);
+        if (activation.defer_missing_replicas_) {
+            publish_membership_resident_runs(address, stream);
+        } else {
+            publish_membership(address, stream);
+        }
     }
 
     void deactivate(KVAddressSpaceHandle handle) {
@@ -1616,6 +1704,47 @@ public:
         pages_->physical_pool().resize_reservation(address.reservation, 0);
     }
 
+    // LOCAL PROTOTYPE (KVMem-style ring): visit every address slot. The functor receives
+    // (handle, active, mapped_pages) for each occupied slot; iteration order is slot order.
+    template <typename F>
+    void for_each_address(F&& f) {
+        for (std::uint32_t index = 0; index < static_cast<std::uint32_t>(addresses_.size());
+             ++index) {
+            Address& address = addresses_[index];
+            if (!address.occupied) { continue; }
+            f(KVAddressSpaceHandle(this, index, address.generation), address.active,
+              address.page_count);
+        }
+    }
+
+    // LOCAL PROTOTYPE (KVMem-style ring retrieval): bring a Host-resident logical page back onto the
+    // Device and re-publish its block-table slot so attention can read it again. The caller owns the
+    // reservation (it must have exactly the pages free) and the Host source view.
+    [[nodiscard]] bool restore_page_from_host(KVAddressSpaceHandle handle, std::uint32_t page,
+                                              HostKVAllocationConstView source,
+                                              DeviceKVPageReservation& reservation,
+                                              cudaStream_t stream = nullptr) {
+        Address& address = require_active(handle);
+        if (page >= address.page_count || !address.row) { return false; }
+        const LogicalKVPageHandle logical = membership(address, page);
+        if (!pages_->valid(logical) || pages_->device_resident(logical) ||
+            !pages_->host_resident(logical)) {
+            return false;
+        }
+        const DeviceKVPageHandle destination = pages_->reserve_device_replica(logical, reservation);
+        pages_->physical_pool().copy_from_host(
+            source, std::span<const DeviceKVPageHandle>(&destination, 1), stream);
+        pages_->publish_device_replica(logical);
+        pages_->retain_active_reference(logical);
+        publish_scratch_.clear();
+        // ADAPTATION (master API): the counterpart passes a tag here - physical(handle, "restore-src") -
+        // but master's LogicalKVPageStore::physical takes only the handle (kv_store.h:432). Same value,
+        // one argument.
+        publish_scratch_.push_back(pages_->physical(logical));
+        tables_->publish(address.row->handle(), page, publish_scratch_, stream);
+        return true;
+    }
+
     // Coverage is a lower bound. A speculative mapping may already extend beyond this stage's
     // needs; only an explicit truncate releases it, and commit_frontier publishes valid tokens.
     void ensure_mapped_to_tokens(KVAddressSpaceHandle handle, std::uint32_t tokens,
@@ -2046,6 +2175,32 @@ private:
             publish_scratch_.push_back(pages_->physical(membership(address, page)));
         }
         tables_->publish(address.row->handle(), 0, publish_scratch_, stream);
+    }
+
+    // ROUTE 3 (lazy adopt): publish only the maximal runs of Device-resident pages. A page whose
+    // Device replica has not been materialized yet gets NO row entry -- there is no physical page to
+    // name -- and stays invisible to attention until the ring restores it; restore_page_from_host
+    // then republishes that single entry (kv_store.h:1701-1702). The row's holes are exactly what
+    // the ring's mask is for: "The mask IS the resident set, so a page that could not be demoted or
+    // restored can only be hidden; it can never expose a stale Device slot"
+    // (program\storage\context.cpp:2185-2186).
+    void publish_membership_resident_runs(const Address& address, RankStreams stream = {}) {
+        if (!address.row) { throw std::logic_error("KV address space has no execution row"); }
+        std::uint32_t page = 0;
+        while (page < address.page_count) {
+            if (!pages_->device_resident(membership(address, page))) {
+                ++page;
+                continue;
+            }
+            const std::uint32_t begin = page;
+            publish_scratch_.clear();
+            while (page < address.page_count &&
+                   pages_->device_resident(membership(address, page))) {
+                publish_scratch_.push_back(pages_->physical(membership(address, page)));
+                ++page;
+            }
+            tables_->publish(address.row->handle(), begin, publish_scratch_, stream);
+        }
     }
 
     LogicalKVPageStore* pages_    = nullptr;

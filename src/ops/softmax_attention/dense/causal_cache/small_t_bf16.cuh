@@ -22,7 +22,10 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_bf
     __nv_bfloat16* cache_v, const std::int32_t* block_tables, const std::int32_t* valid_columns,
     const std::int32_t* table_rows, std::int32_t table_stride, std::int32_t tokens,
     std::int32_t full_width, std::int32_t column_begin, std::int32_t logical_capacity, float scale,
-    float* partial_acc, float* partial_m, float* partial_l) {
+    float* partial_acc, float* partial_m, float* partial_l,
+    // LOCAL FIX (ring mask on the bf16 decode route, 2026-10-02): the retrieval bitmap, passed from
+    // invocation.selected_blocks by small_t.cu. nullptr = dense, bit-identical to before.
+    const std::uint32_t* selected_blocks) {
     static_assert(TokenTile >= 1 && TokenTile * Geometry::GroupSize <= 48);
     static_assert(WarpsPerCta >= 1 && WarpsPerCta <= 4);
 
@@ -289,6 +292,13 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_bf
         const int qabs0 = (row0 < row_count) ? pos[token0] : -1;
         const int qabs1 = (row1 < row_count) ? pos[token1] : -1;
 
+        // LOCAL FIX (ring mask on the bf16 decode route, 2026-10-02): same lambda as
+        // small_t_fp8.cuh:409-415 / small_t_k8v4.cuh. bf16 is the CLI default dtype.
+        const auto block_selected = [&](int key) {
+            if (selected_blocks == nullptr) { return true; }
+            const int page = key >> kPagedKVPageShift;
+            return ((selected_blocks[page >> 5] >> (page & 31)) & 1U) != 0U;
+        };
         float bm0 = -CUDART_INF_F, bm1 = -CUDART_INF_F;
 #pragma unroll
         for (int nt = 0; nt < QKNt; ++nt) {
@@ -297,19 +307,23 @@ __launch_bounds__(128, 2) __global__ void causal_attention_small_t_tc_partial_bf
             const int key0 = k0 + col0;
             const int key1 = col1 + k0;
             score[nt][0] =
-                (row0 < row_count && key0 >= split_start && key0 < split_end && key0 <= qabs0)
+                (row0 < row_count && key0 >= split_start && key0 < split_end && key0 <= qabs0 &&
+                 block_selected(key0))
                     ? score[nt][0] * scale
                     : -CUDART_INF_F;
             score[nt][1] =
-                (row0 < row_count && key1 >= split_start && key1 < split_end && key1 <= qabs0)
+                (row0 < row_count && key1 >= split_start && key1 < split_end && key1 <= qabs0 &&
+                 block_selected(key1))
                     ? score[nt][1] * scale
                     : -CUDART_INF_F;
             score[nt][2] =
-                (row1 < row_count && key0 >= split_start && key0 < split_end && key0 <= qabs1)
+                (row1 < row_count && key0 >= split_start && key0 < split_end && key0 <= qabs1 &&
+                 block_selected(key0))
                     ? score[nt][2] * scale
                     : -CUDART_INF_F;
             score[nt][3] =
-                (row1 < row_count && key1 >= split_start && key1 < split_end && key1 <= qabs1)
+                (row1 < row_count && key1 >= split_start && key1 < split_end && key1 <= qabs1 &&
+                 block_selected(key1))
                     ? score[nt][3] * scale
                     : -CUDART_INF_F;
             bm0 = fmaxf(bm0, fmaxf(score[nt][0], score[nt][1]));

@@ -269,9 +269,15 @@ def fp8_row_maxabs(request: PrepareRequest) -> PreparedMethod:
 
 
 def import_encoded(request: PrepareRequest) -> PreparedMethod:
-    """Preserve the current FP8/NVFP4/T2/GGUF source codes, scales and weight divisor."""
+    """Preserve the current FP8/NVFP4/T2/PTQ1/GGUF source codes, scales and weight divisor."""
+    # PTQ1_0 is in this list for the same reason T2 is: the bytes come from the source's own encoder
+    # (gguf.encode_ptq1_0) rather than from a quantizer here, so all this method has to do is carry
+    # them through. Leaving it out rejected the whole conversion with "requires a known encoded
+    # matrix target" -- a whitelist, not a capability, and the third place the new format had to be
+    # named (after formats/layouts and the row-split codec).
     if (
-        request.target.format not in ("nvfp4", "fp8_e4m3fn_row_bf16", "t2_g128_fp16")
+        request.target.format
+        not in ("nvfp4", "fp8_e4m3fn_row_bf16", "t2_g128_fp16", "ptq1_g128_fp16")
         and request.target.format not in GGUF_FORMATS
     ) or len(request.target.shape) != 2:
         raise ValueError("import_encoded requires a known encoded matrix target")

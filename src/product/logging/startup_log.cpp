@@ -74,7 +74,10 @@ PhasePresentation phase_presentation(StartupPhase phase) noexcept {
     case StartupPhase::CudaGraphPrepare:
         return {"preparing CUDA graphs", "CUDA graphs ready", PhaseVisibility::Info, false, false};
     case StartupPhase::EngineFinalize:
-        return {"finalizing engine", "engine finalized", PhaseVisibility::Debug, false, false};
+        // Info, not Debug: this is the phase that constructs the execution core, and when that step
+        // dies the ONLY trace used to be its absence -- the log stopped at "CUDA graphs ready" and
+        // the process left with 0xC0000005. Two lines here name the failing step from the console.
+        return {"finalizing engine", "engine finalized", PhaseVisibility::Info, false, false};
     }
     return {"starting unknown phase", "unknown phase complete", PhaseVisibility::Debug, false,
             false};

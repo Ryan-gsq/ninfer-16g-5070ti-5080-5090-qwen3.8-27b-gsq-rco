@@ -9,6 +9,7 @@
 #include <limits>
 #include <stdexcept>
 #include <tuple>
+#include <cstdio>
 
 namespace ninfer::models::qwen3_5::detail {
 namespace {
@@ -295,11 +296,30 @@ RequestBasePlan ProgramImpl::plan_request(const PreparedPromptData& prompt,
                 std::min(capacity, base->summary.prompt_tokens + backend_window_tokens - 1U));
         }
     }
+    // LOCAL FIX (ring device footprint): in ring mode the Device pool cannot hold the
+    // whole prompt+output. The address keeps its logical entitlement (it must cover the
+    // mapped prompt), but the sequence's DEVICE footprint is capped at the pool: the ring
+    // keeps a resident window and the excess lives on Host. Planning a Device demand past
+    // the pool is what made materialization fail at the pool boundary
+    // ("Paged KV reservation invariant" / "does not match its active entitlement").
+    const bool ring_active =
+        text_kv_pages != nullptr && text_kv_addresses != nullptr &&
+        text_kv_pages->physical_pool().usable_pages() != 0 &&
+        text_kv_pages->physical_pool().usable_pages() <
+            text_kv_addresses->logical_page_capacity();
+    const std::uint32_t device_text_cap =
+        ring_active ? text_kv_pages->physical_pool().usable_pages()
+                    : base->text_kv_page_entitlement;
+    const std::uint32_t device_backend_cap =
+        backend_kv_pages != nullptr
+            ? std::min(base->backend_kv_page_entitlement,
+                       backend_kv_pages->physical_pool().usable_pages())
+            : base->backend_kv_page_entitlement;
     detail::PhysicalDeviceResources root_active{
         .active_lanes     = 1,
         .state_slots      = 1U,
-        .main_kv_pages    = base->text_kv_page_entitlement,
-        .backend_kv_pages = base->backend_kv_page_entitlement,
+        .main_kv_pages    = std::min(base->text_kv_page_entitlement, device_text_cap),
+        .backend_kv_pages = std::min(base->backend_kv_page_entitlement, device_backend_cap),
     };
     if (prompt.has_media()) {
         if (!workspace_plan.vision) {

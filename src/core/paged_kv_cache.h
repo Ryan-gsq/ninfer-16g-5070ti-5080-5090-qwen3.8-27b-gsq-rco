@@ -28,6 +28,10 @@ struct PagedKVLayerView {
     std::int32_t head_dim     = 0;
     std::int32_t num_kv_heads = 0;
     KvCacheStorage storage    = KvCacheStorage::BFloat16;
+    // LOCAL PROTOTYPE: per-request retrieval mask over 64-token KV pages. Bit p of word
+    // (p >> 5) set means page p is attended; nullptr selects every page (dense, the original
+    // behaviour). Produced by the retrieval policy and carried to the attention kernels.
+    const std::uint32_t* selected_blocks = nullptr;
 };
 
 /** Non-owning multi-sequence view consumed by batched growing-cache Ops. */
@@ -40,6 +44,10 @@ struct PagedKVBatchLayerView {
     std::int32_t head_dim     = 0;
     std::int32_t num_kv_heads = 0;
     KvCacheStorage storage    = KvCacheStorage::BFloat16;
+    // LOCAL PROTOTYPE: per-request retrieval mask over 64-token KV pages. Bit p of word
+    // (p >> 5) set means page p is attended; nullptr selects every page (dense, the original
+    // behaviour). Produced by the retrieval policy and carried to the attention kernels.
+    const std::uint32_t* selected_blocks = nullptr;
 };
 
 /** Rebinds one checked single-sequence table row as a one-row batched view. */
@@ -70,6 +78,11 @@ struct KVPageGeometry {
 
 struct DeviceKVPagePoolSpec {
     std::uint32_t page_group_count = 0;
+    // LOCAL PROTOTYPE (KVMem-style ring): when the logical KV capacity is larger than this pool the
+    // pool cannot back a reservation for the whole logical context. Reservations then become a
+    // logical promise (bounded only by the logical page count); the physical allocation stays
+    // bounded by `page_group_count` and the ring recycles resident pages to honour it.
+    bool allow_logical_reservation = false;
     KVPageGeometry geometry;
 };
 
@@ -274,7 +287,8 @@ public:
                      std::vector<DeviceKVPageLease>& destination,
                      std::optional<DeviceKVPageHandle> preferred_predecessor = std::nullopt);
     // Single-page forms for fixed-capacity logical stores which do not own a growable lease vector.
-    [[nodiscard]] DeviceKVPageLease materialize_one(DeviceKVPageReservation& reservation);
+    [[nodiscard]] DeviceKVPageLease materialize_one(DeviceKVPageReservation& reservation,
+                                                      const char* tag = "unspecified");
     // Returns trailing leases to the same entitlement instead of releasing their capacity.
     void dematerialize(DeviceKVPageReservation& reservation, std::uint32_t target_page_count,
                        std::vector<DeviceKVPageLease>& source);

@@ -1,5 +1,4 @@
 #include "serve/serve_options.h"
-#include "product/cuda_memory_options.h"
 #include "product/post_thinking_options.h"
 #include "product/rope_yarn_options.h"
 #include "product/speculative_options.h"
@@ -127,6 +126,9 @@ std::string serve_usage_text(const char* argv0) {
            "  --no-prefill-cublas-projections\n"
            "                                with --prefill-cublas, keep the attention and\n"
            "                                GDN input projections off that route\n"
+           "  --glp-vector FILE             GLP direction stack (.glpbin) for refusal\n"
+           "                                steering; empty (default) is stock\n"
+           "  --glp-alpha F                 GLP projection strength, 0..4 (default 0: off)\n"
            "  --no-prefill-a8               prefill every projection on the A16 routes\n"
            "                                instead of the integer-activation ones\n"
            "  --mlp-a8-decode               integer-activation MLP gate_up at decode and\n"
@@ -152,33 +154,15 @@ std::string serve_usage_text(const char* argv0) {
            "  --rope-scaling-original-context N\n"
            "                                the interpolation threshold (default: the\n"
            "                                model's native window)\n"
-           "  --cuda-memory-policy MODE    behavior when dedicated GPU memory is insufficient:\n"
-           "    default                     plan against CUDA-reported free memory; ordinary\n"
-           "                                driver behavior, no dedicated-residency guarantee\n"
-           "    mixed                       attempt requested allocations beyond CUDA free;\n"
-           "                                allow Windows to borrow system RAM for device data.\n"
-           "                                Placement is driver-managed, not forced to Shared;\n"
-           "                                inference may become much slower. Auto KV is capped\n"
-           "                                at one page-rounded context window per concurrent\n"
-           "                                request; allocation failure is reported, not retried\n"
-           "    strict                      require observed dedicated-VRAM residency; equals\n"
-           "                                strict-64-128 (64 MiB reserve, 128 MiB probe step)\n"
-           "    strict-RESERVE-STEP          customize both values in MiB; RESERVE >= 0,\n"
-           "                                STEP 1..16384. Example: strict-128-64. Reserve is\n"
-           "                                verified at startup, not permanently locked; step\n"
-           "                                controls probes, final device arenas stay contiguous\n"
-           "                                strict selects its required cache automatically.\n"
-           "                                --host-cache-mib independently sizes CPU context\n"
-           "                                retention, not device-data system-RAM fallback.\n"
-           "                                mixed/strict: Windows single-GPU text, no WDDM mode.\n"
            "  --wddm-evictable-budget       Windows D3D12 builds: budget against dedicated\n"
            "                                memory, holding arenas resident\n"
            "\n"
            "KV CACHE\n"
            "  --kv-capacity N|auto          shared KV capacity in tokens (default\n"
            "                                --max-context, or auto with\n"
-           "                                Hybrid/strict); auto follows --cuda-memory-policy\n"
-           "  --kv-headroom-mib N           default policy only: auto KV leaves free (default\n"
+           "                                --use-alt-prefix-caching); auto sizes the pool\n"
+           "                                from free memory\n"
+           "  --kv-headroom-mib N           memory --kv-capacity auto leaves free (default\n"
            "                                " +
            std::to_string(kDefaultKvCapacityHeadroomBytes / (1024ULL * 1024ULL)) +
            "); alias --vram-headroom-mib\n"
@@ -328,6 +312,7 @@ std::string serve_usage_text(const char* argv0) {
            "  --top-k N                     0..20\n"
            "  --min-p F                     0..1\n"
            "  --presence-penalty F          -2..2\n"
+           "  --thinking-presence-penalty F -2..2 (thinking channel only; unset = off)\n"
            "  --frequency-penalty F         -2..2\n"
            "  --seed N                      seed of a request that sets none (default: fresh\n"
            "                                per request)\n"
@@ -508,8 +493,237 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             if (++i >= argc) { throw std::invalid_argument(std::string(flag) + " needs a value"); }
             return argv[i];
         };
-        // Keep each dispatch chain below MSVC's nested-block limit.
-        bool first_group_handled = true;
+        // MSVC counts each else-if as one level of block nesting and refuses more than 128 levels
+        // (error C1061); this 123-arm argument chain crossed that line. The tail is therefore a
+        // separate chain that reports back through its return value. The arms are the original ones
+        // in the original order, and their text (indentation included) is unchanged: this is a pure
+        // move, so no arm body can change meaning.
+        const auto parse_dispatch_options = [&](const std::string& arg) -> bool {
+        if (false) {}
+        else if (arg == "--spec") {
+            options.speculative.backend =
+                product::parse_speculative_backend(require_value("--spec"));
+        } else if (arg == "--draft-tokens") {
+            options.speculative.draft_tokens = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--draft-tokens"), "draft-tokens"));
+        } else if (arg == "--ngram-draft-tokens") {
+            options.speculative.ngram_draft_tokens = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--ngram-draft-tokens"), "ngram-draft-tokens"));
+            ngram_width_explicit = true;
+        } else if (arg == "--ngram-min-match") {
+            options.speculative.ngram_min_match = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--ngram-min-match"), "ngram-min-match"));
+        } else if (arg == "--ngram-archive-mib" || arg == "--ngram-session-mib") {
+            const auto mib = parse_u64(require_value(arg.c_str()), arg.c_str());
+            if (mib > std::numeric_limits<std::size_t>::max() / (1ULL << 20)) {
+                throw std::invalid_argument("ngram archive capacity is out of range");
+            }
+            auto& bytes = arg == "--ngram-archive-mib" ? options.speculative.ngram_archive_bytes
+                                                       : options.speculative.ngram_session_bytes;
+            bytes       = static_cast<std::size_t>(mib << 20);
+        } else if (arg == "--ngram-native-sessions") {
+            options.ngram_native_sessions = true;
+        } else if (arg == "--default-max-tokens") {
+            options.default_max_tokens =
+                parse_nonnegative_int(require_value("--default-max-tokens"), "default-max-tokens");
+            if (options.default_max_tokens == 0) {
+                options.default_max_tokens = kUnboundedOutputTokens;
+            }
+            default_max_tokens_explicit = true;
+        } else if (arg == "--default-thinking-budget") {
+            const std::uint64_t budget =
+                parse_u64(require_value("--default-thinking-budget"), "default-thinking-budget");
+            if (budget == 0 || budget > std::numeric_limits<std::uint32_t>::max()) {
+                throw std::invalid_argument("--default-thinking-budget is out of range");
+            }
+            options.default_thinking_budget = static_cast<std::uint32_t>(budget);
+        } else if (arg == "--default-reasoning-effort") {
+            const std::string value = require_value("--default-reasoning-effort");
+            const auto effort       = parse_requested_reasoning_effort(value);
+            if (!effort) {
+                throw std::invalid_argument("--default-reasoning-effort must be none, minimal, low, "
+                                            "medium, high, xhigh, or max");
+            }
+            options.default_reasoning_effort = *effort;
+        } else if (arg == "--thinking-budget-message") {
+            options.thinking_budget_message = require_value("--thinking-budget-message");
+            if (options.thinking_budget_message.empty()) {
+                throw std::invalid_argument("--thinking-budget-message must not be empty");
+            }
+        } else if (arg == "--vision") {
+            options.enable_vision = true;
+        } else if (arg == "--vision-residency") {
+            const std::string_view mode = require_value("--vision-residency");
+            if (mode == "resident") {
+                options.vision_residency = VisionResidency::Resident;
+            } else if (mode == "overlay") {
+                options.vision_residency = VisionResidency::Overlay;
+            } else if (mode == "cpu") {
+                options.vision_residency = VisionResidency::Cpu;
+            } else {
+                throw std::invalid_argument("--vision-residency must be resident, overlay or cpu");
+            }
+        } else if (arg == "--vision-cpu") {
+            // The gzenz fork's switch for Vision on CPU threads.
+            options.enable_vision    = true;
+            options.vision_residency = VisionResidency::Cpu;
+        } else if (arg == "--vision-offload") {
+            // The Wallawalla47 fork's switch for the same overlay residency.
+            const std::string_view mode = require_value("--vision-offload");
+            if (mode == "off") {
+                options.vision_residency = VisionResidency::Resident;
+            } else if (mode == "on") {
+                options.vision_residency = VisionResidency::Overlay;
+            } else {
+                throw std::invalid_argument("--vision-offload must be on or off");
+            }
+        } else if (arg == "--vision-max-merged") {
+            const std::uint64_t merged =
+                parse_u64(require_value("--vision-max-merged"), "vision-max-merged");
+            if (merged < 64 || merged > 16384) {
+                throw std::invalid_argument("--vision-max-merged must be in [64, 16384]");
+            }
+            options.vision_max_merged_tokens = static_cast<std::uint32_t>(merged);
+            vision_max_merged_explicit       = true;
+        } else if (arg == "--no-cuda-graph") {
+            options.use_cuda_graph = false;
+        } else if (arg == "--cuda-graph-allowance-mib") {
+            const std::uint64_t mib =
+                parse_u64(require_value("--cuda-graph-allowance-mib"), "cuda-graph-allowance-mib");
+            if (mib > std::numeric_limits<std::size_t>::max() / (1ULL << 20)) {
+                throw std::invalid_argument("--cuda-graph-allowance-mib is out of range");
+            }
+            options.cuda_graph_allowance_mib = mib;
+        } else if (arg == "--no-prefix-reuse") {
+            options.allow_prefix_reuse = false;
+        } else if (arg == "--lenient-assistant-history") {
+            options.lenient_assistant_history = true;
+        } else if (arg == "--derive-session-keys") {
+            legacy_cache_flag           = "--derive-session-keys";
+            options.derive_session_keys = true;
+        } else if (arg == "--auto-prefix-grid") {
+            legacy_cache_flag        = "--auto-prefix-grid";
+            options.auto_prefix_grid = true;
+        } else if (arg == "--lm-head-draft") {
+            options.speculative.proposal_head = ProposalHead::Optimized;
+        } else if (arg == "--adaptive-mtp") {
+            options.speculative.mtp_policy = MtpDraftPolicy::Adaptive;
+        } else if (arg == "--mtp-attention-window") {
+            options.speculative.mtp_attention_window =
+                static_cast<std::uint32_t>(parse_nonnegative_int(
+                    require_value("--mtp-attention-window"), "mtp-attention-window"));
+        } else if (arg == "--lm-head-q4") {
+            options.lm_head_q4 = true;
+        } else if (arg == "--lm-head-q6") {
+            options.lm_head_q6 = true;
+        } else if (arg == "--embedding-q4") {
+            options.embedding_q4 = true;
+        } else if (arg == "--embedding-q6") {
+            options.embedding_q6 = true;
+        } else if (arg == "--mtp-experts-q4") {
+            options.mtp_experts_q4 = true;
+        } else if (arg == "--gdn-state-fp16") {
+            options.gdn_state_fp16 = true;
+        } else if (arg == "--rope-yarn") {
+            options.rope_yarn = true;
+        } else if (arg == "--rope-yarn-factor") {
+            options.rope_yarn_factor =
+                product::parse_rope_yarn_factor(require_value("--rope-yarn-factor"));
+        } else if (arg == "--rope-scaling-factor") {
+            options.rope_scaling_factor =
+                product::parse_rope_scaling_factor(require_value("--rope-scaling-factor"));
+        } else if (arg == "--rope-scaling-original-context") {
+            options.rope_scaling_original_context = product::parse_rope_scaling_original_context(
+                require_value("--rope-scaling-original-context"));
+        } else if (arg == "--wddm-evictable-budget") {
+            options.wddm_evictable_budget = true;
+        } else if (arg == "--mlp-a8-decode") {
+            options.mlp_a8_decode = true;
+        } else if (arg == "--no-prefill-a8") {
+            options.prefill_a8 = false;
+        } else if (arg == "--lookup-ngram") {
+            options.speculative.lookup_ngram = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--lookup-ngram"), "lookup-ngram"));
+        } else if (arg == "--prefill-cublas") {
+            options.prefill_cublas = true;
+        } else if (arg == "--no-prefill-cublas-projections") {
+            options.prefill_cublas_projections = false;
+        } else if (arg == "--glp-vector") {
+            options.glp_vector = require_value("--glp-vector");
+        } else if (arg == "--glp-alpha") {
+            options.glp_alpha = parse_float_in(require_value("--glp-alpha"), "glp-alpha", 0.0F, 4.0F);
+        } else if (arg == "--chat-template") {
+            options.chat_template_path = require_value("--chat-template");
+            if (options.chat_template_path.empty()) {
+                throw std::invalid_argument("--chat-template must not be empty");
+            }
+        } else if (arg == "--no-thinking") {
+            options.enable_thinking = false;
+        } else if (arg == "--preserve-thinking") {
+            options.preserve_thinking = true;
+        } else if (arg == "--cors") {
+            options.enable_cors = true;
+        } else if (arg == "--no-webui") {
+            options.enable_webui = false;
+        } else if (arg == "--webui-mcp-proxy") {
+            options.webui_mcp_proxy = true;
+        } else if (arg == "--structured-output") {
+            options.structured_output = true;
+        } else if (arg == "--unconstrained-response-format") {
+            options.unconstrained_response_format = true;
+        } else if (arg == "--assistant-prefill") {
+            options.assistant_prefill = true;
+        } else if (arg == "--usage-chunk-choice") {
+            options.usage_chunk_choice = true;
+        } else if (arg == "--temperature") {
+            options.sampling_overrides.temperature =
+                parse_float_in(require_value("--temperature"), "temperature", 0.0f, 2.0f);
+        } else if (arg == "--top-p") {
+            options.sampling_overrides.top_p =
+                parse_float_in(require_value("--top-p"), "top-p", 0.0f, 1.0f);
+        } else if (arg == "--top-k") {
+            const int top_k = parse_nonnegative_int(require_value("--top-k"), "top-k");
+            if (top_k > 20) { throw std::invalid_argument("top-k must be in [0,20]"); }
+            options.sampling_overrides.top_k = top_k;
+        } else if (arg == "--min-p") {
+            options.sampling_overrides.min_p =
+                parse_float_in(require_value("--min-p"), "min-p", 0.0f, 1.0f);
+        } else if (arg == "--presence-penalty") {
+            options.sampling_overrides.presence_penalty = parse_float_in(
+                require_value("--presence-penalty"), "presence-penalty", -2.0f, 2.0f);
+        } else if (arg == "--thinking-presence-penalty") {
+            // S2: thinking-channel-only presence penalty (see serve_options.h).
+            options.thinking_presence_penalty = parse_float_in(
+                require_value("--thinking-presence-penalty"), "thinking-presence-penalty", -2.0f,
+                2.0f);
+        } else if (arg == "--frequency-penalty") {
+            options.sampling_overrides.frequency_penalty = parse_float_in(
+                require_value("--frequency-penalty"), "frequency-penalty", -2.0f, 2.0f);
+        } else if (arg == "--seed") {
+            options.sampling_overrides.seed = parse_u64(require_value("--seed"), "seed");
+        } else if (arg == "--greedy") {
+            options.greedy = true;
+        } else if (arg == "--post-thinking") {
+            if (!options.post_thinking_overrides) { options.post_thinking_overrides.emplace(); }
+        } else if (arg == "--post-thinking-temperature" || arg == "--post-thinking-top-p" ||
+                   arg == "--post-thinking-top-k") {
+            const std::string_view key = arg == "--post-thinking-temperature" ? "temp"
+                                         : arg == "--post-thinking-top-p"     ? "top_p"
+                                                                              : "top_k";
+            if (!options.post_thinking_overrides) { options.post_thinking_overrides.emplace(); }
+            product::set_post_thinking_field(*options.post_thinking_overrides, key,
+                                             require_value(arg.c_str()));
+        } else if (arg == "--post-thinking-sampler") {
+            if (!options.post_thinking_overrides) { options.post_thinking_overrides.emplace(); }
+            product::apply_post_thinking_sampler(require_value("--post-thinking-sampler"),
+                                                 *options.post_thinking_overrides);
+        } else if (arg == "--log-level") {
+            options.log_level = product::parse_log_level(require_value("--log-level"));
+        } else {
+            throw std::invalid_argument("unknown argument: " + arg);
+        }
+        return true;
+        };
         if (arg == "--host") {
             options.host = require_value("--host");
         } else if (arg == "--port") {
@@ -754,11 +968,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                 parse_nonnegative_int(require_value("--max-cache-markers-per-request"),
                                       "max-cache-markers-per-request"));
             context_capacity_explicit = true;
-        } else {
-            first_group_handled = false;
-        }
-        if (first_group_handled) { continue; }
-        if (arg == "--request-log-jsonl") {
+        } else if (arg == "--request-log-jsonl") {
             options.request_log_jsonl = require_value("--request-log-jsonl");
             if (options.request_log_jsonl.empty()) {
                 throw std::invalid_argument("--request-log-jsonl must not be empty");
@@ -792,246 +1002,11 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.stage_layers = parse_stage_layers(require_value("--stage-layers"));
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_dtype(require_value("--kv-dtype"));
-        } else if (arg == "--spec") {
-            options.speculative.backend =
-                product::parse_speculative_backend(require_value("--spec"));
-        } else if (arg == "--draft-tokens") {
-            options.speculative.draft_tokens = static_cast<std::uint32_t>(
-                parse_nonnegative_int(require_value("--draft-tokens"), "draft-tokens"));
-        } else if (arg == "--ngram-draft-tokens") {
-            options.speculative.ngram_draft_tokens = static_cast<std::uint32_t>(
-                parse_nonnegative_int(require_value("--ngram-draft-tokens"), "ngram-draft-tokens"));
-            ngram_width_explicit = true;
-        } else if (arg == "--ngram-min-match") {
-            options.speculative.ngram_min_match = static_cast<std::uint32_t>(
-                parse_nonnegative_int(require_value("--ngram-min-match"), "ngram-min-match"));
-        } else if (arg == "--ngram-archive-mib" || arg == "--ngram-session-mib") {
-            const auto mib = parse_u64(require_value(arg.c_str()), arg.c_str());
-            if (mib > std::numeric_limits<std::size_t>::max() / (1ULL << 20)) {
-                throw std::invalid_argument("ngram archive capacity is out of range");
-            }
-            auto& bytes = arg == "--ngram-archive-mib" ? options.speculative.ngram_archive_bytes
-                                                       : options.speculative.ngram_session_bytes;
-            bytes       = static_cast<std::size_t>(mib << 20);
-        } else if (arg == "--ngram-native-sessions") {
-            options.ngram_native_sessions = true;
-        } else if (arg == "--default-max-tokens") {
-            options.default_max_tokens =
-                parse_nonnegative_int(require_value("--default-max-tokens"), "default-max-tokens");
-            if (options.default_max_tokens == 0) {
-                options.default_max_tokens = kUnboundedOutputTokens;
-            }
-            default_max_tokens_explicit = true;
-        } else if (arg == "--default-thinking-budget") {
-            const std::uint64_t budget =
-                parse_u64(require_value("--default-thinking-budget"), "default-thinking-budget");
-            if (budget == 0 || budget > std::numeric_limits<std::uint32_t>::max()) {
-                throw std::invalid_argument("--default-thinking-budget is out of range");
-            }
-            options.default_thinking_budget = static_cast<std::uint32_t>(budget);
-        } else if (arg == "--default-reasoning-effort") {
-            const std::string value = require_value("--default-reasoning-effort");
-            const auto effort       = parse_requested_reasoning_effort(value);
-            if (!effort) {
-                throw std::invalid_argument("--default-reasoning-effort must be none, minimal, low, "
-                                            "medium, high, xhigh, or max");
-            }
-            options.default_reasoning_effort = *effort;
-        } else if (arg == "--thinking-budget-message") {
-            options.thinking_budget_message = require_value("--thinking-budget-message");
-            if (options.thinking_budget_message.empty()) {
-                throw std::invalid_argument("--thinking-budget-message must not be empty");
-            }
-        } else if (arg == "--vision") {
-            options.enable_vision = true;
-        } else if (arg == "--vision-residency") {
-            const std::string_view mode = require_value("--vision-residency");
-            if (mode == "resident") {
-                options.vision_residency = VisionResidency::Resident;
-            } else if (mode == "overlay") {
-                options.vision_residency = VisionResidency::Overlay;
-            } else if (mode == "cpu") {
-                options.vision_residency = VisionResidency::Cpu;
-            } else {
-                throw std::invalid_argument("--vision-residency must be resident, overlay or cpu");
-            }
-        } else if (arg == "--vision-cpu") {
-            // The gzenz fork's switch for Vision on CPU threads.
-            options.enable_vision    = true;
-            options.vision_residency = VisionResidency::Cpu;
-        } else if (arg == "--vision-offload") {
-            // The Wallawalla47 fork's switch for the same overlay residency.
-            const std::string_view mode = require_value("--vision-offload");
-            if (mode == "off") {
-                options.vision_residency = VisionResidency::Resident;
-            } else if (mode == "on") {
-                options.vision_residency = VisionResidency::Overlay;
-            } else {
-                throw std::invalid_argument("--vision-offload must be on or off");
-            }
-        } else if (arg == "--vision-max-merged") {
-            const std::uint64_t merged =
-                parse_u64(require_value("--vision-max-merged"), "vision-max-merged");
-            if (merged < 64 || merged > 16384) {
-                throw std::invalid_argument("--vision-max-merged must be in [64, 16384]");
-            }
-            options.vision_max_merged_tokens = static_cast<std::uint32_t>(merged);
-            vision_max_merged_explicit       = true;
-        } else if (arg == "--no-cuda-graph") {
-            options.use_cuda_graph = false;
-        } else if (arg == "--cuda-graph-allowance-mib") {
-            const std::uint64_t mib =
-                parse_u64(require_value("--cuda-graph-allowance-mib"), "cuda-graph-allowance-mib");
-            if (mib > std::numeric_limits<std::size_t>::max() / (1ULL << 20)) {
-                throw std::invalid_argument("--cuda-graph-allowance-mib is out of range");
-            }
-            options.cuda_graph_allowance_mib = mib;
-        } else if (arg == "--no-prefix-reuse") {
-            options.allow_prefix_reuse = false;
-        } else if (arg == "--lenient-assistant-history") {
-            options.lenient_assistant_history = true;
-        } else if (arg == "--derive-session-keys") {
-            legacy_cache_flag           = "--derive-session-keys";
-            options.derive_session_keys = true;
-        } else if (arg == "--auto-prefix-grid") {
-            legacy_cache_flag        = "--auto-prefix-grid";
-            options.auto_prefix_grid = true;
-        } else if (arg == "--lm-head-draft") {
-            options.speculative.proposal_head = ProposalHead::Optimized;
-        } else if (arg == "--adaptive-mtp") {
-            options.speculative.mtp_policy = MtpDraftPolicy::Adaptive;
-        } else if (arg == "--mtp-attention-window") {
-            options.speculative.mtp_attention_window =
-                static_cast<std::uint32_t>(parse_nonnegative_int(
-                    require_value("--mtp-attention-window"), "mtp-attention-window"));
-        } else if (arg == "--lm-head-q4") {
-            options.lm_head_q4 = true;
-        } else if (arg == "--lm-head-q6") {
-            options.lm_head_q6 = true;
-        } else if (arg == "--embedding-q4") {
-            options.embedding_q4 = true;
-        } else if (arg == "--embedding-q6") {
-            options.embedding_q6 = true;
-        } else if (arg == "--mtp-experts-q4") {
-            options.mtp_experts_q4 = true;
-        } else if (arg == "--gdn-state-fp16") {
-            options.gdn_state_fp16 = true;
-        } else if (arg == "--rope-yarn") {
-            options.rope_yarn = true;
-        } else if (arg == "--rope-yarn-factor") {
-            options.rope_yarn_factor =
-                product::parse_rope_yarn_factor(require_value("--rope-yarn-factor"));
-        } else if (arg == "--rope-scaling-factor") {
-            options.rope_scaling_factor =
-                product::parse_rope_scaling_factor(require_value("--rope-scaling-factor"));
-        } else if (arg == "--rope-scaling-original-context") {
-            options.rope_scaling_original_context = product::parse_rope_scaling_original_context(
-                require_value("--rope-scaling-original-context"));
-        } else if (arg == "--cuda-memory-policy") {
-            const auto policy = product::parse_cuda_memory_options(require_value(arg.c_str()));
-            options.cuda_memory_policy = policy.policy;
-            options.cuda_vram_reserve_bytes = policy.reserve_bytes;
-            options.cuda_memory_probe_step_bytes = policy.probe_step_bytes;
-        } else if (arg == "--wddm-evictable-budget") {
-            options.wddm_evictable_budget = true;
-        } else if (arg == "--mlp-a8-decode") {
-            options.mlp_a8_decode = true;
-        } else if (arg == "--no-prefill-a8") {
-            options.prefill_a8 = false;
-        } else if (arg == "--lookup-ngram") {
-            options.speculative.lookup_ngram = static_cast<std::uint32_t>(
-                parse_nonnegative_int(require_value("--lookup-ngram"), "lookup-ngram"));
-        } else if (arg == "--prefill-cublas") {
-            options.prefill_cublas = true;
-        } else if (arg == "--no-prefill-cublas-projections") {
-            options.prefill_cublas_projections = false;
-        } else if (arg == "--chat-template") {
-            options.chat_template_path = require_value("--chat-template");
-            if (options.chat_template_path.empty()) {
-                throw std::invalid_argument("--chat-template must not be empty");
-            }
-        } else if (arg == "--no-thinking") {
-            options.enable_thinking = false;
-        } else if (arg == "--preserve-thinking") {
-            options.preserve_thinking = true;
-        } else if (arg == "--cors") {
-            options.enable_cors = true;
-        } else if (arg == "--no-webui") {
-            options.enable_webui = false;
-        } else if (arg == "--webui-mcp-proxy") {
-            options.webui_mcp_proxy = true;
-        } else if (arg == "--structured-output") {
-            options.structured_output = true;
-        } else if (arg == "--unconstrained-response-format") {
-            options.unconstrained_response_format = true;
-        } else if (arg == "--assistant-prefill") {
-            options.assistant_prefill = true;
-        } else if (arg == "--usage-chunk-choice") {
-            options.usage_chunk_choice = true;
-        } else if (arg == "--temperature") {
-            options.sampling_overrides.temperature =
-                parse_float_in(require_value("--temperature"), "temperature", 0.0f, 2.0f);
-        } else if (arg == "--top-p") {
-            options.sampling_overrides.top_p =
-                parse_float_in(require_value("--top-p"), "top-p", 0.0f, 1.0f);
-        } else if (arg == "--top-k") {
-            const int top_k = parse_nonnegative_int(require_value("--top-k"), "top-k");
-            if (top_k > 20) { throw std::invalid_argument("top-k must be in [0,20]"); }
-            options.sampling_overrides.top_k = top_k;
-        } else if (arg == "--min-p") {
-            options.sampling_overrides.min_p =
-                parse_float_in(require_value("--min-p"), "min-p", 0.0f, 1.0f);
-        } else if (arg == "--presence-penalty") {
-            options.sampling_overrides.presence_penalty = parse_float_in(
-                require_value("--presence-penalty"), "presence-penalty", -2.0f, 2.0f);
-        } else if (arg == "--frequency-penalty") {
-            options.sampling_overrides.frequency_penalty = parse_float_in(
-                require_value("--frequency-penalty"), "frequency-penalty", -2.0f, 2.0f);
-        } else if (arg == "--seed") {
-            options.sampling_overrides.seed = parse_u64(require_value("--seed"), "seed");
-        } else if (arg == "--greedy") {
-            options.greedy = true;
-        } else if (arg == "--post-thinking") {
-            if (!options.post_thinking_overrides) { options.post_thinking_overrides.emplace(); }
-        } else if (arg == "--post-thinking-temperature" || arg == "--post-thinking-top-p" ||
-                   arg == "--post-thinking-top-k") {
-            const std::string_view key = arg == "--post-thinking-temperature" ? "temp"
-                                         : arg == "--post-thinking-top-p"     ? "top_p"
-                                                                              : "top_k";
-            if (!options.post_thinking_overrides) { options.post_thinking_overrides.emplace(); }
-            product::set_post_thinking_field(*options.post_thinking_overrides, key,
-                                             require_value(arg.c_str()));
-        } else if (arg == "--post-thinking-sampler") {
-            if (!options.post_thinking_overrides) { options.post_thinking_overrides.emplace(); }
-            product::apply_post_thinking_sampler(require_value("--post-thinking-sampler"),
-                                                 *options.post_thinking_overrides);
-        } else if (arg == "--log-level") {
-            options.log_level = product::parse_log_level(require_value("--log-level"));
-        } else {
-            throw std::invalid_argument("unknown argument: " + arg);
-        }
-    }
-    // Resolve policy-implied cache mode before choosing the KV default or validating cache flags.
-    if (options.cuda_memory_policy == CudaMemoryPolicy::StrictVram) {
-        if (original_cache_selected || !options.allow_prefix_reuse) {
-            throw std::invalid_argument(
-                "--cuda-memory-policy strict enables hybrid prefix caching and conflicts with "
-                "--use-original-prefix-caching and --no-prefix-reuse");
-        }
-        options.context_cache.mode = ContextCacheMode::Hybrid;
-    } else {
-        options.cuda_vram_reserve_bytes = 0;
-        options.cuda_memory_probe_step_bytes = 0;
-    }
-    if (options.cuda_memory_policy != CudaMemoryPolicy::DriverDefault &&
-        (options.wddm_evictable_budget || options.enable_vision || options.devices.size() > 1)) {
-        throw std::invalid_argument(
-            "--cuda-memory-policy mixed/strict requires one GPU, text-only inference and "
-            "ordinary CUDA allocation (no --wddm-evictable-budget)");
+        } else if (parse_dispatch_options(arg)) {         }
     }
     if (!kv_capacity_explicit) {
-        // Hybrid defaults to automatic sizing. The memory policy decides whether runtime may
-        // grow beyond active-context capacity; mixed keeps that bound instead of filling VRAM.
+        // The hybrid cache turns every Device page no active request holds into block cache, so
+        // it sizes the KV pool to free VRAM unless a capacity is given.
         options.kv_capacity = options.context_cache.mode == ContextCacheMode::Hybrid
                                   ? KvCapacityPolicy::automatic()
                                   : KvCapacityPolicy::explicit_capacity(options.max_context);
@@ -1081,16 +1056,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
                                     " requires --use-alt-prefix-caching");
     }
     if (kv_headroom_mib.has_value()) {
-        if (options.cuda_memory_policy != CudaMemoryPolicy::DriverDefault) {
-            throw std::invalid_argument("--kv-headroom-mib is available only with --cuda-memory-policy default");
-        }
         if (options.kv_capacity.mode != KvCapacityMode::Automatic) {
             throw std::invalid_argument("--kv-headroom-mib requires --kv-capacity auto");
         }
         options.kv_capacity = KvCapacityPolicy::automatic(*kv_headroom_mib << 20);
-    } else if (options.kv_capacity.mode == KvCapacityMode::Automatic &&
-               options.cuda_memory_policy != CudaMemoryPolicy::DriverDefault) {
-        options.kv_capacity = KvCapacityPolicy::automatic(options.cuda_vram_reserve_bytes);
     }
     if (long_anchor_spacing_explicit && !options.context_cache.automatic_long_anchors) {
         throw std::invalid_argument("--long-anchor-spacing requires --auto-long-anchors");
@@ -1148,9 +1117,25 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         throw std::invalid_argument("--stats-port must be in [1,65535] and differ from --port");
     }
     if (options.max_context == 0) { throw std::invalid_argument("--max-context must be positive"); }
-    if (options.kv_capacity.mode == KvCapacityMode::Explicit &&
+    // LOCAL PROTOTYPE (KVMem-style ring): the ring lets --kv-capacity be SMALLER than --max-context.
+    // Storage-side backing for it is the ring itself (device pool < logical context, with the recycled
+    // pages demoted to host memory), which is why the combination stays refused unless the experiment
+    // is enabled. The dense production configuration is untouched: without the switch a too-small pool
+    // is rejected, exactly as before.
+    // B30 (fixed 2026-10-07): this gate used to read NINFER_KV_RING, while the engine-side gate
+    // (models/qwen3_5/program/planning/startup.cpp, ring_requested()) reads NINFER_KV_WINDOW. The
+    // engine's own advice therefore named the WRONG variable: setting only NINFER_KV_RING passed here
+    // and then died at startup with "kv_capacity must be at least max_context", never serving. Both
+    // ends now read NINFER_KV_WINDOW with the same predicate (present, non-empty, strtol > 0), and the
+    // message below names that variable.
+    const bool kv_ring_enabled = [] {
+        const char* text = std::getenv("NINFER_KV_WINDOW");
+        return text != nullptr && std::strtol(text, nullptr, 10) > 0;
+    }();
+    if (!kv_ring_enabled && options.kv_capacity.mode == KvCapacityMode::Explicit &&
         options.kv_capacity.explicit_tokens < options.max_context) {
-        throw std::invalid_argument("--kv-capacity must be at least --max-context");
+        throw std::invalid_argument("--kv-capacity must be at least --max-context "
+                                    "(set NINFER_KV_WINDOW=<window tokens> to allow the experimental ring)");
     }
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
         throw std::invalid_argument("--max-concurrency must be in [1,8]");

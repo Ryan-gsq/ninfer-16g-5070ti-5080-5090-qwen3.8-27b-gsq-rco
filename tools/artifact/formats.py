@@ -73,6 +73,13 @@ Q8_G32_FP16 = QuantFormat("q8_g32_fp16", 8, 32, -127, 127)
 # Ternary: two-bit two's-complement codes over {-1, 0, +1} (0b10 is outside the language),
 # one binary16 multiplier per 128 columns; the native form of ternary checkpoints.
 T2_G128_FP16 = QuantFormat("t2_g128_fp16", 2, 128, -1, 1)
+# Prism PTQ1_0, the other packing of the same ternary coordinates: base-3 digits staged five per
+# byte (24 bytes) plus a 2-byte tail of four-per-byte digits, one binary16 multiplier per 128
+# columns = 28 B/128, i.e. 1.75 bits per weight. That ratio is deliberately NOT expressible as
+# `bits`, so layouts.row_split_geometry takes an explicit branch for this name and the row-split
+# codec refuses it outright -- see the notes in both. `bits` here is the code width for the range
+# check only, and the coordinates are the same {-1, 0, +1} as T2_G128_FP16.
+PTQ1_G128_FP16 = QuantFormat("ptq1_g128_fp16", 2, 128, -1, 1)
 NVFP4 = Nvfp4Format("nvfp4", 16)
 FP8_E4M3FN_ROW_BF16 = Fp8RowFormat("fp8_e4m3fn_row_bf16")
 
@@ -98,7 +105,14 @@ DIRECT_FORMATS = MappingProxyType({item.name: item for item in (BF16, FP32, INT3
 QUANT_FORMATS = MappingProxyType(
     {
         item.name: item
-        for item in (Q4_G64_FP16, Q5_G64_FP16, Q6_G64_FP16, Q8_G32_FP16, T2_G128_FP16)
+        for item in (
+            Q4_G64_FP16,
+            Q5_G64_FP16,
+            Q6_G64_FP16,
+            Q8_G32_FP16,
+            T2_G128_FP16,
+            PTQ1_G128_FP16,
+        )
     }
 )
 NVFP4_FORMATS = MappingProxyType({NVFP4.name: NVFP4})

@@ -163,8 +163,21 @@ int main(int argc, char** argv) {
         server.start_serving_during_startup();
         logger->info("build {}", NINFER_BUILD_ID);
 
-        ninfer::serve::GenerationService service(
-            options, startup_log.observer(), ninfer::product::engine_diagnostic_observer(logger));
+        logger->info("engine init | constructing service");
+        std::unique_ptr<ninfer::serve::GenerationService> service_holder;
+        try {
+            service_holder = std::make_unique<ninfer::serve::GenerationService>(
+                options, startup_log.observer(), ninfer::product::engine_diagnostic_observer(logger));
+        } catch (const std::exception& exception) {
+            // The boundary that used to be silent: an engine that failed to come up here was later
+            // dereferenced (load_summary() on a null instance) and left the process with a bare
+            // access violation and no message. Name the step and the reason instead.
+            logger->error("engine init | FAILED while constructing the service: {}",
+                          exception.what());
+            operational_log.server_failure(serving, exception.what());
+            return 1;
+        }
+        ninfer::serve::GenerationService& service = *service_holder;
         startup_log.engine_ready(service.load_summary());
         operational_log.engine_capacity(service);
 

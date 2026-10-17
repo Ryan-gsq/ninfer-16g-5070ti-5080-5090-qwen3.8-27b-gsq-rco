@@ -7,6 +7,10 @@
 #    include <sys/socket.h>
 #endif
 
+#if defined(_WIN32)
+#    include <mstcpip.h>   // tcp_keepalive / SIO_KEEPALIVE_VALS (see configure_http_server_socket)
+#endif
+
 #include <algorithm>
 #include <charconv>
 #include <stdexcept>
@@ -28,6 +32,35 @@ constexpr unsigned int kTcpUserTimeoutMilliseconds = 15000;
 template <class T>
 void set_socket_option(socket_t socket, int level, int option, const T& value) noexcept {
     (void)::setsockopt(socket, level, option, &value, sizeof(value));
+}
+#endif
+
+#if defined(_WIN32)
+// Windows mirror of the POSIX keep-alive block above. The POSIX branch exists so a silently dead peer
+// cannot pin a worker forever; on Windows that protection was simply ABSENT -- only
+// httplib::default_socket_options ran, and Windows has no TCP_USER_TIMEOUT to set anyway. The case it
+// matters for is a NON-STREAMING request whose cold prefill holds the connection byte-silent for
+// minutes (openai_chat_http.cpp:102 assembles the body only after service_->run() returns; the SSE
+// heartbeat exists on the streaming path only, http_transport.h:48). Measured 2026-10-02: on a 95k-token
+// prefill the client reported "a connection that was expected to be kept alive was closed by the
+// server" while this process was still prefilling and logged nothing -- i.e. something between us and
+// the client reaped a connection it considered idle, and plain SO_KEEPALIVE would not have helped
+// because its default idle is TWO HOURS. SIO_KEEPALIVE_VALS is the documented Windows way to shorten
+// that. Both calls are best-effort: a failure costs nothing.
+constexpr unsigned long kWindowsKeepAliveIdleSeconds     = 10;
+constexpr unsigned long kWindowsKeepAliveIntervalSeconds = 3;
+
+void enable_windows_keepalive(socket_t socket) noexcept {
+    const int enabled = 1;
+    (void)::setsockopt(socket, SOL_SOCKET, SO_KEEPALIVE,
+                       reinterpret_cast<const char*>(&enabled), sizeof(enabled));
+    tcp_keepalive values{};
+    values.onoff             = 1;
+    values.keepalivetime     = kWindowsKeepAliveIdleSeconds * 1000UL;
+    values.keepaliveinterval = kWindowsKeepAliveIntervalSeconds * 1000UL;
+    DWORD returned           = 0;
+    (void)::WSAIoctl(socket, SIO_KEEPALIVE_VALS, &values, sizeof(values), nullptr, 0, &returned,
+                     nullptr, nullptr);
 }
 #endif
 
@@ -199,6 +232,8 @@ void configure_http_server_socket(socket_t socket) noexcept {
     set_socket_option(socket, IPPROTO_TCP, TCP_KEEPINTVL, kKeepAliveIntervalSeconds);
     set_socket_option(socket, IPPROTO_TCP, TCP_KEEPCNT, kKeepAliveProbeCount);
     set_socket_option(socket, IPPROTO_TCP, TCP_USER_TIMEOUT, kTcpUserTimeoutMilliseconds);
+#elif defined(_WIN32)
+    enable_windows_keepalive(socket);
 #endif
 }
 

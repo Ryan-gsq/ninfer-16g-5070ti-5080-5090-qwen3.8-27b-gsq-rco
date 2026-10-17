@@ -1,7 +1,6 @@
 #pragma once
 
 #include "core/tma_descriptor_staging.cuh"
-
 #include "ops/common/mbarrier.cuh"
 #include "ops/common/memory.cuh"
 #include "ops/common/mma.cuh"
@@ -141,20 +140,34 @@ __device__ __forceinline__ void nvfp4_tma_load_2d(void* destination, const CUten
                  : "memory");
 }
 
+#ifdef NINFER_TMA_STAGED_DESCRIPTORS
+// Same design as nvfp4_w4a4_tma.cuh:100-104 -- one staging buffer per descriptor type, filled by
+// the launcher's staging kernel and read back by the kernel through a device pointer. This header
+// was the only one of the three NVFP4 TMA paths missing it, which is why a WINDOWS 120a build
+// fails on it (error C2719) while upstream's Linux 120a build does not.
+inline TmaDescriptorStaging<Nvfp4A4TmaDescriptors>& nvfp4_a4_tma_staging() {
+    static TmaDescriptorStaging<Nvfp4A4TmaDescriptors> staging;
+    return staging;
+}
+#endif
+
 template <class Schedule, class Epilogue, class OutputPolicy, class Rows>
 __global__
 __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a4_tma_kernel(
 #ifdef NINFER_TMA_STAGED_DESCRIPTORS
-    const Nvfp4A4TmaDescriptors* descriptors_pointer, float alpha,
-    const Epilogue epilogue, const OutputPolicy output,
+    // MSVC cannot pass the over-aligned (alignas(128)) CUtensorMap struct by value as a
+    // __grid_constant__ parameter (C2719), so on Windows the descriptors are pointer-passed: the
+    // launcher's staging kernel stores them into a device buffer and this kernel reads them from
+    // global memory. The epilogue/output keep ordinary by-value passing because a grid-constant
+    // struct holding a sub-8-byte member mis-packs. Verbatim from nvfp4_w4a4_tma.cuh:196-208.
+    const Nvfp4A4TmaDescriptors* descriptors_pointer, float alpha, const Epilogue epilogue,
+    const OutputPolicy output, int token_count, int output_rows, int input_rows, int token_offset
 #else
     const __grid_constant__ Nvfp4A4TmaDescriptors descriptors, float alpha,
     const __grid_constant__ Epilogue epilogue, const __grid_constant__ OutputPolicy output,
+    int token_count, int output_rows, int input_rows, int token_offset
 #endif
-    int token_count, int output_rows, int input_rows, int token_offset) {
-#ifdef NINFER_TMA_STAGED_DESCRIPTORS
-    const Nvfp4A4TmaDescriptors& descriptors = *descriptors_pointer;
-#endif
+    ) {
     const int K               = Schedule::kStaticK ? Schedule::kStaticK : input_rows;
     constexpr int branches    = Rows::kPaired ? 2 : 1;
     constexpr int loaded_rows = Schedule::kBlockRows / branches;
@@ -168,6 +181,14 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a4_t
     nvfp4_tma_raster_blocks(block_x, block_y);
     const int token_begin = token_offset + block_y * Schedule::kBlockTokens;
     const int row_begin   = block_x * loaded_rows;
+
+#ifdef NINFER_TMA_STAGED_DESCRIPTORS
+    // The descriptors sit in a device buffer written by the launcher's staging kernel (global
+    // memory). On the non-Windows path they are __grid_constant__ (constant memory), which the TMA
+    // (tensormap) proxy reads coherently for free; a global-memory tensor map written by the
+    // generic proxy is not, until it is acquired below.
+    const Nvfp4A4TmaDescriptors& descriptors = *descriptors_pointer;
+#endif
 
     if (threadIdx.x == 0) {
 #pragma unroll
@@ -187,10 +208,14 @@ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void nvfp4_a4_t
         }
         if (threadIdx.x == 0) {
 #ifdef NINFER_TMA_STAGED_DESCRIPTORS
+            // Each 128-byte tensor map needs its own acquire: the fence covers only the map at its
+            // address, and the buffer's address repeats with new contents every launch.
             acquire_staged_tensor_map(&descriptors.a_codes);
             acquire_staged_tensor_map(&descriptors.b_codes);
             acquire_staged_tensor_map(&descriptors.a_scales);
             acquire_staged_tensor_map(&descriptors.b_scales);
+            // The activation codes/scales are produced by the quantize kernel (generic proxy); make
+            // those global writes visible to the TMA (async) proxy that reads them.
             asm volatile("fence.proxy.async.global;" : : : "memory");
 #endif
 #pragma unroll 1
@@ -411,17 +436,18 @@ void launch_nvfp4_a4_tma_mma(const Nvfp4A4Operands& p, Output output, Epilogue e
     constexpr int bytes    = sizeof(Nvfp4A4TmaSharedStorage<Schedule, Rows, Epilogue>);
     constexpr auto kernel  = nvfp4_a4_tma_kernel<Schedule, Epilogue, Output, Rows>;
     (void)nvfp4_prepare_shared<bytes, kernel, true>();
-#ifdef NINFER_TMA_STAGED_DESCRIPTORS
-    static TmaDescriptorStaging<Nvfp4A4TmaDescriptors> staging;
-    const auto descriptor_argument = staging.stage(descriptors, stream);
-#else
-    const auto& descriptor_argument = descriptors;
-#endif
     for_each_token_slice(p.tokens, Schedule::kBlockTokens, [&](int offset, int count) {
         const dim3 grid(p.rows / Schedule::kBlockRows, div_up(count, Schedule::kBlockTokens));
-        nvfp4_a4_tma_kernel<Schedule, Epilogue, Output, Rows>
-            <<<grid, Schedule::kThreads, bytes, stream>>>(descriptor_argument, p.alpha, epilogue, output,
+#ifdef NINFER_TMA_STAGED_DESCRIPTORS
+        // Windows: the descriptors are staged into a device buffer and pointer-passed, because MSVC
+        // cannot pass the alignas(128) CUtensorMap struct by value (see the kernel parameter).
+        kernel<<<grid, Schedule::kThreads, bytes, stream>>>(
+            nvfp4_a4_tma_staging().stage(descriptors, stream), p.alpha, epilogue, output,
+            offset + count, p.rows, p.k, offset);
+#else
+        kernel<<<grid, Schedule::kThreads, bytes, stream>>>(descriptors, p.alpha, epilogue, output,
                                                             offset + count, p.rows, p.k, offset);
+#endif
         CUDA_CHECK(cudaGetLastError());
     });
 }

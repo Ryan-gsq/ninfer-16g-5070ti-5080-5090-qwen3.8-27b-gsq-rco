@@ -7,6 +7,7 @@ from functools import lru_cache
 import operator
 from typing import Sequence, TypeAlias
 
+import numpy as np
 import torch
 
 from ..formats import QuantFormat
@@ -87,6 +88,25 @@ def _unpack_two_bit(packed: torch.Tensor, group_size: int) -> torch.Tensor:
 def _pack_codes(
     codes: torch.Tensor, spec: QuantFormat
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    if spec.name == "ptq1_g128_fp16":
+        # PTQ1_0 is 1.75 bits per weight (24 base-3 bytes + 2 tail bytes per 128), which no `bits`
+        # branch below can describe -- the two-bit branch would silently emit T2 bytes under a
+        # PTQ1_0 name. So this packing gets its own path, and the arithmetic is NOT re-derived here:
+        # it comes from encode_ptq1_0, the upstream packing of the ggml block {qs[24]; qh[2]; fp16 d}
+        # that follows quantize_row_ptq1_0_ref. The artifact's row-split planes are exactly that
+        # block taken apart -- qs is the base plane, qh the high plane -- and the scale plane is
+        # written by encode_row_split from the caller's scales, so the dummy scale below is dropped.
+        # Imported lazily: the converter layer owns the encoder, and a module-level import would
+        # couple this codec's import order to it.
+        from ...convert.sources.gguf import encode_ptq1_0
+
+        groups, group_size = codes.shape
+        values = codes.to(torch.int16).detach().cpu().numpy().reshape(groups, 1, group_size)
+        dummy_scales = np.zeros((groups, 1), dtype=np.float16)
+        blocks = encode_ptq1_0(values, dummy_scales)
+        base = torch.from_numpy(np.ascontiguousarray(blocks[:, 0, :24])).reshape(groups, 24)
+        high = torch.from_numpy(np.ascontiguousarray(blocks[:, 0, 24:26])).reshape(groups, 2)
+        return base.to(codes.device), high.to(codes.device)
     if spec.bits == 2:
         return (
             _pack_two_bit(codes),
@@ -400,6 +420,22 @@ def _unpack_codes(
     scales = planes.scale.view(torch.float16).reshape(
         geometry.n, geometry.groups_per_row
     )
+    if spec.name == "ptq1_g128_fp16":
+        # The mirror of the packing above, and the reason it can be exact: reassemble the 28-byte
+        # ggml block from the three planes and hand it to decode_ptq1_0, the upstream reference
+        # decode. A trit's position walks the base-3 stages, so the bit-width branches below cannot
+        # describe it -- and the two-bit branch would read base-3 bytes as T2 fields, silently.
+        from ...convert.sources.gguf import decode_ptq1_0
+
+        groups = geometry.n * geometry.groups_per_row
+        base = planes.base.reshape(groups, 24).cpu().numpy().astype(np.uint8)
+        high = planes.high.reshape(groups, 2).cpu().numpy().astype(np.uint8)
+        scale = planes.scale.reshape(groups, 2).cpu().numpy().astype(np.uint8)
+        blocks = np.concatenate([base, high, scale], axis=1).reshape(groups, 1, 28)
+        values = decode_ptq1_0(blocks).values.reshape(
+            geometry.n, geometry.groups_per_row, spec.group_size
+        )
+        return scales, torch.from_numpy(np.ascontiguousarray(values)).to(torch.int8)
     if spec.bits == 8:
         codes = planes.base.view(torch.int8).reshape(
             geometry.n, geometry.groups_per_row, spec.group_size
@@ -545,7 +581,11 @@ def dequantize_row_split(
     geometry = row_split_geometry(spec, shape)
     target = torch.device(device)
     planes = _planes_on_device(source, geometry, target)
-    if dtype == torch.bfloat16:
+    if dtype == torch.bfloat16 and spec.name != "ptq1_g128_fp16":
+        # The bits-keyed eager/compiled dequantizers below cover the 2/4/5/6/8-bit formats only.
+        # PTQ1_0 is 1.75 bits per weight, so there is no entry to look up -- and defaulting to the
+        # 2-bit one would read base-3 bytes as T2 fields, silently. It takes the generic path at the
+        # bottom, which unpacks through _unpack_codes -> decode_ptq1_0.
         byte_indices, shifts = _high_indices(
             target.type, target.index, spec.bits, spec.group_size
         )

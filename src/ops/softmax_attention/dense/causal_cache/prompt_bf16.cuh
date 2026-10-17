@@ -256,10 +256,16 @@ __launch_bounds__(kCausalPromptThreads, 1) __global__
         const int qabs0            = (qrow0 < tokens) ? base_pos + qrow0 : -1;
         const int qabs1            = (qrow1 < tokens) ? base_pos + qrow1 : -1;
         const bool full_score_tile = (q0 + Br <= tokens) && ((k0 + Bc - 1) <= (base_pos + q0));
+        // LOCAL FIX (ring mask on the bf16 prompt route, 2026-10-02): a cleared page must contribute
+        // nothing even inside a FULL score tile -- a page the ring demoted has had its device slot
+        // handed to another page, so "fully inside the causal window" no longer implies "safe to
+        // read". Same shape as prompt_fp8.cuh:266-292 (bf16 was the CLI default dtype, so this is the
+        // route a hand-written command line lands on when --kv-dtype is omitted).
+        const bool selection_active = metadata.selected_blocks != nullptr;
 
         // block row-max on raw (unscaled) scores; scale is folded into exp2 below
         float bm0 = -CUDART_INF_F, bm1 = -CUDART_INF_F;
-        if (full_score_tile) {
+        if (full_score_tile && !selection_active) {
 #pragma unroll
             for (int nt = 0; nt < QKNt; ++nt) {
                 bm0 = fmaxf(bm0, fmaxf(score[nt][0], score[nt][1]));
@@ -270,10 +276,26 @@ __launch_bounds__(kCausalPromptThreads, 1) __global__
             for (int nt = 0; nt < QKNt; ++nt) {
                 const int key0 = k0 + nt * 8 + 2 * lid;
                 const int key1 = key0 + 1;
-                score[nt][0]   = (qrow0 < tokens && key0 <= qabs0) ? score[nt][0] : -CUDART_INF_F;
-                score[nt][1]   = (qrow0 < tokens && key1 <= qabs0) ? score[nt][1] : -CUDART_INF_F;
-                score[nt][2]   = (qrow1 < tokens && key0 <= qabs1) ? score[nt][2] : -CUDART_INF_F;
-                score[nt][3]   = (qrow1 < tokens && key1 <= qabs1) ? score[nt][3] : -CUDART_INF_F;
+                score[nt][0] =
+                    (qrow0 < tokens && key0 <= qabs0 &&
+                     paged_kv_block_selected(metadata.selected_blocks, key0))
+                        ? score[nt][0]
+                        : -CUDART_INF_F;
+                score[nt][1] =
+                    (qrow0 < tokens && key1 <= qabs0 &&
+                     paged_kv_block_selected(metadata.selected_blocks, key1))
+                        ? score[nt][1]
+                        : -CUDART_INF_F;
+                score[nt][2] =
+                    (qrow1 < tokens && key0 <= qabs1 &&
+                     paged_kv_block_selected(metadata.selected_blocks, key0))
+                        ? score[nt][2]
+                        : -CUDART_INF_F;
+                score[nt][3] =
+                    (qrow1 < tokens && key1 <= qabs1 &&
+                     paged_kv_block_selected(metadata.selected_blocks, key1))
+                        ? score[nt][3]
+                        : -CUDART_INF_F;
                 bm0            = fmaxf(bm0, fmaxf(score[nt][0], score[nt][1]));
                 bm1            = fmaxf(bm1, fmaxf(score[nt][2], score[nt][3]));
             }

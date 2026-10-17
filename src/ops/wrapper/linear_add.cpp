@@ -115,13 +115,18 @@ std::size_t linear_add_workspace_capacity_bytes(QType qtype, std::int32_t output
         const detail::GgufShape shape{qtype, output_rows, input_rows};
         return detail::gguf_project_workspace_bytes({&shape, 1}, min_tokens, max_tokens);
     }
-    if (qtype == QType::T2_G128_FP16) {
+    if (is_ternary(qtype)) {
         (void)linear_workspace_capacity_bytes(qtype, output_rows, input_rows, LinearPolicy::A16Only,
                                               min_tokens, max_tokens);
         WorkspaceLayoutBuilder layout;
         (void)layout.alloc(DType::BF16, {output_rows, max_tokens});
-        return std::max(layout.peak_bytes(1),
-                        detail::t2_a8_workspace_bytes(output_rows, input_rows, policy, max_tokens));
+        // The int8 route is registered for T2 only -- linear.cpp declines it for PTQ1_0 and
+        // t2_a8_supported tests the qtype exactly -- so a PTQ1_0 weight must not be sized for one.
+        const std::size_t a8_bytes =
+            qtype == QType::T2_G128_FP16
+                ? detail::t2_a8_workspace_bytes(output_rows, input_rows, policy, max_tokens)
+                : 0;
+        return std::max(layout.peak_bytes(1), a8_bytes);
     }
     if (qtype == QType::BF16) {
         (void)detail::bf16_linear_add_select(output_rows, input_rows, min_tokens);
@@ -206,7 +211,9 @@ void linear_add(const Tensor& x, const Weight& w, Tensor& residual_out, LinearPo
         return;
     }
 
-    if (w.qtype == QType::T2_G128_FP16) {
+    if (is_ternary(w.qtype)) {
+        // t2_a8_supported tests the qtype exactly, so a PTQ1_0 weight falls past the int8 route to
+        // the A16 project-then-add below without needing a guard of its own.
         if (detail::t2_a8_admits(policy) && detail::t2_a8_supported(w, t)) {
             detail::t2_a8_linear_add(x, w, residual_out, ws, stream);
             return;

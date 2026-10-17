@@ -248,6 +248,96 @@ private:
 
 } // namespace
 
+// Read the pool geometry once, on the first request that needs it. Not at construction: the core's
+// `instance_.program` is created by the worker, so an earlier read dereferences nothing and the
+// process dies without an error line (measured 2026-10-01 on sm_89; the frozen binary, which never
+// reads it that early, serves the same command line fine). A zero page count still means "the Engine
+// publishes no KV capacity", and then the check stays off.
+GenerationService::PoolSnapshot GenerationService::pool_snapshot() const {
+    std::call_once(pool_once_, [this] {
+        const ninfer::MemorySummary memory = engine_->memory_summary();
+        pool_snapshot_.pool_pages  = memory.kv_capacity_page_groups;
+        pool_snapshot_.pool_tokens = memory.kv_capacity;
+        // kv_capacity is page_groups * page_tokens exactly (SequenceCapacityCurve::resolved_tokens).
+        pool_snapshot_.page_tokens =
+            pool_snapshot_.pool_pages == 0
+                ? 0U
+                : static_cast<std::uint32_t>(memory.kv_capacity / pool_snapshot_.pool_pages);
+    });
+    return pool_snapshot_;
+}
+
+// State for the over-pool warning, FILE-LOCAL on purpose (2026-10-02).
+//
+// It used to be members of GenerationService. Adding a member changes sizeof(GenerationService),
+// which invalidates every translation unit that sees the class (9 of them, including the one that
+// stack-allocates the service by value) and turned a one-file edit into a full ~50-minute rebuild.
+// Nothing here needs to be per-instance -- the pool is one Engine per process -- so it belongs in
+// the .cpp. Keep it that way: touching this file alone costs one recompile and one link.
+namespace {
+struct OverPoolWarnState {
+    std::mutex mutex;
+    std::chrono::steady_clock::time_point last_emit{};
+    std::uint64_t suppressed = 0;  // over-pool requests since the last emitted line
+};
+constexpr auto kOverPoolInterval = std::chrono::seconds(30);
+} // namespace
+
+// The over-pool warning. Deliberately says what was MEASURED and what is UNKNOWN, and never says
+// "broken": the point is to remove the silence around a long prompt whose middle can go missing, not
+// to claim a root cause that is still unlocalized (2026-10-01 handoff, section 10 red line 4: no
+// speculative fix for this one).
+//
+// Re-emitted periodically rather than once (2026-10-02). See the note on the declaration: the
+// once-only version left every over-pool request after the first one silent, so "I saw no warning"
+// was not evidence of safety -- which is exactly how a user reads a log. The number of requests
+// skipped between emissions rides along on the next line, so the cadence loses no information.
+//
+// The interval is measured from the FIRST over-pool request of a spell, never from process start: a
+// cold 70k-token prefill takes over a minute, and counting from process start would let that prefill
+// push the first line past the interval and turn the one request that matters into a "suppressed" one.
+void GenerationService::warn_on_prompt_over_pool(std::uint32_t prompt_count) const {
+    const PoolSnapshot pool = pool_snapshot();
+    if (pool.pool_pages == 0 || pool.page_tokens == 0 || prompt_count == 0) { return; }
+    const std::uint64_t pages =
+        1ULL + (static_cast<std::uint64_t>(prompt_count) - 1ULL) / pool.page_tokens;
+    if (pages <= pool.pool_pages) { return; }
+
+    static OverPoolWarnState state;
+    std::uint64_t suppressed = 0;
+    {
+        const auto now = std::chrono::steady_clock::now();
+        std::lock_guard lock(state.mutex);
+        if (state.last_emit.time_since_epoch().count() != 0 &&
+            now - state.last_emit < kOverPoolInterval) {
+            ++state.suppressed;
+            return;
+        }
+        suppressed       = state.suppressed;
+        state.suppressed = 0;
+        state.last_emit  = now;
+    }
+
+    std::string message =
+        "prompt exceeds the resident Device KV pool: prompt " + std::to_string(prompt_count) +
+        " tokens (" + std::to_string(pages) + " pages) > pool " + std::to_string(pool.pool_tokens) +
+        " tokens (" + std::to_string(pool.pool_pages) +
+        " pages). Part of the prompt is therefore not resident, and the MIDDLE of such a prompt "
+        "has been measured to go missing with no error line, HTTP 200 and a plausible wrong "
+        "answer; the root cause is not localized. Treat every answer to this request as "
+        "unverified against its context, and raise --kv-capacity to at least the prompt's token "
+        "count (measured: prompt >= pool is the condition that reproduces it) before reading a "
+        "result.";
+    if (suppressed != 0) {
+        message += " [" + std::to_string(suppressed) +
+                   " more over-pool request(s) since the previous line]";
+    }
+    message +=
+        " [This line repeats at most every 30 s while over-pool requests keep arriving; a MISSING"
+        " line is never evidence that a request was safe.]";
+    write_console_log(ConsoleLogLevel::Warning, message);
+}
+
 ninfer::EngineOptions make_engine_options(const ServeOptions& options) {
     ninfer::EngineOptions engine_options;
     engine_options.artifact_path            = options.artifact_path;
@@ -282,13 +372,12 @@ ninfer::EngineOptions make_engine_options(const ServeOptions& options) {
     engine_options.cuda_graph_allowance_bytes =
         static_cast<std::size_t>(options.cuda_graph_allowance_mib) << 20;
     engine_options.wddm_evictable_budget    = options.wddm_evictable_budget;
-    engine_options.cuda_memory_policy = options.cuda_memory_policy;
-    engine_options.cuda_vram_reserve_bytes = options.cuda_vram_reserve_bytes;
-    engine_options.cuda_memory_probe_step_bytes = options.cuda_memory_probe_step_bytes;
     engine_options.mlp_a8_decode            = options.mlp_a8_decode;
     engine_options.prefill_a8               = options.prefill_a8;
     engine_options.prefill_cublas           = options.prefill_cublas;
     engine_options.prefill_cublas_projections = options.prefill_cublas_projections;
+    engine_options.glp_vector               = options.glp_vector;
+    engine_options.glp_alpha                = options.glp_alpha;
     engine_options.speculative              = options.speculative;
     engine_options.context_cache            = options.context_cache;
     engine_options.devices                  = options.devices;
@@ -328,6 +417,14 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     engine_options.startup_observer      = std::move(startup_observer);
     engine_options.diagnostic_observer   = std::move(diagnostic_observer);
     engine_           = std::make_unique<ninfer::Engine>(std::move(engine_options));
+    // A null engine_ used to be able to survive construction: the next method call on it
+    // (load_summary() in apps/serve/main.cpp, right before "engine ready") then walked into a null
+    // `this` and produced a bare 0xC0000005 with no message anywhere. Never let that be quiet.
+    if (engine_ == nullptr) {
+        throw std::runtime_error(
+            "engine construction produced a null instance -- see the startup log above for the "
+            "step that failed");
+    }
     request_capacity_ = std::make_shared<RequestCapacity>(
         static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests);
 }
@@ -458,6 +555,9 @@ PreparedRequest GenerationService::prepare_impl(const GenerationRequest& incomin
             prepared.thinking_budget.reset();
         }
         prepared.prompt_tokens = static_cast<int>(prompt.summary().prompt_tokens);
+        // Removes the SILENCE around a long prompt whose middle can go missing (see the note on the
+        // declaration). Fires before submit, so it lands in the log even if the answer never comes.
+        warn_on_prompt_over_pool(prompt.summary().prompt_tokens);
         prepared.preparation   = prompt.preparation_stats();
         prepared.prepare_seconds =
             std::chrono::duration<double>(Clock::now() - prepared.lifetime->started).count();

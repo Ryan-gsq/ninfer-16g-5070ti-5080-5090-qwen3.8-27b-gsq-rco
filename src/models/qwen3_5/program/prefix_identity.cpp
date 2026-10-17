@@ -4,6 +4,7 @@
 #include <iterator>
 #include <limits>
 #include <stdexcept>
+#include <cstdio>
 
 namespace ninfer::models::qwen3_5::detail {
 namespace {

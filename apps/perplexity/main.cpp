@@ -65,6 +65,10 @@ struct Options {
     bool embedding_q6                   = false;
     bool mtp_experts_q4                 = false;
     bool gdn_state_fp16                 = false;
+    // GLP runtime steering (same semantics as ninfer-serve --glp-vector/--glp-alpha).
+    // Empty path disables it; the engine default alpha 0 makes projection a bit-exact no-op.
+    std::filesystem::path glp_vector;
+    float glp_alpha                     = 0.0F;
     bool rope_yarn                      = false;
     float rope_yarn_factor              = 1.0F;
     float rope_scaling_factor                   = 1.0F;
@@ -85,6 +89,7 @@ std::string usage_text() {
            "<directory>]\n"
            "       [--lm-head-q4|--lm-head-q6] [--embedding-q4|--embedding-q6] [--mtp-experts-q4] "
            "[--gdn-state-fp16]\n"
+           "       [--glp-vector <file> [--glp-alpha F]]\n"
            "       [--mlp-a8-decode] [--no-prefill-a8] [--rope-yarn] [--rope-yarn-factor F]\n"
            "       [--rope-scaling-factor F [--rope-scaling-original-context N]]\n"
            "       (--mlp-a8-decode is inert here: the route it enables is verify-phase"
@@ -181,6 +186,10 @@ Options parse_options(int argc, char** argv) {
             out.mtp_experts_q4 = true;
         } else if (option == "--gdn-state-fp16") {
             out.gdn_state_fp16 = true;
+        } else if (option == "--glp-vector") {
+            out.glp_vector = std::filesystem::path(value("--glp-vector"));
+        } else if (option == "--glp-alpha") {
+            out.glp_alpha = std::stof(std::string(value("--glp-alpha")));
         } else if (option == "--rope-yarn") {
             out.rope_yarn = true;
         } else if (option == "--rope-yarn-factor") {
@@ -323,6 +332,8 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     engine_options.embedding_q6     = options.embedding_q6;
     engine_options.mtp_experts_q4   = options.mtp_experts_q4;
     engine_options.gdn_state_fp16   = options.gdn_state_fp16;
+    engine_options.glp_vector       = options.glp_vector;
+    engine_options.glp_alpha        = options.glp_alpha;
     engine_options.rope_yarn        = options.rope_yarn;
     engine_options.rope_yarn_factor = options.rope_yarn_factor;
     engine_options.rope_scaling_factor           = options.rope_scaling_factor;

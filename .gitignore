@@ -101,3 +101,11 @@ tests/windows-manager-backend/bin/
 tests/windows-manager-backend/obj/
 !apps/windows-manager/config/profiles/
 !apps/windows-manager/config/profiles/*.json
+
+# Local transient GLP dev scratch: ad-hoc build/test helpers and hand-rolled
+# compile dirs used while bringing up the GLP runtime projection. Not project
+# assets; kept out of history (see temp/ conventions upstream).
+/_build_glp3.ps1
+/_build_perplexity.ps1
+/_glp_test_link.ps1
+/temp_glp_test/

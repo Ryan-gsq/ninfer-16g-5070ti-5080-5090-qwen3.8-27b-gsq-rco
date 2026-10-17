@@ -1,6 +1,9 @@
 #include "models/qwen3_5/program/program_impl.h"
 #include "models/qwen3_5/program/context_work.h"
 #include "core/device.h"
+// LOCAL (KVMem content scoring, 2026-10-02): the scorer's published selection + scores. Header-only,
+// host-safe (it pulls cuda_runtime, not a CUDA kernel header), so no build wiring is needed.
+#include "ops/kvmem/kvmem_score.h"
 
 #include <algorithm>
 #include <array>
@@ -10,8 +13,14 @@
 #include <optional>
 #include <span>
 #include <stdexcept>
+#include <string>
 #include <utility>
 #include <variant>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace ninfer::models::qwen3_5::detail {
 
@@ -374,12 +383,22 @@ ProgramImpl::owner_exclusive_resources(const SequenceState& sequence) const {
             if (addresses.active(address)) {
                 const std::uint32_t mapped      = addresses.mapped_pages(address);
                 const std::uint32_t entitlement = addresses.entitlement(address);
-                if (entitlement < mapped ||
-                    entitlement - mapped >
-                        std::numeric_limits<std::uint32_t>::max() - device_pages) {
-                    throw std::logic_error("owner active KV entitlement is inconsistent");
+                // LOCAL FIX (ring device footprint): the Device footprint of an active
+                // address is its resident pages plus its unmapped entitlement, but never
+                // more than the pool. The ring keeps the excess on Host, so a demoted or
+                // host-backed page is not Device footprint. Without this cap the
+                // materialization check failed at the pool boundary
+                // ("materialized sequence does not match its active entitlement").
+                const std::uint32_t pool       = pages.physical_pool().usable_pages();
+                const std::uint32_t device_cap =
+                    pool == 0 ? entitlement : std::min(entitlement, pool);
+                if (device_cap > mapped) {
+                    const std::uint32_t delta = device_cap - mapped;
+                    if (delta > std::numeric_limits<std::uint32_t>::max() - device_pages) {
+                        throw std::overflow_error("owner active KV entitlement overflow");
+                    }
+                    device_pages += delta;
                 }
-                device_pages += entitlement - mapped;
             }
         };
         add_kv(*text_kv_addresses, *text_kv_pages, sequence.kv->text, out.device.main_kv_pages);
@@ -539,11 +558,18 @@ detail::PhysicalResources ProgramImpl::physical_occupancy() const noexcept {
     }
     if (text_kv_pages) {
         const DeviceKVPagePool& pool = text_kv_pages->physical_pool();
-        out.device.main_kv_pages     = pool.allocated_pages() + pool.reserved_pages();
+        // LOCAL FIX (ring physical occupancy): under a logical reservation the reserved
+        // count is a promise the ring satisfies by demotion on demand, not memory already
+        // held. Counting it made the Device look permanently oversubscribed
+        // (allocated 1500 + reserved 938 = 2438 over a 1500-page pool) and drove the
+        // capture/materialization paths into a state they could not fund.
+        out.device.main_kv_pages = pool.allocated_pages() +
+                                  (ring_requested() ? 0U : pool.reserved_pages());
     }
     if (backend_kv_pages) {
         const DeviceKVPagePool& pool = backend_kv_pages->physical_pool();
-        out.device.backend_kv_pages  = pool.allocated_pages() + pool.reserved_pages();
+        out.device.backend_kv_pages = pool.allocated_pages() +
+                                     (ring_requested() ? 0U : pool.reserved_pages());
     }
     if (host_kv_arena) { out.host.kv_bytes = host_kv_arena->occupied_bytes(); }
     return out;
@@ -555,7 +581,18 @@ ProgramImpl::materialization_deficit(const ResourceCandidateState& admission) co
     // would forbid Device-to-Host demotion even when Host capacity is available.
     const detail::PhysicalResources required =
         checked_resource_sum(physical_occupancy(), admission.demand.physical_peak_additional);
-    return positive_resource_difference(required, admission_capacity());
+    const detail::PhysicalResources limits = admission_capacity();
+    if (!ring_requested()) { return positive_resource_difference(required, limits); }
+    // LOCAL PROTOTYPE (KVMem-style ring): a logical Main KV entitlement larger than the pool is
+    // not a real deficit; the ring recycles resident pages. Clamp before measuring pressure.
+    detail::PhysicalResources clamped = required;
+    if (clamped.device.main_kv_pages > limits.device.main_kv_pages) {
+        clamped.device.main_kv_pages = limits.device.main_kv_pages;
+    }
+    if (clamped.device.backend_kv_pages > limits.device.backend_kv_pages) {
+        clamped.device.backend_kv_pages = limits.device.backend_kv_pages;
+    }
+    return positive_resource_difference(clamped, limits);
 }
 
 detail::PhysicalResources
@@ -569,7 +606,17 @@ ProgramImpl::guided_materialization_deficit(const ResourceCandidateState& admiss
         pressure.removed);
     const detail::PhysicalResources required =
         checked_resource_sum(physical_occupancy(), projected_peak);
-    return positive_resource_difference(required, admission_capacity());
+    const detail::PhysicalResources limits = admission_capacity();
+    if (!ring_requested()) { return positive_resource_difference(required, limits); }
+    // LOCAL PROTOTYPE (KVMem-style ring): see materialization_deficit.
+    detail::PhysicalResources clamped = required;
+    if (clamped.device.main_kv_pages > limits.device.main_kv_pages) {
+        clamped.device.main_kv_pages = limits.device.main_kv_pages;
+    }
+    if (clamped.device.backend_kv_pages > limits.device.backend_kv_pages) {
+        clamped.device.backend_kv_pages = limits.device.backend_kv_pages;
+    }
+    return positive_resource_difference(clamped, limits);
 }
 
 bool ProgramImpl::physical_peak_fits(detail::PhysicalResources peak) const noexcept {
@@ -581,16 +628,31 @@ bool ProgramImpl::physical_peak_fits(detail::PhysicalResources peak) const noexc
     const auto fits_size = [](std::size_t used, std::size_t added, std::size_t capacity) {
         return added <= capacity && used <= capacity - added;
     };
-    return fits_u32(occupied.device.active_lanes, peak.device.active_lanes,
-                    limits.device.active_lanes) &&
-           fits_u32(occupied.device.state_slots, peak.device.state_slots,
-                    limits.device.state_slots) &&
-           fits_u32(occupied.device.main_kv_pages, peak.device.main_kv_pages,
-                    limits.device.main_kv_pages) &&
-           fits_u32(occupied.device.backend_kv_pages, peak.device.backend_kv_pages,
-                    limits.device.backend_kv_pages) &&
-           fits_u32(occupied.host.state_slots, peak.host.state_slots, limits.host.state_slots) &&
-           fits_size(occupied.host.kv_bytes, peak.host.kv_bytes, limits.host.kv_bytes);
+    // LOCAL PROTOTYPE (KVMem-style ring): when the Device pool is smaller than the logical context
+    // the pool is managed by the ring (pages are demoted to the Host and retrieved back), so a
+    // request's logical page entitlement must NOT be compared against it. Clamping the entitlement
+    // to the pool does not work either: the check is `used + added <= capacity`, so clamping
+    // `added` to `capacity` forces `used == 0` and rejects every request once the pool holds
+    // anything. Skip the dimension instead.
+    // LOCAL FIX (ring-fits-used): zeroing only `added` is not enough: `used` itself is the
+    // logical mapped count, legitimately above pool capacity by design (1660 mapped vs 1500
+    // pool observed), so `used <= capacity` fails every capture past the pool even with
+    // zero added. Skip the whole dimension as the comment intends, not just the added term.
+    const bool ring = ring_requested() && text_kv_pages != nullptr && text_kv_addresses != nullptr &&
+                      text_kv_pages->physical_pool().usable_pages() <
+                          text_kv_addresses->logical_page_capacity();
+    const bool ok =
+        fits_u32(occupied.device.active_lanes, peak.device.active_lanes,
+                 limits.device.active_lanes) &&
+        fits_u32(occupied.device.state_slots, peak.device.state_slots,
+                 limits.device.state_slots) &&
+        (ring || fits_u32(occupied.device.main_kv_pages, peak.device.main_kv_pages,
+                          limits.device.main_kv_pages)) &&
+        (ring || fits_u32(occupied.device.backend_kv_pages, peak.device.backend_kv_pages,
+                          limits.device.backend_kv_pages)) &&
+        fits_u32(occupied.host.state_slots, peak.host.state_slots, limits.host.state_slots) &&
+        fits_size(occupied.host.kv_bytes, peak.host.kv_bytes, limits.host.kv_bytes);
+    return ok;
 }
 
 StateImageHandle
@@ -827,6 +889,39 @@ ProgramImpl::checkpoint_summary(const SequenceState& sequence, runtime::Checkpoi
         : speculative_backend == SpeculativeBackend::DFlash ? checkpoint.frontier
                                                             : 0U;
     const std::uint32_t identity_tag = capture_identity_tag();
+    // LOCAL FIX (host-backed checkpoint): count the pages of this checkpoint's range whose Device
+    // replica the ring gave up while a CURRENT Host replica exists. Same predicate as the publish gate
+    // in capture.cpp (`scan_range`); the byte total reuses `host_kv_prefix_bytes` so the two never
+    // disagree about the stride.
+    const auto count_host_backed = [&](const KVAddressSpaceStore& addresses,
+                                       const LogicalKVPageStore& pages, KVAddressSpaceHandle address,
+                                       std::uint32_t page_limit) {
+        std::uint32_t count = 0;
+        if (!addresses.valid(address)) { return count; }
+        const std::uint32_t mapped = addresses.mapped_pages(address);
+        const std::uint32_t limit  = page_limit < mapped ? page_limit : mapped;
+        for (std::uint32_t page = 0; page < limit; ++page) {
+            const LogicalKVPageHandle logical = addresses.logical_page(address, page);
+            if (!pages.valid(logical) || pages.device_resident(logical)) { continue; }
+            if (pages.host_resident(logical) && pages.host_replica_current(logical)) { ++count; }
+        }
+        return count;
+    };
+    std::uint32_t host_backed_pages = 0;
+    std::uint64_t host_backed_bytes = 0;
+    if (text_kv_addresses != nullptr && text_kv_pages != nullptr) {
+        host_backed_pages += count_host_backed(*text_kv_addresses, *text_kv_pages, sequence.kv->text,
+                                               kv_pages_for_frontier(checkpoint.frontier));
+        host_backed_bytes += static_cast<std::uint64_t>(
+            host_kv_prefix_bytes(*text_kv_addresses, sequence.kv->text, checkpoint.frontier));
+    }
+    if (sequence.kv->backend && backend_kv_addresses != nullptr && backend_kv_pages != nullptr) {
+        host_backed_pages +=
+            count_host_backed(*backend_kv_addresses, *backend_kv_pages, *sequence.kv->backend,
+                              kv_pages_for_frontier(backend_frontier));
+        host_backed_bytes += static_cast<std::uint64_t>(host_kv_prefix_bytes(
+            *backend_kv_addresses, *sequence.kv->backend, backend_frontier));
+    }
     return qwen3_5::CheckpointSummary{
         .ref   = checkpoint,
         .scope = runtime::CheckpointScope::Private,
@@ -845,6 +940,12 @@ ProgramImpl::checkpoint_summary(const SequenceState& sequence, runtime::Checkpoi
                 .backend_pages    = kv_pages_for_frontier(backend_frontier),
             },
         .rebuild_work = validated_rebuild_work(rebuild_work, checkpoint.frontier),
+        // LOCAL FIX (host-backed checkpoint): register how much of the range is Host-backed only.
+        // `host_kv_prefix_bytes` (context.cpp:824-858) already sums exactly those strides; the page
+        // count repeats the publish gate's predicate (capture.cpp `scan_range`: no Device replica and a
+        // CURRENT Host replica). Nothing consumes these fields yet.
+        .host_backed_pages = host_backed_pages,
+        .host_backed_bytes = host_backed_bytes,
     };
 }
 
@@ -1505,6 +1606,542 @@ void ProgramImpl::unbind_sequence_kv(SequenceState& sequence) noexcept {
     } catch (...) {}
 }
 
+// LOCAL PROTOTYPE (KVMem-style ring retrieval): bring the selected Host-resident pages back onto the
+// Device (H2D) and re-publish their block-table slots. Returns the retrieved pages that are Device-
+// resident once this returns, which is exactly the set the retrieval mask may select (a page that was
+// already resident also counts, and a failed restore simply drops out).
+std::vector<std::uint32_t>
+ProgramImpl::restore_kv_pages_from_host(KVAddressSpaceStore& addresses, LogicalKVPageStore& pages,
+                                        const KVAddressSpaceHandle& address,
+                                        std::span<const std::uint32_t> logical_pages) {
+    std::vector<std::uint32_t> resident;
+    if (!addresses.valid(address) || logical_pages.empty()) { return resident; }
+    if (host_kv_extents == nullptr) {
+        for (const std::uint32_t page : logical_pages) {
+            if (pages.device_resident(addresses.logical_page(address, page))) {
+                resident.push_back(page);
+            }
+        }
+        return resident;
+    }
+    for (const std::uint32_t page : logical_pages) {
+        const LogicalKVPageHandle logical = addresses.logical_page(address, page);
+        if (!pages.valid(logical)) { continue; }
+        if (pages.device_resident(logical)) {
+            resident.push_back(page);
+            continue;
+        }
+        if (!pages.host_resident(logical)) { continue; }
+        // SAFETY: never materialize into a full pool. A page that cannot be brought back is simply
+        // left out of the mask, which hides it -- it can never be read from a stale Device slot.
+        if (pages.physical_pool().free_runs().empty()) { break; }
+        const HostKVPageReplica replica = pages.host_replica(logical);
+        DeviceKVPageReservation reservation = pages.physical_pool().make_empty_reservation();
+        pages.physical_pool().resize_reservation(reservation, 1);
+        const HostKVAllocationConstView source =
+            host_kv_extents->view(replica.extent).subview(replica.page_offset, 1);
+        if (addresses.restore_page_from_host(address, page, source, reservation, device.stream)) {
+            resident.push_back(page);
+        }
+    }
+    return resident;
+}
+
+// LOCAL FIX (D-5 seam completeness, 2026-10-04): visibility is PAGE granularity, so evidence that
+// straddles a page boundary is cut in half -- and the measured failure mode at a small pool is exactly
+// that: the model answers with a TRUNCATED needle (`ZX-7001` -> `ZX-700`, `ARCH-4201` -> `ARCH-420`,
+// 4/4 deterministic in the ledger's D-5 note; the pool-4000 multi-needle arm loses turn 2 on 4 of 6
+// trials precisely because the needle's own page was brought back without its neighbour).
+//
+// That is what "a small window cannot hold a big question" looks like once it is measured: it is not
+// that 63 pages cannot hold one needle -- it is that the resident set holds HALF of it. The cure does
+// not need a bigger pool, it needs complete evidence for the pages the scorer picked.
+//
+// Policy: walk the ranked pages best-first and complete each one's neighbourhood while the budget
+// lasts. Breadth is traded for completeness on purpose: 31 isolated pages become ~10 fully covered
+// ones, and a needle needs 3 of them at most (its page plus the two the seam can be on). The budget
+// stays the hard cap, so this never asks the ring to hold more than it already did.
+std::vector<std::uint32_t> add_seam_neighbors(std::vector<std::uint32_t> ranked,
+                                              std::uint32_t begin, std::uint32_t end,
+                                              std::uint32_t budget, std::uint32_t reach) {
+    std::vector<std::uint32_t> out;
+    if (reach == 0 || budget == 0 || ranked.empty()) { return ranked; }
+    out.reserve(ranked.size() + 2U * reach * ranked.size());
+    const auto contains = [](const std::vector<std::uint32_t>& pages, std::uint32_t page) {
+        return std::find(pages.begin(), pages.end(), page) != pages.end();
+    };
+    for (const std::uint32_t page : ranked) {
+        if (page < begin || page >= end) { continue; }
+        if (!contains(out, page)) { out.push_back(page); }
+        for (std::uint32_t step = 1; step <= reach; ++step) {
+            // FORWARD first: the measured symptom is a truncated TAIL ("...->  ZX-700"), and what is
+            // missing sits in the page that follows. Backward is added next, for a needle whose
+            // beginning was the part that fell on the far side of the seam.
+            const std::uint32_t forward = page + step;
+            if (forward < end && !contains(out, forward)) { out.push_back(forward); }
+            if (out.size() >= budget) { break; }
+            const std::uint32_t backward = page >= step ? page - step : 0U;
+            if (page >= step && backward >= begin && !contains(out, backward)) {
+                out.push_back(backward);
+            }
+            if (out.size() >= budget) { break; }
+        }
+        if (out.size() >= budget) { break; }
+    }
+    if (out.size() > budget) { out.resize(budget); }
+    return out;
+}
+
+// How many pages on EITHER side of a selected page are brought back with it.
+//   0 = the shipped behaviour, i.e. this fix's NEGATIVE CONTROL (`NINFER_KV_NEIGHBOR_PAGES=0`)
+//   1 = +-1 page (the default; a 64-token page boundary can only separate two halves)
+//   2 = +-2 pages, only ever if the budget allows it
+std::uint32_t proto_kv_neighbor_pages() {
+    static const std::uint32_t reach = [] {
+        const char* text = std::getenv("NINFER_KV_NEIGHBOR_PAGES");
+        if (text == nullptr) { return 1U; }
+        const long value = std::strtol(text, nullptr, 10);
+        return value <= 0 ? 0U : static_cast<std::uint32_t>(value);
+    }();
+    return reach;
+}
+
+// LOCAL PROTOTYPE (KVMem-style ring retrieval): rank the pages that are (or are about to become)
+// Host-resident by lexical overlap with the recent context, and return the top `budget` page
+// indices. The score is an inverse-document-frequency weighted token overlap, which is what makes
+// a rare match (a variable name, an error string, a code) dominate ordinary function words. Token
+// ids live on the Host in the sequence ledger, so this needs no Device work.
+std::vector<std::uint32_t> ProgramImpl::select_retrieval_pages(const SequenceState& sequence,
+                                                              std::uint32_t begin,
+                                                              std::uint32_t end,
+                                                              std::uint32_t budget) const {
+    std::vector<std::uint32_t> selected;
+    if (budget == 0 || end <= begin) { return selected; }
+    // ---- LOCAL (KVMem content scoring, 2026-10-02) ---------------------------------------------
+    // Prefer the CONTENT ranking when the scorer published one. It ranks pages by a query-conditioned
+    // dot product against the mean-K index (ops/kvmem/kvmem_retrieve.h, Eq.10), so a page is found
+    // because it is ABOUT the question, not because it happens to share rare WORDS with it. That
+    // lexical dependence is the measured defect: with the IDF path below, a question that is
+    // semantically the same but lexically disjoint lost the mid-prompt needle in 2 of 6 trials.
+    //
+    // The ring's restore budget is smaller than the selector's own budget, so the kept set is ranked
+    // again here and cut to `budget`; ids are ascending by contract (kvmem_select.h:30-33).
+    //
+    // Everything below stays untouched and is the fallback -- and also this change's NEGATIVE CONTROL:
+    // with NINFER_TERNARY_KVMEM_SCORE unset nothing is published, this block is skipped, and the
+    // engine must reproduce the old readings exactly (the disjoint arm goes back to its pre-fix 4/6).
+    {
+        const std::vector<std::int32_t>& kept = ops::detail::kvmem_score_selected_blocks();
+        const std::vector<float>& scores     = ops::detail::kvmem_score_host_scores();
+        const std::int32_t scored            = ops::detail::kvmem_score_scored_blocks();
+        if (!kept.empty() && scored > 0 && !scores.empty()) {
+            std::vector<std::pair<float, std::uint32_t>> ranked;
+            ranked.reserve(kept.size());
+            for (const std::int32_t block : kept) {
+                if (block < 0 || block >= scored) { continue; }
+                const std::uint32_t page = static_cast<std::uint32_t>(block);
+                if (page < begin || page >= end) { continue; }
+                if (static_cast<std::size_t>(block) >= scores.size()) { continue; }
+                ranked.emplace_back(scores[static_cast<std::size_t>(block)], page);
+            }
+            if (!ranked.empty()) {
+                std::sort(ranked.begin(), ranked.end(), [](const auto& left, const auto& right) {
+                    return left.first != right.first ? left.first > right.first
+                                                     : left.second < right.second;
+                });
+                if (ranked.size() > budget) { ranked.resize(budget); }
+                // D-5: complete the evidence of the pages we keep, in score order, while the budget
+                // lasts. The result is re-sorted below because callers binary-search it
+                // (demote_kv_pages_to_host's is_preferred, context.cpp:1871).
+                std::vector<std::uint32_t> by_score;
+                by_score.reserve(ranked.size());
+                for (const auto& entry : ranked) { by_score.push_back(entry.second); }
+                selected = add_seam_neighbors(std::move(by_score), begin, end, budget,
+                                              proto_kv_neighbor_pages());
+                if (selected.empty()) {
+                    selected.reserve(ranked.size());
+                    for (const auto& entry : ranked) { selected.push_back(entry.second); }
+                }
+                std::sort(selected.begin(), selected.end());
+                return selected;
+            }
+        }
+    }
+    // The ledger is only needed by the lexical fallback below; an empty ledger is not a reason to skip
+    // the content path (which reads the index, not the ledger).
+    if (sequence.ledger.empty()) { return selected; }
+    constexpr std::size_t kQueryWindow = 256;
+    const std::size_t query_begin =
+        sequence.ledger.size() > kQueryWindow ? sequence.ledger.size() - kQueryWindow : 0;
+    std::unordered_set<TokenId> query;
+    for (std::size_t index = query_begin; index < sequence.ledger.size(); ++index) {
+        query.insert(sequence.ledger[index]);
+    }
+    if (query.empty()) { return selected; }
+    const std::size_t page_size = static_cast<std::size_t>(kPagedKVPageSize);
+    std::vector<std::vector<TokenId>> page_tokens;
+    page_tokens.reserve(end - begin);
+    std::unordered_map<TokenId, std::uint32_t> document_frequency;
+    for (std::uint32_t page = begin; page < end; ++page) {
+        const std::size_t first = static_cast<std::size_t>(page) * page_size;
+        if (first >= sequence.ledger.size()) { break; }
+        const std::size_t last = std::min(first + page_size, sequence.ledger.size());
+        std::vector<TokenId> distinct;
+        for (std::size_t index = first; index < last; ++index) {
+            const TokenId token = sequence.ledger[index];
+            if (query.count(token) == 0) { continue; }
+            if (std::find(distinct.begin(), distinct.end(), token) != distinct.end()) { continue; }
+            distinct.push_back(token);
+        }
+        for (const TokenId token : distinct) { ++document_frequency[token]; }
+        page_tokens.push_back(std::move(distinct));
+    }
+    const double documents = static_cast<double>(page_tokens.size());
+    std::unordered_map<TokenId, double> weight;
+    weight.reserve(document_frequency.size() * 2 + 1);
+    for (const auto& entry : document_frequency) {
+        weight.emplace(entry.first,
+                       std::log((documents + 1.0) / (static_cast<double>(entry.second) + 1.0)) + 1.0);
+    }
+    std::vector<std::pair<double, std::uint32_t>> scored;
+    scored.reserve(page_tokens.size());
+    for (std::size_t offset = 0; offset < page_tokens.size(); ++offset) {
+        double score = 0.0;
+        for (const TokenId token : page_tokens[offset]) { score += weight[token]; }
+        if (score > 0.0) { scored.emplace_back(score, begin + static_cast<std::uint32_t>(offset)); }
+    }
+    std::sort(scored.begin(), scored.end(), [](const auto& left, const auto& right) {
+        return left.first != right.first ? left.first > right.first : left.second < right.second;
+    });
+    if (scored.size() > budget) { scored.resize(budget); }
+    selected.reserve(scored.size());
+    for (const auto& entry : scored) { selected.push_back(entry.second); }
+    std::sort(selected.begin(), selected.end());
+    return selected;
+}
+
+std::uint32_t ProgramImpl::demote_other_addresses_to_host(KVAddressSpaceStore& addresses,
+                                                          LogicalKVPageStore& pages,
+                                                          const KVAddressSpaceHandle& skip,
+                                                          std::uint32_t target_free) {
+    if (host_kv_extents == nullptr || target_free == 0) { return 0; }
+    std::uint32_t freed = 0;
+    std::uint32_t slots_visited = 0, skip_invalid = 0, skip_noresident = 0, skip_pins = 0,
+                  skip_stalehost = 0, skip_partial = 0, skip_duplicate = 0;
+    // LOCAL DIAGNOSTIC (demote-counters): the fourth way to end with freed=0 was invisible. A
+    // refused host-arena reservation (HostKVExtentStore full) returns false from flush() without
+    // bumping any counter -- and the tail call at the end of this function dropped the return
+    // value outright. Counted here so `demote-other short` can name it. Read-only observation.
+    std::uint32_t flush_failed = 0;
+    // LOCAL FIX (2026-10-02): a SECOND, distinct refusal reason. `flush_failed` means the Host arena
+    // was full; this one means the Host store REFUSED to publish the batch (see the `publish declined`
+    // line in host_kv_store.h -- it used to be a silent `std::terminate`). They need different
+    // responses from a reader: one says "raise --host-kv-mib", the other says "a page could not be
+    // attached", so folding them into one counter would hide which one is happening.
+    std::uint32_t flush_declined = 0;
+    std::vector<LogicalKVPageHandle> batch;
+    batch.reserve(64);
+    const auto flush = [&]() -> bool {
+        if (batch.empty()) { return true; }
+        std::optional<HostKVExtentReservation> reserved = host_kv_extents->prepare(pages, batch);
+        if (!reserved) { ++flush_failed; return false; }   // Host arena full: nothing more can be moved
+        const std::vector<DeviceKVPageHandle> sources = host_kv_extents->device_sources(*reserved);
+        // Copy on the compute stream so the D2H is ordered after the kernels that wrote them.
+        pages.physical_pool().copy_to_host(sources, host_kv_extents->writable_view(*reserved),
+                                           device.stream);
+        // LOCAL FIX (2026-10-02): publish declines instead of terminating, so this batch simply does
+        // not happen -- every Device page in it keeps its replica and its active reference (the loop
+        // below never runs), i.e. the data is intact and the ring can try again later. Same shape as
+        // the `prepare` refusal just above, with its own counter so the log names the real reason.
+        if (!host_kv_extents->publish(std::move(*reserved))) {
+            ++flush_declined;
+            return false;
+        }
+        for (const LogicalKVPageHandle logical : batch) {
+            pages.release_active_reference(logical);
+            if (!pages.drop_device_replica(logical)) { return false; }
+        }
+        freed += static_cast<std::uint32_t>(batch.size());
+        batch.clear();
+        return true;
+    };
+    addresses.for_each_address([&](const KVAddressSpaceHandle& handle, bool active,
+                                   std::uint32_t mapped) {
+        if (freed >= target_free || active || handle == skip) { return; }
+        ++slots_visited;
+        for (std::uint32_t page = 0; page < mapped && freed + batch.size() < target_free; ++page) {
+            const LogicalKVPageHandle logical = addresses.logical_page(handle, page);
+            if (!pages.valid(logical)) { ++skip_invalid; continue; }
+            if (!pages.device_resident(logical)) { ++skip_noresident; continue; }
+            if (pages.source_pins(logical) != 0) { ++skip_pins; continue; }
+            // LOCAL FIX (ring decode; prescription: 交棒-ninfer解耦第四棒 §4.3): only a page that can
+            // never receive another coverage commit may give up its Device replica. A partially
+            // committed page keeps a live commit path (commit_coverage requires a Device replica and
+            // writer_references == 1), so demoting it made the next commit throw
+            // "logical KV committed coverage is not monotonic". Measured 2026-09-30 with pool 16
+            // pages < prompt+output during decode.
+            if (pages.committed_columns(logical) != static_cast<std::uint32_t>(kPagedKVPageSize)) {
+                ++skip_partial;
+                continue;
+            }
+            // NOTE: snapshot protection (protected_columns) is deliberately NOT consulted here.
+            // Protection keeps pages resident for fork-based reuse, and reuse of a host-demoted
+            // source is declined in ring mode. Demoting to the Host preserves the content and the
+            // descriptor, so the checkpoint stays restorable; only the Device replica goes.
+            if (pages.host_resident(logical)) {
+                // Content already on the Host: just give up the Device replica.
+                if (!pages.host_replica_current(logical)) { ++skip_stalehost; continue; }
+                pages.set_writer(logical, false);
+                pages.release_active_reference(logical);
+                if (pages.drop_device_replica(logical)) { ++freed; }
+                continue;
+            }
+            // Content not on the Host yet: the extent store pins through `can_pin_source`, which
+            // needs the writer reference clear (inactive addresses normally hold none, but be safe).
+            pages.set_writer(logical, false);
+            // LOCAL FIX (2026-10-02, step 1 of the publish patch -- the ROOT-CAUSE half):
+            // a logical page must not enter the SAME batch twice. fork/COW pages are reference-counted,
+            // so one logical page can be reached through two non-live addresses; the batch then asks
+            // the Host store to attach two replicas for it, the second attach throws, and with the old
+            // `noexcept -> std::terminate` publish the whole batch (up to 64 pages) died with it --
+            // `abort()`, no log, no dump (K's ebd7ad46). Skipping the duplicate REMOVES the cause; the
+            // decline path in publish() is only the safety net behind it.
+            if (std::find(batch.begin(), batch.end(), logical) != batch.end()) {
+                ++skip_duplicate;
+                continue;
+            }
+            batch.push_back(logical);
+            if (batch.size() >= 64 && !flush()) { return; }
+        }
+    });
+    // The tail flush is the last chance to bank the pending batch; its return value used to be
+    // dropped here, so a failure at this exact point was indistinguishable from "no candidates".
+    // flush() now counts its own refusals in flush_failed, tail call included.
+    (void)flush();
+    // LOCAL DIAGNOSTIC (demote-counters): when inactive addresses cannot cover the
+    // deficit the live lane cannibalizes its own bankable head, so a bank-miss
+    // needs to know WHY the dead residents would not drain. Name the blocker.
+    if (freed < target_free) {
+        std::fprintf(stderr,
+                     "[ninfer] demote-other short: freed=%u want=%u slots=%u invalid=%u "
+                     "noresident=%u pins=%u stalehost=%u partial=%u dup=%u flushfail=%u declined=%u pending=%zu\n",
+                     freed, target_free, slots_visited, skip_invalid, skip_noresident,
+                     skip_pins, skip_stalehost, skip_partial, skip_duplicate, flush_failed,
+                     flush_declined, batch.size());
+    }
+    return freed;
+}
+
+std::uint32_t ProgramImpl::demote_kv_pages_to_host(KVAddressSpaceStore& addresses,
+                                                   LogicalKVPageStore& pages,
+                                                   const KVAddressSpaceHandle& address,
+                                                   std::uint32_t sink_pages,
+                                                   std::uint32_t target_free,
+                                                   std::span<const std::uint32_t> preferred) {
+    if (host_kv_extents == nullptr || !addresses.valid(address) || target_free == 0) { return 0; }
+    const std::uint32_t mapped = addresses.mapped_pages(address);
+    const auto is_preferred = [&](std::uint32_t page) {
+        return !preferred.empty() && std::binary_search(preferred.begin(), preferred.end(), page);
+    };
+    // Oldest first, skipping the attention sink and (in the first pass) the pages retrieval wants to
+    // keep. If that is not enough the second pass gives up the retrieved pages too, so the caller is
+    // guaranteed to get the room it asked for whenever the Device can supply it at all.
+    std::uint32_t demoted   = 0;
+    std::uint32_t page      = sink_pages;
+    bool second_pass        = false;
+    while (demoted < target_free) {
+        if (page >= mapped) {
+            if (second_pass) { break; }
+            second_pass = true;
+            page        = sink_pages;
+            continue;
+        }
+        const std::uint32_t current       = page;
+        const LogicalKVPageHandle logical = addresses.logical_page(address, current);
+        ++page;
+        if (!second_pass && is_preferred(current)) { continue; }
+        if (!pages.valid(logical) || !pages.device_resident(logical) ||
+            pages.source_pins(logical) != 0) {
+            continue;
+        }
+        // LOCAL FIX (ring decode; prescription: 交棒-ninfer解耦第四棒 §4.3): only a page that can never
+        // receive another coverage commit may be demoted. The tail page the decode step is still
+        // writing (or the current prefill chunk's pages) is partially committed and keeps a live
+        // commit path; demoting it made the next commit throw "logical KV committed coverage is not
+        // monotonic" (measured 2026-09-30: pool 16 pages, context grew past the pool during decode).
+        if (pages.committed_columns(logical) != static_cast<std::uint32_t>(kPagedKVPageSize)) {
+            continue;
+        }
+        if (!pages.host_resident(logical)) {
+            // The content is not on the Host yet: copy it there first. The Host extent store pins
+            // through `can_pin_source`, which requires the writer reference to be clear; an active
+            // sequence keeps one on every mapped page and these pages are outside the window.
+            pages.set_writer(logical, false);
+            std::vector<LogicalKVPageHandle> one{logical};
+            std::optional<HostKVExtentReservation> reserved = host_kv_extents->prepare(pages, one);
+            if (!reserved) { break; }   // Host arena full: nothing more can be moved
+            const std::vector<DeviceKVPageHandle> sources =
+                host_kv_extents->device_sources(*reserved);
+            // Copy on the compute stream so the D2H is ordered after the kernels that wrote it.
+            pages.physical_pool().copy_to_host(sources, host_kv_extents->writable_view(*reserved),
+                                               device.stream);
+            // LOCAL FIX (2026-10-02): a declined publish stops the demotion exactly like the `prepare`
+            // refusal above -- `break` skips `release_active_reference` below, so this page keeps its
+            // Device replica and its data. Never drop a replica that has no Host copy.
+            if (!host_kv_extents->publish(std::move(*reserved))) {
+                // No counter here on purpose: this function has no summary line to carry it, and the
+                // store already named the page and the reason in its own `publish declined` line.
+                break;
+            }
+        } else {
+            // Already preserved on the Host (demoted before and then retrieved): no transfer needed.
+            if (!pages.host_replica_current(logical)) { continue; }
+            pages.set_writer(logical, false);
+        }
+        pages.release_active_reference(logical);
+        if (!pages.drop_device_replica(logical)) { continue; }
+        ++demoted;
+    }
+    return demoted;
+}
+
+namespace {
+// LOCAL PROTOTYPE: the retrieval policy's placeholder window, read once from the environment so
+// the mask path can be exercised end to end without a CLI change.
+//   NINFER_KV_WINDOW=<tokens>  keep only the newest N tokens on the Device (0/unset = dense)
+//                             the effective window shrinks to fit the Device pool
+// LOCAL PROTOTYPE (KVMem-style ring): a preserved attention "sink" is deliberately NOT supported,
+// because the ring demotes the oldest pages first; a sink would read a recycled Device slot.
+std::uint32_t proto_env_pages(const char* name) {
+    const char* text = std::getenv(name);
+    if (text == nullptr) { return 0; }
+    const long tokens = std::strtol(text, nullptr, 10);
+    if (tokens <= 0) { return 0; }
+    return static_cast<std::uint32_t>(tokens / static_cast<long>(kPagedKVPageSize));
+}
+std::uint32_t proto_kv_window_pages() {
+    static const std::uint32_t pages = proto_env_pages("NINFER_KV_WINDOW");
+    return pages;
+}
+
+std::uint32_t proto_pages_for_tokens(std::uint32_t tokens) {
+    if (tokens == 0) { return 0; }
+    return (tokens + static_cast<std::uint32_t>(kPagedKVPageSize) - 1U) /
+           static_cast<std::uint32_t>(kPagedKVPageSize);
+}
+
+std::uint32_t proto_kv_sink_pages() {
+    // StreamingLLM-style attention sink: the first pages are never demoted and stay selected.
+    static const std::uint32_t pages = [] {
+        const char* text = std::getenv("NINFER_KV_SINK");
+        if (text == nullptr) { return 4U; }   // 4 pages = 256 tokens
+        const long tokens = std::strtol(text, nullptr, 10);
+        if (tokens <= 0) { return 0U; }
+        return static_cast<std::uint32_t>(tokens / static_cast<long>(kPagedKVPageSize));
+    }();
+    return pages;
+}
+
+std::uint32_t proto_kv_retrieve_pages() {
+    // Retrieval budget: how many Host-resident pages to bring back on the basis of relevance.
+    static const std::uint32_t pages = proto_env_pages("NINFER_KV_RETRIEVE");
+    return pages;
+}
+// B32 (2026-10-07): is the retrieval budget literally UNSET? proto_env_pages cannot tell "unset" from
+// an explicit 0 (both return 0), and an explicit value must stay authoritative -- a switch the operator
+// set and the engine silently overrode is the defect class B25 was about ("=0 must mean 0"). The
+// fallback below therefore fires only when the variable is absent or empty.
+bool retrieve_budget_unset() {
+    const char* text = std::getenv("NINFER_KV_RETRIEVE");
+    return text == nullptr || text[0] == '\0';
+}
+
+// B32 (2026-10-07): the off switch for the retrieval fallback added at its call site. Unset -- or any
+// value whose first character is not '0' -- keeps the fallback ON, matching how this file reads every
+// other switch. It exists only so the fallback can be turned off for a negative control.
+bool retrieve_auto_enabled() {
+    static const bool enabled = [] {
+        const char* text = std::getenv("NINFER_KV_RETRIEVE_AUTO");
+        return text == nullptr || text[0] == '\0' || text[0] != '0';
+    }();
+    return enabled;
+}
+
+// LOCAL FIX (ring retrieval budget, 2026-10-02): the budget used to be a hard-wired quarter of the
+// pool (`pool / 4U`), and in the delivered shape that quarter is the BINDING term -- pool = 280 pages
+// in the shipped tier (`--kv-capacity 17920`), so the budget was min(128 pages from
+// NINFER_KV_RETRIEVE=8192, 70) = SEVENTY pages out of 636 mapped. A page whose only overlap with the
+// query is ordinary body vocabulary ranks just below the cut, so "the page the question is about"
+// was admitted or dropped essentially by luck -- measured: 4 hits in 6 trials for a question that is
+// semantically the same but shares no rare word with the marked line.
+// The share is now a percentage of the pool with the same default as the old behaviour times two,
+// and -- crucially -- it is read from the ENVIRONMENT so that tuning it costs a server restart
+// instead of a full rebuild of this tree (an edit to this file alone is cheap; an edit to anything
+// the CUDA wrappers include is not). 0 or >100 is ignored; NINFER_KV_RETRIEVE still caps it.
+std::uint32_t proto_env_percent(const char* name, std::uint32_t fallback) {
+    const char* text = std::getenv(name);
+    if (text == nullptr) { return fallback; }
+    const long value = std::strtol(text, nullptr, 10);
+    if (value <= 0 || value > 100) { return fallback; }
+    return static_cast<std::uint32_t>(value);
+}
+
+std::uint32_t proto_kv_retrieve_share_percent() {
+    static const std::uint32_t percent = proto_env_percent("NINFER_KV_RETRIEVE_SHARE", 50U);
+    return percent;
+}
+
+// LOCAL PROTOTYPE (KVMem-style ring): the retrieval mask IS the Device-resident set. Pages past
+// what has been mapped are selected too (the current chunk is writing into them). Building the mask
+// page by page rather than as a range is what makes a "hole" left by a page that could not be
+// demoted safe: a range would expose that hole's stale Device slot.
+// LOCAL DIAGNOSTIC (mask-hidden): the mask IS the attention window, so a mapped page that is not
+// Device-resident is silently unreadable -- that is the "middle of the prompt disappears" shape.
+// Count exactly those pages and name the caller. `which` is the stream (text/backend), `site` is
+// the installation point (mapped = the full ring mask, commit = the conservative safety net); both
+// are pure labels. Nothing about the selection itself changes.
+void install_resident_selection(qwen3_5::PagedKVCache* cache, std::uint32_t span_pages,
+                                const KVAddressSpaceStore& addresses,
+                                const LogicalKVPageStore& pages,
+                                const KVAddressSpaceHandle& address, const char* which,
+                                const char* site) {
+    if (cache == nullptr || span_pages == 0 || !addresses.valid(address)) { return; }
+    const std::size_t words = (static_cast<std::size_t>(span_pages) + 31U) / 32U;
+    std::vector<std::uint32_t> bits(words, 0U);
+    const std::uint32_t mapped = addresses.mapped_pages(address);
+    std::uint32_t resident = 0, hidden = 0, first_hidden = 0, last_hidden = 0;
+    // Where the prompt's middle is: page index in [35%, 70%) of the span handed to this mask.
+    // Printed with its bounds so the reading needs no recomputation (page P starts at token P*64).
+    const std::uint32_t mid_lo = static_cast<std::uint32_t>(
+        (static_cast<std::uint64_t>(span_pages) * 35U) / 100U);
+    const std::uint32_t mid_hi = static_cast<std::uint32_t>(
+        (static_cast<std::uint64_t>(span_pages) * 70U) / 100U);
+    std::uint32_t mid_hidden = 0;
+    for (std::uint32_t page = 0; page < span_pages; ++page) {
+        const bool selected =
+            page >= mapped || pages.device_resident(addresses.logical_page(address, page));
+        if (selected) {
+            bits[page >> 5] |= (1U << (page & 31U));
+            ++resident;
+        } else {
+            if (hidden == 0) { first_hidden = page; }
+            last_hidden = page;
+            ++hidden;
+            if (page >= mid_lo && page < mid_hi) { ++mid_hidden; }
+        }
+    }
+    cache->install_selection(bits);
+    // Only a non-zero reading is news: a mask that hides nothing stays silent (no per-step spam).
+    if (hidden != 0) {
+        std::fprintf(stderr,
+                     "[ninfer] mask hidden: which=%s site=%s span=%u resident=%u hidden=%u "
+                     "first_hidden=%u last_hidden=%u mid_hidden=%u mid_lo=%u mid_hi=%u\n",
+                     which, site, span_pages, resident, hidden, first_hidden, last_hidden,
+                     mid_hidden, mid_lo, mid_hi);
+    }
+}
+} // namespace
+
 void ProgramImpl::ensure_sequence_kv_lease(SequenceState& sequence, std::uint32_t main_tokens,
                                            std::uint32_t backend_tokens) {
     if (!context_cache.kv_lease_growth) { return; }
@@ -1669,6 +2306,86 @@ ProgramImpl::retained_device_kv_pages(const SharedPrefixHandle& shared) const no
     } catch (...) { return {}; }
 }
 
+// LOCAL FIX (B01 ring room): this beat used to live inside ensure_sequence_kv_mapped as a local
+// lambda, so the two other places that map Device KV pages without going through it -- the DFlash
+// context append (decode.cpp) and the causal-scoring lane (program_impl.cpp) -- asked the pool for
+// pages without ever demoting, and hit the paged-KV reservation invariant once the pool was full
+// with nothing demotable left. Same logic, one home, callable from every mapping site, with the
+// early verdict inside so no caller can forget it.
+void ProgramImpl::ensure_ring_room(KVAddressSpaceStore& addresses, LogicalKVPageStore& pages,
+                                   const KVAddressSpaceHandle& address, std::uint32_t total_tokens,
+                                   std::span<const std::uint32_t> preferred) {
+    // No-op unless the ring is active: with a pool that covers the logical context every page is
+    // resident anyway, and a demotion pass would be pure overhead on the hot path.
+    if (proto_kv_window_pages() == 0 ||
+        pages.physical_pool().usable_pages() >= addresses.logical_page_capacity()) {
+        return;
+    }
+    // Keep a few pages of slack so the pool never runs at exactly 100%: the restore path always
+    // needs a free Device page to work with.
+    constexpr std::uint32_t kRingSlackPages = 8U;
+    const auto free_pages                   = [](const LogicalKVPageStore& store) {
+        const std::uint32_t usable    = store.physical_pool().usable_pages();
+        const std::uint32_t allocated = store.physical_pool().allocated_pages();
+        return usable > allocated ? usable - allocated : 0U;
+    };
+    const std::uint32_t sink_pages = proto_kv_sink_pages();
+    const std::uint32_t total      = proto_pages_for_tokens(total_tokens);
+    const std::uint32_t mapped     = addresses.mapped_pages(address);
+    const std::uint32_t need       = total > mapped ? total - mapped : 0U;
+    std::uint32_t wanted_extra     = 0;
+    for (const std::uint32_t page : preferred) {
+        const LogicalKVPageHandle logical = addresses.logical_page(address, page);
+        if (pages.valid(logical) && !pages.device_resident(logical) &&
+            pages.host_resident(logical)) {
+            ++wanted_extra;   // a preferred page has to be brought back
+        }
+    }
+    const std::uint32_t want_free   = need + kRingSlackPages + wanted_extra;
+    const std::uint32_t free_now    = free_pages(pages);
+    const std::uint32_t target_free = want_free > free_now ? want_free - free_now : 0U;
+    if (target_free == 0) {
+        (void)demote_kv_pages_to_host(addresses, pages, address, sink_pages, 0U, preferred);
+        return;
+    }
+    // Cold pages first: inactive addresses are pure cache, so drain them before touching this
+    // sequence's own resident window.
+    const std::uint32_t freed_cold =
+        demote_other_addresses_to_host(addresses, pages, address, target_free);
+    const std::uint32_t free_after = free_pages(pages);
+    const std::uint32_t target2 = want_free > free_after ? want_free - free_after : 0U;
+    const std::uint32_t freed_own =
+        demote_kv_pages_to_host(addresses, pages, address, sink_pages, target2, preferred);
+    // LOCAL FIX (B01 ring early verdict): both demotions used to have their return value dropped, so
+    // a ring that could free nothing carried on into `ensure_mapped_to_tokens` and failed later --
+    // as the paged-KV reservation invariant, as an engine death, or (measured 2026-10-04, community
+    // report) as a request that never returns while the prefill loop retries block after block.
+    // Decide HERE, where the numbers are known.
+    // `need` is the hard requirement: pages this step must map. The slack and the preferred restores
+    // are best effort (retrieval quality), so falling short of `want_free` warns instead of failing.
+    const std::uint32_t free_final = free_pages(pages);
+    if (free_final < need) {
+        // ContextCacheExhausted is a std::bad_alloc (include/ninfer/types.h:867), so the worker's
+        // out-of-memory path fails this request and keeps serving -- it is not gated by
+        // --recover-invariant-failures. This is the readable error the task book's F1 asks for
+        // instead of a silent stall or a dead engine.
+        throw ninfer::ContextCacheExhausted(
+            "KVMem ring cannot free Device KV pages: this step needs " + std::to_string(need) +
+            " free, " + std::to_string(free_final) + " available (target " +
+            std::to_string(want_free) + " = need + slack " + std::to_string(kRingSlackPages) +
+            " + restores " + std::to_string(wanted_extra) + "; freed cold " +
+            std::to_string(freed_cold) + ", own " + std::to_string(freed_own) + "; pool usable " +
+            std::to_string(pages.physical_pool().usable_pages()) + ", allocated " +
+            std::to_string(pages.physical_pool().allocated_pages()) + ")");
+    }
+    if (free_final < want_free) {
+        std::fprintf(stderr,
+                     "[ninfer] ring short: freed=%u want=%u need=%u free=%u cold=%u own=%u -> "
+                     "continuing without slack\n",
+                     freed_cold + freed_own, want_free, need, free_final, freed_cold, freed_own);
+    }
+}
+
 void ProgramImpl::ensure_sequence_kv_mapped(SequenceState& sequence, std::uint32_t main_tokens,
                                             std::uint32_t backend_tokens) {
     if (!sequence.kv || main_tokens > capacity || backend_tokens > capacity) {
@@ -1677,11 +2394,177 @@ void ProgramImpl::ensure_sequence_kv_mapped(SequenceState& sequence, std::uint32
     if (backend_tokens != 0 && !sequence.kv->backend) {
         throw std::logic_error("backend KV materialization requested without an allocation");
     }
+    // ADAPTATION (master keeps kv-lease): K's tree has no kv_lease mechanism at all (zero hits for
+    // kv_lease in K), so K's five-beat body never extends a lease and pasting it as-is would
+    // silently disable master's own lease-growth behaviour. This port replaces only the MAPPING
+    // beat; master's lease accounting is untouched. Kept FIRST because master ran it before any
+    // mapping and because the beats below consume what it decides (beat 1 scores over the mapped
+    // range, ensure_ring_room computes need = total - mapped, beat 3 maps into the entitlement it
+    // sized).
     ensure_sequence_kv_lease(sequence, main_tokens, backend_tokens);
-    text_kv_addresses->ensure_mapped_to_tokens(sequence.kv->text, main_tokens, compute_streams);
+    // LOCAL PROTOTYPE (KVMem-style ring): when a Device pool is smaller than the logical context a
+    // sequence cannot keep all of its KV on the Device. Each call then:
+    //   1. ranks the pages by relevance to the recent context (retrieval preference),
+    //   2. demotes the oldest pages until the pool has room for this call's pages plus slack (and for
+    //      the pages retrieval wants to bring back); the preferred pages are given up last,
+    //   3. maps the pages this call needs,
+    //   4. brings the preferred pages back onto the Device (H2D),
+    //   5. installs the mask over EXACTLY the resident set.
+    // The dense configuration (pool >= logical capacity, or no window configured) never enters here.
+    const std::uint32_t text_total    = proto_pages_for_tokens(main_tokens);
+    const std::uint32_t backend_total = proto_pages_for_tokens(backend_tokens);
+    const std::uint32_t window_pages  = proto_kv_window_pages();
+    const std::uint32_t sink_pages    = proto_kv_sink_pages();
+    const bool has_backend =
+        backend_tokens != 0 && sequence.kv->backend && backend_kv_addresses && backend_kv_pages;
+    const bool ring = window_pages != 0 && text_kv_pages != nullptr && text_kv_addresses != nullptr &&
+                      text_kv_pages->physical_pool().usable_pages() <
+                          text_kv_addresses->logical_page_capacity();
+    std::vector<std::uint32_t> preferred;
+    if (ring) {
+        // Retrieval preference: a share of the pool (default half -- see the LOCAL FIX comment on
+        // proto_kv_retrieve_share_percent), scored on the whole mapped range.
+        // Scoring runs only when the mapped page count changed (relevance shifts slowly; within one
+        // page the previous selection stays valid). Between rescores the hysteresis set is reused.
+        const std::uint32_t pool   = text_kv_pages->physical_pool().usable_pages();
+        const std::uint32_t share  = pool * proto_kv_retrieve_share_percent() / 100U;
+        std::uint32_t budget       = std::min(proto_kv_retrieve_pages(), share);        // ---- B32 (2026-10-07): the retrieval budget had NO default. ---------------------------------
+        // WHY THIS EXISTS: proto_env_pages returns 0 when NINFER_KV_RETRIEVE is unset, and NOTHING in
+        // this tree sets it (no launcher, script or doc), so the shipped default is budget = 0: the
+        // ring demotes pages and never brings any back. Measured on this build (2026-10-07): such a
+        // request answers out of a MASKED middle with HTTP 200 and a plausible wrong answer -- the
+        // exact condition generation_service.cpp warns about but does not refuse. The same
+        // measurement with the budget supplied by hand: 0/6 correct at budget 0, 6/6 at 8192 tokens
+        // on a content-distinct fixture. A fix that ships switched off is a fix the user does not
+        // have (startup.cpp:1239), which is why the default below is ON.
+        // THE CONDITION IS DELIBERATELY NARROW: only when the caller left NINFER_KV_RETRIEVE unset
+        // (budget 0), only on the ring path, and only when this request's own KV (text_total pages)
+        // exceeds the pool. An explicit NINFER_KV_RETRIEVE -- including 0 -- is respected untouched.
+        // THE CAP RESPECTS THE RESTORE PATH'S SLACK: ensure_ring_room keeps free pages because a
+        // restore needs a free slot (context.cpp:2305), so the fallback stops short of the pool
+        // instead of taking every free page.
+        if (budget == 0U && retrieve_budget_unset() && retrieve_auto_enabled() && text_total > pool) {
+            constexpr std::uint32_t kRestoreSlackPages = 4U;
+            const std::uint32_t room =
+                pool > sink_pages + kRestoreSlackPages ? pool - sink_pages - kRestoreSlackPages : 0U;
+            const std::uint32_t auto_budget = std::min(share, room);
+            if (auto_budget != 0U) {
+                budget = auto_budget;
+                std::fprintf(stderr,
+                             "[ring] retrieve AUTO-ENABLED: prompt %u pages > pool %u pages and "
+                             "NINFER_KV_RETRIEVE is unset -> budget %u pages (skeleton %u, "
+                             "restore-slack %u). Set NINFER_KV_RETRIEVE to pick a budget, or "
+                             "NINFER_KV_RETRIEVE_AUTO=0 for the old (budget 0) behaviour.\n",
+                             text_total, pool, budget, sink_pages, kRestoreSlackPages);
+            }
+        }
+        // ---- P1-a BUDGET LINE (2026-10-05): the pool's split, in one auditable row. --------------
+        // WHY: the plan's P1-a asks for "[ring] budgets: skeleton=S, evidence=E, recent=R, free=F
+        // (pool P)" so that the NEXT person can see where the KV budget went without reading code.
+        // WHAT EACH TERM IS, exactly (no invented quantities):
+        //   skeleton = the attention-sink pin (proto_kv_sink_pages) -- the only region the demotion
+        //              scan refuses to touch (context.cpp:1946/1952). Measured need for a real agent
+        //              surface: 2,808 tokens = 44 pages (see 实验-骨架体量实测-20261005.md).
+        //   evidence = the retrieval budget, min(NINFER_KV_RETRIEVE, pool * SHARE%) -- the pages the
+        //              ring may bring back; it is taken FROM the pool by construction.
+        //   recent   = what is left for the recency window and the sequence's own frontier.
+        //   free     = pool - everything above.
+        // The identity S + E + R + F == P therefore holds BY CONSTRUCTION, which is what makes this
+        // row a self-check rather than decoration: if a reader ever sees the four not summing to the
+        // pool, one of the terms was redefined without updating the others.
+        // Logged once per request (the ring path is per-request), not per chunk, to avoid flooding.
+        {
+            const std::uint32_t b_skeleton = sink_pages < pool ? sink_pages : pool;
+            const std::uint32_t b_evidence = budget < pool - b_skeleton ? budget : pool - b_skeleton;
+            const std::uint32_t b_recent   = 0U;   // recency is whatever the request's own frontier maps
+            const std::uint32_t b_free     = pool - b_skeleton - b_evidence - b_recent;
+            std::fprintf(stderr,
+                         "[ring] budgets: skeleton=%u, evidence=%u, recent=%u, free=%u (pool %u) "
+                         "[skeleton+evidence+recent+free == pool: %s]\n",
+                         b_skeleton, b_evidence, b_recent, b_free, pool,
+                         (b_skeleton + b_evidence + b_recent + b_free) == pool ? "yes" : "NO");
+        }
+        const std::uint32_t mapped_now = text_kv_addresses->mapped_pages(sequence.kv->text);
+        if (budget != 0 && mapped_now > sink_pages &&
+            (mapped_now != sequence.ring_scored_mapped || sequence.ring_keep.empty())) {
+            preferred = select_retrieval_pages(sequence, sink_pages, mapped_now, budget);
+            sequence.ring_keep          = preferred;
+            sequence.ring_scored_mapped = mapped_now;
+        } else if (mapped_now == sequence.ring_scored_mapped) {
+            preferred = sequence.ring_keep;
+        } else {
+            // Fresh or shrunken range (e.g. a recycled lane): no hysteresis applies.
+            preferred.clear();
+            sequence.ring_keep.clear();
+            sequence.ring_scored_mapped = mapped_now;
+        }
+        // The hysteresis set may reference pages beyond the current mapping (stale lane reuse);
+        // clamp it so logical_page() below can never throw.
+        preferred.erase(std::remove_if(preferred.begin(), preferred.end(),
+                                       [&](std::uint32_t page) { return page >= mapped_now; }),
+                        preferred.end());
+        // B01: room is made by the shared helper, which every mapping site now uses. It takes the
+        // token frontier (proto_pages_for_tokens converts) and decides right here -- with these exact
+        // numbers -- whether the pages this step must map can be freed at all.
+        ensure_ring_room(*text_kv_addresses, *text_kv_pages, sequence.kv->text, main_tokens,
+                         preferred);
+        if (has_backend) {
+            ensure_ring_room(*backend_kv_addresses, *backend_kv_pages, *sequence.kv->backend,
+                             backend_tokens, {});
+        }
+    }
+    text_kv_addresses->ensure_mapped_to_tokens(sequence.kv->text, main_tokens, device.stream);
     if (backend_tokens != 0) {
         backend_kv_addresses->ensure_mapped_to_tokens(*sequence.kv->backend, backend_tokens,
-                                                      compute_streams);
+                                                      device.stream);
+    }
+    if (ring) {
+        const std::vector<std::uint32_t> restored = restore_kv_pages_from_host(
+            *text_kv_addresses, *text_kv_pages, sequence.kv->text, preferred);
+        // LOCAL DIAGNOSTIC (ring retrieve): `preferred` vs `restored` separates three different
+        // worlds that used to look identical from the outside --
+        //   restored == preferred   -> every wanted page is Device-resident now
+        //   restored  < preferred   -> the restore ran out of free slots or host arena (it walks
+        //                              ascending and BREAKS, so an over-large budget loses its HIGH
+        //                              tail -- that is the failure mode a budget change can create)
+        //   preferred == 0          -> nothing was wanted at all (budget 0, or every page scored 0)
+        // Only printed when the pair changes, so a long run does not emit one line per step.
+        {
+            // LOCAL FIX (defect D-10, 2026-10-02): the de-dup key used to be the PAIR OF SIZES only, so a
+            // round that restored a DIFFERENT SET of the same size printed nothing -- and the printed
+            // first/last then belonged to the first occurrence of that size, which invites a wrong
+            // conclusion ("page X was never restored"; that exact mistake was made once already).
+            // first/last are part of the key now.
+            static std::size_t last_preferred = 0;
+            static std::size_t last_restored  = 0;
+            static std::uint32_t last_first   = 0;
+            static std::uint32_t last_last    = 0;
+            const std::uint32_t first_page = restored.empty() ? 0U : restored.front();
+            const std::uint32_t last_page  = restored.empty() ? 0U : restored.back();
+            if (preferred.size() != last_preferred || restored.size() != last_restored ||
+                first_page != last_first || last_page != last_last) {
+                last_preferred = preferred.size();
+                last_restored  = restored.size();
+                last_first     = first_page;
+                last_last      = last_page;
+                std::fprintf(stderr,
+                             "[ninfer] ring retrieve: which=text preferred=%zu restored=%zu "
+                             "first=%u last=%u\n",
+                             preferred.size(), restored.size(),
+                             restored.empty() ? 0U : restored.front(),
+                             restored.empty() ? 0U : restored.back());
+            }
+        }
+        // The mask IS the resident set, so a page that could not be demoted or restored can only be
+        // hidden; it can never expose a stale Device slot.
+        install_resident_selection(decoder ? &decoder->text_kv : nullptr, text_total,
+                                   *text_kv_addresses, *text_kv_pages, sequence.kv->text, "text",
+                                   "mapped");
+        if (has_backend) {
+            install_resident_selection(backend_kv_cache(), backend_total, *backend_kv_addresses,
+                                       *backend_kv_pages, *sequence.kv->backend, "backend",
+                                       "mapped");
+        }
     }
 }
 
@@ -1695,6 +2578,25 @@ void ProgramImpl::commit_sequence_kv(SequenceState& sequence, std::uint32_t main
     if (sequence.kv->backend) {
         backend_kv_addresses->commit_frontier(*sequence.kv->backend, backend_tokens);
     }
+    // LOCAL PROTOTYPE: keep the retrieval masks in step with the committed frontier as well. This
+    // is a CONSERVATIVE safety net (sink + the resident recent window, no retrieval); the full mask
+    // is re-installed by ensure_sequence_kv_mapped before the next attention reads the cache.
+    const std::uint32_t window_pages = proto_kv_window_pages();
+    if (window_pages != 0 && text_kv_pages != nullptr && text_kv_addresses != nullptr &&
+        text_kv_pages->physical_pool().usable_pages() <
+            text_kv_addresses->logical_page_capacity()) {
+        const bool has_backend =
+            backend_tokens != 0 && sequence.kv->backend && backend_kv_addresses && backend_kv_pages;
+        install_resident_selection(decoder ? &decoder->text_kv : nullptr,
+                                   proto_pages_for_tokens(main_tokens), *text_kv_addresses,
+                                   *text_kv_pages, sequence.kv->text, "text", "commit");
+        if (has_backend) {
+            install_resident_selection(backend_kv_cache(), proto_pages_for_tokens(backend_tokens),
+                                       *backend_kv_addresses, *backend_kv_pages,
+                                       *sequence.kv->backend, "backend", "commit");
+        }
+    }
+
     if (hybrid_) { hybrid_publish_blocks(sequence); }
 }
 

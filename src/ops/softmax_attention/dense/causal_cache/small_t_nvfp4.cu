@@ -7,6 +7,8 @@
 #include "ops/kv_cache/plane_types.h"
 
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <stdexcept>
 
 namespace ninfer::ops::detail {
@@ -57,7 +59,7 @@ void launch_nvfp4_partial(const Tensor& q, CacheInput input, const Tensor& posit
             q_ptr, input, positions_ptr, cache_k_ptr, cache_v_ptr, k_scale_ptr, v_scale_ptr,
             tables_ptr, valid_ptr, rows_ptr, cache.block_tables.ne[0], invocation.full_width,
             invocation.column_begin, logical_capacity, scale, partial_acc_ptr, partial_m_ptr,
-            partial_l_ptr);
+            partial_l_ptr, invocation.selected_blocks);
         CUDA_CHECK(cudaGetLastError());
     };
 
@@ -190,6 +192,8 @@ void causal_attention_small_t_nvfp4_launch(
         .column_begin  = column_begin,
         .width         = width,
         .batch_size    = q.ne[3],
+        .selected_blocks =
+            cache.selected_blocks != nullptr ? cache.selected_blocks : proto_selected_blocks(),
     };
     if (q.ne[1] == CausalD256H24Kv4::QHeads) {
         causal_attention_small_t_nvfp4_launch_for<CausalD256H24Kv4>(
@@ -216,6 +220,8 @@ void causal_attention_cached_small_t_nvfp4_launch(const Tensor& q, const Tensor&
         .column_begin  = 0,
         .width         = q.ne[2],
         .batch_size    = 1,
+        .selected_blocks =
+            cache.selected_blocks != nullptr ? cache.selected_blocks : proto_selected_blocks(),
     };
     PagedKVBatchLayerView batch_cache = single_row_paged_kv_batch_view(cache);
     if (q.ne[1] == CausalD256H24Kv4::QHeads) {

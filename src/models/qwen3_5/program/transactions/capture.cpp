@@ -55,11 +55,115 @@ ProgramImpl::inspect_capture(const CaptureOffer& offer, const SharedPrefixHandle
     const RequestControl::Prefill& prefill = *requests[lane].prefill;
     const CaptureGroup& group              = prefill.capture_groups[prefill.next_capture];
     if (!group.identity) { throw std::logic_error("capture identity backing is missing"); }
-    const bool publish_private =
+    const bool publish_private_requested =
         group.rewrite.has_value() ||
         (group.long_anchor && context_cache.max_long_anchors_per_continuation.value_or(0) != 0);
-    const bool publish_shared = group.shared && permit_shared_publication &&
-                                exact_shared == nullptr && shared_prefix_capacity != 0;
+    const bool publish_shared_requested = group.shared && permit_shared_publication &&
+                                          exact_shared == nullptr && shared_prefix_capacity != 0;
+    // LOCAL PROTOTYPE (KVMem-style ring): publishing a continuation snapshots the whole address,
+    // which requires every mapped page Device-resident. Pages the ring demoted to the Host cannot
+    // satisfy that, and restoring the whole context is exactly what the pool cannot hold. A
+    // host-demoted source therefore completes WITHOUT publishing (reuse of it is declined anyway,
+    // so nothing consumes the entry). Fully resident sequences keep the normal fast path.
+    // LOCAL FIX (scoped-publish): the prototype declined publishing whenever ANY
+    // mapped page was host-demoted - including the tail beyond this checkpoint.
+    // Past pool capacity the tail is always demoted, so nothing ever banked and
+    // every later turn fell back to root. Only pages within the capture frontier
+    // belong to this checkpoint; the tail is recomputed (or anchored separately)
+    // on reuse, and banked host pages ride the existing H2D restore machinery.
+    const std::uint32_t publish_scan_pages = kv_pages_for_frontier(group.frontier);
+    bool publish_private = publish_private_requested;
+    bool publish_shared  = publish_shared_requested;
+    if ((publish_private || publish_shared) && text_kv_addresses != nullptr &&
+        text_kv_pages != nullptr &&
+        text_kv_pages->physical_pool().usable_pages() <
+            text_kv_addresses->logical_page_capacity()) {
+        const SequenceState& seq = active_sequence(lane);
+        // LOCAL FIX (host-backed checkpoint): the prototype voided the publication as soon as ANY
+        // page of the range was host-resident, even though a demoted page keeps its content intact -
+        // `LogicalKVPageStore::can_drop_device_replica` (kv_store.h:567-573) refuses to drop a Device
+        // replica whose Host copy is stale, so a host-resident page with a CURRENT Host replica can be
+        // brought back by the existing H2D path (`ProgramImpl::restore_kv_pages_from_host`, called from
+        // the five-beat body). Publication therefore requires every page to be RECOVERABLE:
+        //   Device-resident, or Host-resident with a current Host replica.
+        // A page with no current replica anywhere still voids the publication and is named, so a
+        // bank-miss keeps naming its gate. Consequence: `publish declined` now means "unrecoverable",
+        // and a merely host-backed range publishes with a `publish host-backed` line instead.
+        struct PublishScan {
+            std::uint32_t scanned             = 0;
+            std::uint32_t host_backed         = 0;
+            std::uint32_t unrecoverable       = 0;
+            std::uint64_t host_bytes          = 0;
+            std::uint32_t first_unrecoverable = 0;
+            std::uint32_t last_unrecoverable  = 0;
+        };
+        const auto scan_range = [&](const KVAddressSpaceStore& addresses,
+                                    const LogicalKVPageStore& pages,
+                                    const KVAddressSpaceHandle& address, std::uint32_t limit_pages,
+                                    std::size_t host_stride) {
+            PublishScan out{};
+            if (!addresses.valid(address)) { return out; }
+            const std::uint32_t mapped = addresses.mapped_pages(address);
+            const std::uint32_t limit  = limit_pages < mapped ? limit_pages : mapped;
+            for (std::uint32_t page = 0; page < limit; ++page) {
+                const LogicalKVPageHandle logical = addresses.logical_page(address, page);
+                if (!pages.valid(logical)) { continue; }
+                ++out.scanned;
+                if (pages.device_resident(logical)) { continue; }
+                if (pages.host_resident(logical) && pages.host_replica_current(logical)) {
+                    ++out.host_backed;
+                    out.host_bytes += host_stride;
+                    continue;
+                }
+                if (out.unrecoverable == 0) { out.first_unrecoverable = page; }
+                out.last_unrecoverable = page;
+                ++out.unrecoverable;
+            }
+            return out;
+        };
+        const PublishScan text_scan =
+            seq.kv ? scan_range(*text_kv_addresses, *text_kv_pages, seq.kv->text, publish_scan_pages,
+                                text_host_kv_page_stride)
+                   : PublishScan{};
+        PublishScan backend_scan{};
+        if (seq.kv && seq.kv->backend && backend_kv_addresses && backend_kv_pages) {
+            backend_scan = scan_range(*backend_kv_addresses, *backend_kv_pages, *seq.kv->backend,
+                                      publish_scan_pages, backend_host_kv_page_stride);
+        }
+        const std::uint32_t scanned       = text_scan.scanned + backend_scan.scanned;
+        const std::uint32_t host_backed   = text_scan.host_backed + backend_scan.host_backed;
+        const std::uint64_t host_bytes    = text_scan.host_bytes + backend_scan.host_bytes;
+        const std::uint32_t unrecoverable = text_scan.unrecoverable + backend_scan.unrecoverable;
+        // LOCAL DIAGNOSTIC (publish-scan): report a host-backed range (now publishable) once, and the
+        // exact page range that is genuinely unrecoverable.
+        if (host_backed != 0 && unrecoverable == 0) {
+            std::fprintf(stderr,
+                         "[ninfer] publish host-backed: frontier=%u scanned=%u host_backed=%u "
+                         "host_bytes=%llu\n",
+                         group.frontier, scanned, host_backed,
+                         static_cast<unsigned long long>(host_bytes));
+        }
+        if (unrecoverable != 0) {
+            // LOCAL DIAGNOSTIC (publish-decline): name which frontier lost its
+            // publish to host demotion, so a bank-miss names its gate.
+            std::fprintf(stderr,
+                         "[ninfer] publish declined: frontier=%u private=%d shared=%d "
+                         "(host-demoted pages inside range)\n",
+                         group.frontier, publish_private ? 1 : 0, publish_shared ? 1 : 0);
+            // LOCAL DIAGNOSTIC (publish-decline detail): the line above cannot say whether the range
+            // is merely host-backed (recoverable over H2D) or genuinely unrecoverable. Counters plus
+            // the first/last offending page of each space.
+            std::fprintf(stderr,
+                         "[ninfer] publish denied detail: scanned=%u host_backed=%u host_bytes=%llu "
+                         "unrecoverable=%u text=%u[%u..%u] backend=%u[%u..%u]\n",
+                         scanned, host_backed, static_cast<unsigned long long>(host_bytes),
+                         unrecoverable, text_scan.unrecoverable, text_scan.first_unrecoverable,
+                         text_scan.last_unrecoverable, backend_scan.unrecoverable,
+                         backend_scan.first_unrecoverable, backend_scan.last_unrecoverable);
+            publish_private = false;
+            publish_shared  = false;
+        }
+    }
 
     CaptureAssessment assessment;
     assessment.shortlist_key   = group.identity->shortlist_key;
@@ -706,6 +810,34 @@ bool ProgramImpl::prepare_active_capture(ActiveCaptureTransaction& transaction) 
         active_removed.device.main_kv_pages       = shared.device.main_kv_pages;
         active_removed.device.backend_kv_pages    = shared.device.backend_kv_pages;
         active_removed.host.kv_bytes              = shared.host.kv_bytes;
+        // LOCAL FIX (B01 Class C, snapshot room): `prepare_active_snapshot` reserves its copied tail
+        // pages (kv_store.h:1554-1556) and that reservation IS capacity-checked, but nothing demoted
+        // first -- so a pool holding other residents could refuse a snapshot whose room the ring could
+        // have made by draining the INACTIVE owners (pure cache). Same shape as the restore path's fix
+        // (materialization.cpp:884-887) and as ensure_ring_room: make room, then ask.
+        // Self-gating on purpose: nothing is demoted when the pool can already cover the reservation,
+        // so a configuration that is not short sees no behaviour change at all.
+        const auto drain_other_for = [&](KVAddressSpaceStore& addresses, LogicalKVPageStore& pages,
+                                         const KVAddressSpaceHandle& keep, std::uint32_t room) {
+            if (room == 0) { return; }
+            const auto& pool = pages.physical_pool();
+            const std::uint32_t free_now = pool.usable_pages() > pool.allocated_pages()
+                                               ? pool.usable_pages() - pool.allocated_pages()
+                                               : 0U;
+            if (free_now >= room) { return; }
+            (void)demote_other_addresses_to_host(addresses, pages, keep, room - free_now);
+        };
+        drain_other_for(*text_kv_addresses, *text_kv_pages, sequence.kv->text,
+                        text_kv_addresses->active_snapshot_shape(sequence.kv->text,
+                                                                 sequence.text_kv_valid)
+                            .copied_pages());
+        if (sequence.kv->backend) {
+            drain_other_for(*backend_kv_addresses, *backend_kv_pages, *sequence.kv->backend,
+                            backend_kv_addresses
+                                ->active_snapshot_shape(*sequence.kv->backend,
+                                                        backend_kv_valid(sequence))
+                                .copied_pages());
+        }
         transaction.active_text_destination = text_kv_addresses->create_inactive();
         if (!transaction.active_text_destination) {
             throw std::logic_error("selected capture has no Text KV address descriptor");
@@ -911,7 +1043,21 @@ ActiveCaptureResult ProgramImpl::publish_active_capture(ActiveCaptureTransaction
                                                         : prefill.initial_mtp_extent - 1U))
             : speculative_backend == SpeculativeBackend::DFlash ? prefill.prompt_tokens
                                                                 : 0U;
-        ensure_sequence_kv_mapped(sequence, prefill.prompt_tokens, backend_materialized);
+        // LOCAL FIX (ring incremental map): after a capture the whole prompt cannot be
+        // mapped at once under the ring: the pool is smaller than the logical context
+        // (observed: one batch of 1766 pages against a 1500-page pool, "Paged KV
+        // reservation invariant"). Map only up to the prefill cursor plus one chunk and
+        // let the prefill loop extend the mapping incrementally, exactly as for root.
+        std::uint32_t map_target = prefill.prompt_tokens;
+        if (text_kv_pages != nullptr && text_kv_addresses != nullptr &&
+            text_kv_pages->physical_pool().usable_pages() != 0 &&
+            text_kv_pages->physical_pool().usable_pages() <
+                text_kv_addresses->logical_page_capacity()) {
+            map_target = std::min(prefill.prompt_tokens, prefill.cursor + prefill_chunk);
+        }
+        const std::uint32_t map_backend =
+            backend_materialized <= map_target ? backend_materialized : map_target;
+        ensure_sequence_kv_mapped(sequence, map_target, map_backend);
     }
 
     detail::PhysicalResources removed = transaction.capacity_preparation_removed;
