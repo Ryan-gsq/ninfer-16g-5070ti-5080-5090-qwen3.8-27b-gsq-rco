@@ -271,11 +271,17 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
         decoder->text_kv.execution_tables().logical_page_capacity());
     if (vision_broker && kv_arena) {
         // A loan changes the admission capacity, so it may not race a sealed plan: refuse one while
-        // a context transaction or a pressure-planning session is in flight, and advance the
-        // resource revision whenever the capacity moves.
+        // a context transaction or a pressure-planning session is in flight, while a reservation is
+        // sealing its plan, and advance the resource revision whenever the capacity moves. The
+        // reservation window matters because a reservation starts a Vision item before it installs
+        // its transaction, and the loan that item takes would otherwise shrink the capacity the
+        // reservation is about to seal against.
         vision_broker->enable_kv_tier(
             *kv_arena, decoder->text_kv.page_pool(),
-            [this] { return !has_context_transaction() && !pressure_planning_active_; },
+            [this] {
+                return !has_context_transaction() && !pressure_planning_active_ &&
+                       !reservation_active_;
+            },
             [this] { advance_resource_revision(); });
     }
     state_images = std::make_unique<qwen3_5::StateImageDevicePool>(backings,

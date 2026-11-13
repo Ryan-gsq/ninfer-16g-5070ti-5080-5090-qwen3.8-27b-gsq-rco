@@ -885,9 +885,21 @@ private:
         if (++resource_revision_.value == 0) { ++resource_revision_.value; }
     }
 
+    // Set while a reservation is sealing a plan but has not installed its transaction yet. A KV
+    // loan taken in that window lowers `usable_pages()` behind the plan the reservation is about to
+    // seal, so the reservation itself then fails to grow its own page reservation.
+    struct ReservationWindowGuard {
+        bool& active;
+        explicit ReservationWindowGuard(bool& flag) noexcept : active(flag) { active = true; }
+        ReservationWindowGuard(const ReservationWindowGuard&)            = delete;
+        ReservationWindowGuard& operator=(const ReservationWindowGuard&) = delete;
+        ~ReservationWindowGuard() noexcept { active = false; }
+    };
+
     runtime::ProgramResourceRevision resource_revision_{.value = 1};
     std::uint32_t pressure_planning_generation_ = 0;
     bool pressure_planning_active_              = false;
+    bool reservation_active_                    = false;
 
     struct PressurePageScratchSlot {
         std::uint32_t generation     = 0;
