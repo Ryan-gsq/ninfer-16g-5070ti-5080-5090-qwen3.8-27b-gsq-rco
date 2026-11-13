@@ -33,6 +33,13 @@ ProgramImpl::reserve_materialization(AdmissionCandidate&& plan, PreparedPromptDa
     if (plan.impl_ == nullptr) {
         throw std::invalid_argument("materialization reservation is invalid");
     }
+    // This function starts a Vision item (below) before it installs the transaction, so `can_lend`
+    // cannot see the reservation through `has_context_transaction()` yet. Hold the reservation
+    // window closed for loans: a loan taken here lowers `usable_pages()` behind the plan this
+    // reservation is about to seal, and the reservation then fails to grow its own page
+    // reservation. The opportunistic Vision prefill is a no-op without a loan; its synchronous
+    // path still runs inside the prefill unit.
+    const ReservationWindowGuard reservation_window{reservation_active_};
 
     const AdmissionCandidateImpl& details = *plan.impl_;
     const std::uint32_t lane              = details.destination.value;
